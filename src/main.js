@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { CFG, applyReleasePreset } from "./config.js";
+import { CFG, applyReleasePreset, applyEnemySpeedScale } from "./config.js";
 import { clamp } from "./util.js";
 import { Input } from "./input.js";
 import { World } from "./world.js";
@@ -38,7 +38,7 @@ function boot() {
   player.grapple = grapple;
 
   const horde = new Horde(scene, trampler);
-  const director = new Director(horde);
+  const director = new Director(horde, trampler, player);
   const weapon = new Weapon(scene, player, horde, world, trampler);
   const repair = new Repair(player, trampler, horde);
   const guns = CFG.deckGun.mounts.map((m) => new DeckGun(scene, trampler, m));
@@ -67,6 +67,10 @@ function boot() {
     horde.clear();
     emitters.clear();
     trampler.repairAll();
+    // Rewind the patrol too, not just the damage. Spawn bearings derive from the
+    // hull's heading, so leaving it mid-patrol makes a restart a different fight
+    // from the same seed.
+    trampler.resetPose();
     director.reset();
     player.hp = player.maxHp;
     for (const g of guns) {
@@ -103,6 +107,24 @@ function boot() {
     if (input.pressed("BracketRight")) {
       CFG.trampler.speed = clamp(CFG.trampler.speed + d.speedStep, d.minSpeed, d.maxSpeed);
     }
+
+    if (input.pressed("Comma")) tuneEnemySpeed(-d.enemyScaleStep);
+    if (input.pressed("Period")) tuneEnemySpeed(+d.enemyScaleStep);
+  }
+
+  // Enemy speed is a feel question that no measurement can answer, so it gets a
+  // live knob and an on-screen readout rather than a decided value.
+  function tuneEnemySpeed(delta) {
+    const r = applyEnemySpeedScale(CFG.debug.enemySpeedScale + delta);
+    toast(
+      `ENEMY SPEED ${r.scale.toFixed(2)}x<small>chewer ${r.chewer.toFixed(1)} · `
+      + `climber ${r.climber.toFixed(1)} m/s · you walk ${CFG.player.walkSpeed}`
+      + (r.outrun
+        ? ` <br>under the hull's ${CFG.trampler.speed} m/s — they still arrive head-on, `
+          + `but the fortress outruns anything it gets past`
+        : "")
+      + `</small>`,
+    );
   }
 
   // ---- loop ---------------------------------------------------------------
@@ -111,6 +133,15 @@ function boot() {
   let fpsFrames = 0;
   let fps = 0;
   let lossTimer = 0;
+
+  // The banner is otherwise driven by persistent states and cleared every frame,
+  // so a transient message needs its own timer or the next frame erases it.
+  let toastTimer = 0;
+  let toastHtml = "";
+  function toast(html, seconds = 2.5) {
+    toastHtml = html;
+    toastTimer = seconds;
+  }
 
   const hudCtx = {
     player, trampler, grapple, horde, director, weapon, repair, emitters,
@@ -144,7 +175,18 @@ function boot() {
       if (lossTimer > 3.5) resetEncounter();
     } else {
       director.update(dt);
-      if (trampler.immobilised) {
+      // A tuning toast briefly outranks the immobilised notice; losing the reactor
+      // outranks everything. Holding the siege outranks everything except a loss,
+      // and unlike the others it does NOT auto-reset -- finishing a run should be
+      // something you get to sit in, not something the game clears for you.
+      if (director.held) {
+        hud.showBanner(
+          `SIEGE HELD<small>${CFG.waves.siegeLength} waves · press K to run it again</small>`,
+        );
+      } else if (toastTimer > 0) {
+        toastTimer -= dt;
+        hud.showBanner(toastHtml);
+      } else if (trampler.immobilised) {
         hud.showBanner("TRAMPLER IMMOBILISED<small>repair a leg to get it walking again</small>");
       } else {
         hud.hideBanner();

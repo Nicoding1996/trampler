@@ -70,7 +70,9 @@ export class World {
   }
 
   #scatter() {
-    const rand = makeRandom(20260725);
+    // Seed lives in config with the others, so every stochastic part of the
+    // build is listed in one place. Changing it reshuffles the rocks and ruins.
+    const rand = makeRandom(CFG.world.seed);
     const rockMat = new THREE.MeshStandardMaterial({ color: 0x8a7256, roughness: 0.95 });
     const pillarMat = new THREE.MeshStandardMaterial({ color: 0x6d6357, roughness: 0.9 });
 

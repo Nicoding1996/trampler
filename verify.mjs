@@ -7,13 +7,15 @@
 //   node verify.mjs
 
 import * as THREE from "three";
-import { CFG, applyReleasePreset, releasePresetName } from "./src/config.js";
+import {
+  CFG, applyReleasePreset, releasePresetName, applyEnemySpeedScale,
+} from "./src/config.js";
 import { World } from "./src/world.js";
 import { Trampler } from "./src/trampler.js";
 import { Player } from "./src/player.js";
 import { Grapple } from "./src/grapple.js";
 import { Horde, CHEWER, CLIMBER } from "./src/enemies.js";
-import { Director } from "./src/waves.js";
+import { Director, PHASE } from "./src/waves.js";
 import { Weapon } from "./src/weapon.js";
 import { Repair } from "./src/repair.js";
 import { DeckGun, handleStationInput } from "./src/deckgun.js";
@@ -74,7 +76,7 @@ function makeSim() {
   player.grapple = grapple;
 
   const horde = new Horde(scene, trampler);
-  const director = new Director(horde);
+  const director = new Director(horde, trampler, player);
   const weapon = new Weapon(scene, player, horde, world, trampler);
   const repair = new Repair(player, trampler, horde);
   const guns = CFG.deckGun.mounts.map((m) => new DeckGun(scene, trampler, m));
@@ -673,31 +675,70 @@ console.log("\n15. The ground has a cost");
 }
 
 // ---------------------------------------------------------------------------
-console.log("\n16. Wave director");
+console.log("\n16. Wave director cycles rest, prep, spawn, engage");
 {
   const sim = makeSim();
   sim.waves = true;
+  sim.player.position.set(700, 1.2, 700);
+  sim.player.base = null;
   const { horde, director } = sim;
 
-  ok("no wave at the start", director.wave === 0 && horde.liveCount === 0);
+  ok("starts resting with nothing on the field",
+    director.phase === PHASE.REST && director.wave === 0 && horde.liveCount === 0);
 
-  step(sim, 60 * (CFG.waves.firstDelay + 4));
-  ok("first wave arrived on the clock", director.wave === 1, `wave ${director.wave}`);
-  ok("it put enemies on the field", horde.liveCount > 5, `${horde.liveCount} alive`);
+  // Rest must run out before anything is telegraphed.
+  step(sim, 60 * (CFG.waves.firstDelay - 2));
+  ok("still resting partway through the opening calm", director.phase === PHASE.REST,
+    `phase ${director.phase}`);
+  ok("nothing has spawned yet", horde.liveCount === 0);
+
+  // Then a telegraphed preparation window, with nothing spawning during it.
+  step(sim, 60 * 3);
+  ok("rest gives way to a telegraphed prep window", director.phase === PHASE.PREP,
+    `phase ${director.phase}`);
+  ok("the prep window names a bearing", /AHEAD|PORT|STARBOARD/.test(director.bearingLabel),
+    director.bearingLabel);
+  ok("still nothing spawned during prep", horde.liveCount === 0,
+    `${horde.liveCount} alive`);
+
+  step(sim, 60 * (CFG.waves.prepTime + 1));
+  ok("the wave then releases", director.wave === 1 && horde.liveCount > 0,
+    `wave ${director.wave}, ${horde.liveCount} alive`);
+
+  // Release is a trickle, not a dump.
+  ok("the wave is still arriving several seconds in",
+    director.phase === PHASE.SPAWNING || horde.liveCount < CFG.waves.baseCount,
+    `phase ${director.phase}, ${horde.liveCount} of ${CFG.waves.baseCount}`);
 
   const scaleEarly = director.hpScale();
   step(sim, 60 * 60);
   ok("enemy health scales with elapsed time, not wave number",
     director.hpScale() > scaleEarly * 1.4,
     `x${scaleEarly.toFixed(2)} -> x${director.hpScale().toFixed(2)}`);
+}
 
-  // Calling early should collapse the countdown.
-  const sim2 = makeSim();
-  sim2.waves = true;
-  step(sim2, 30);
-  ok("E collapses the countdown", sim2.director.callEarly() && sim2.director.timer === 0);
-  step(sim2, 30);
-  ok("and the wave starts immediately", sim2.director.wave === 1);
+// ---------------------------------------------------------------------------
+console.log("\n16b. A wave is a trickle, not a lump");
+{
+  const sim = makeSim();
+  sim.waves = true;
+  sim.player.position.set(700, 1.2, 700);
+  sim.player.base = null;
+
+  // Skip straight to a wave.
+  sim.director.callEarly();
+  step(sim, 2);
+  ok("wave is releasing", sim.director.phase === PHASE.SPAWNING);
+
+  step(sim, 60 * 1);
+  const afterOneSecond = sim.horde.liveCount;
+  ok("only a couple are out after one second", afterOneSecond <= 4,
+    `${afterOneSecond} of ${CFG.waves.baseCount} after 1 s`);
+
+  step(sim, 60 * 6);
+  ok("the whole wave is out a few seconds later",
+    sim.horde.liveCount >= CFG.waves.baseCount - 1,
+    `${sim.horde.liveCount} of ${CFG.waves.baseCount}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +901,49 @@ console.log("\n21. Enemies halt on target instead of walking through it");
   ok("and stays beneath the fortress instead of overshooting into the open",
     maxLocalX < trampler.halfW + 3,
     `max |local x| ${maxLocalX.toFixed(2)}, hull half-width ${trampler.halfW}`);
+
+  ok("it is latched to the hull, not re-chasing the leg every frame", e.latched);
+}
+
+// ---------------------------------------------------------------------------
+// This failed SILENTLY and cost the under-hull pillar. A leg's attack point is
+// outboard, so the hull's yaw adds tangential speed on top of its 4.5 m/s -- 4.71
+// mean and 6.33 peak on the legs outside the turn. Chewers were chasing a point
+// faster than they could run, so their damage fluctuated with the turn phase and
+// fell to 0.5 hp/s at 4.70 m/s: the fortress walks on, untouched, and there is no
+// longer any reason to fight beneath it.
+//
+// Latching is the fix, so enemy speed only decides how fast they ARRIVE. This
+// asserts the property at a speed well below the hull's, because that is the case
+// that used to break, and the speed knob can reach it.
+console.log("\n15b. Chewers hold a leg even when far slower than the hull");
+{
+  for (const scale of [1.0, 0.6]) {
+    const sim = makeSim();
+    const { trampler, horde } = sim;
+    applyEnemySpeedScale(scale);
+
+    const e = horde.spawn(CHEWER);
+    const at = trampler.legAttackWorld(0, new THREE.Vector3());
+    e.x = at.x;
+    e.y = at.y;
+    e.z = at.z;
+    e.legIndex = 0;
+
+    // Leg 0 is outboard, so its attack point is one of the fast ones.
+    let dealt = 0;
+    step(sim, 60 * 20, () => {
+      dealt += CFG.trampler.legHp - trampler.legHp[0];
+      trampler.legHp[0] = CFG.trampler.legHp;
+    });
+
+    const speed = CFG.enemies.chewer.speed;
+    ok(`at ${scale.toFixed(1)}x (${speed.toFixed(2)} m/s, hull ${CFG.trampler.speed}) it still chews`,
+      dealt > 100, `${dealt.toFixed(0)} hp dealt over 20 s`);
+    ok(`and stays latched at ${scale.toFixed(1)}x`, e.latched);
+
+    applyEnemySpeedScale(1);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1908,13 +1992,50 @@ console.log("\n48. Emitters delay the spiral but cannot stop it alone");
   ok("all three emitters were placed", armed.placed === 3, `${armed.placed} placed`);
   ok("undefended, the fortress is crippled", bare.reached,
     `${(bare.frames / 60).toFixed(1)}s, wave ${bare.wave}`);
-  ok("emitters buy meaningful time", armed.frames > bare.frames * 1.2,
-    `${(bare.frames / 60).toFixed(1)}s -> ${(armed.frames / 60).toFixed(1)}s`);
-  ok("but they do NOT hold the line on their own -- the pillar survives",
+  ok("but emitters do NOT hold the line on their own -- the pillar survives",
     armed.reached,
     armed.reached
       ? `still crippled without a player, at ${(armed.frames / 60).toFixed(1)}s`
       : "AUTOMATION ALONE WON");
+
+  // Their contribution has to be measured with the director OUT of the loop.
+  // Pacing is now adaptive: emitters lower pressure by killing things, which
+  // brings the next wave sooner, so the director compensates the time away and
+  // wall-clock survival says nothing about how much work they did.
+  const fixedSet = (useEmitters) => {
+    const sim = makeSim();
+    const { player, trampler, emitters, horde } = sim;
+
+    if (useEmitters) {
+      for (const legIndex of [0, 2, 4]) {
+        const at = trampler.legAttackWorld(legIndex, new THREE.Vector3());
+        player.position.set(at.x, 1.2, at.z);
+        player.base = null;
+        player.velocity.set(0, 0, 0);
+        step(sim, 6);
+        sim.input.presses.add(CFG.emitters.deployKey);
+        step(sim, 2);
+      }
+    }
+
+    player.position.set(700, 1.2, 700);
+    player.base = null;
+    for (let i = 0; i < 14; i++) horde.spawn(CHEWER);
+
+    let frames = 0;
+    const cap = 60 * 45;
+    while (!trampler.immobilised && frames < cap) {
+      step(sim, 1);
+      frames++;
+    }
+    return frames;
+  };
+
+  const bareFixed = fixedSet(false);
+  const armedFixed = fixedSet(true);
+  ok("against a fixed force they buy real time",
+    armedFixed > bareFixed * 1.25,
+    `${(bareFixed / 60).toFixed(1)}s -> ${(armedFixed / 60).toFixed(1)}s`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1989,40 +2110,51 @@ console.log("\n50. Spawns are far away, and waves wait for the field to thin");
     return e;
   };
 
-  // Cripple it, so this is the wave-3 situation.
-  for (let i = 0; i < 4; i++) trampler.damageLeg(i, 1e6);
-  ok("fortress is immobilised", trampler.immobilised);
-
+  // Let it degrade on its own rather than pre-crippling it: an immobilised
+  // fortress now halts the pacing outright, so a pre-broken setup never gets any
+  // waves to measure.
   sim.waves = true;
 
-  // Track the PEAK. Sampling the final value is misleading here: once the last
-  // legs die the chewers escalate to boarding, which empties the under-hull area
-  // and hides the very thing being measured.
+  // Track PEAKS. Final values mislead here -- once the last legs die the chewers
+  // escalate to boarding, which empties the under-hull area being measured.
   let peakUnder = 0;
-  step(sim, 60 * 60, () => {
+  let peakAlive = 0;
+  step(sim, 60 * 100, () => {
     peakUnder = Math.max(peakUnder, horde.underHull);
+    peakAlive = Math.max(peakAlive, horde.liveCount);
   });
 
   ok("nothing spawns anywhere near the hull", nearest > 40,
     `nearest spawn ${nearest.toFixed(1)} m from hull centre`);
   ok("hostiles do accumulate in the hull's shadow", peakUnder > 0,
     `peak ${peakUnder} beneath the hull`);
+  ok("the field did get crowded", peakAlive > CFG.waves.holdUntilCleared,
+    `peak ${peakAlive} alive`);
+  ok("with nobody defending, the fortress ends up crippled", trampler.immobilised,
+    `${trampler.workingLegs()} legs working`);
 
-  // The anti-spiral rule: with a crowded field the clock must not keep firing.
-  ok("the field did get crowded", horde.liveCount > CFG.waves.holdUntilCleared,
-    `${horde.liveCount} alive`);
-  ok("so the next wave is held rather than stacked", director.holding,
-    `wave ${director.wave}, timer ${director.timer.toFixed(1)}`);
+  // The anti-spiral rule, and the strongest form of it: a stopped fortress stops
+  // the pacing dead. No reinforcements arrive while you are down in the sand.
+  ok("a stopped fortress halts the pacing entirely", director.holding,
+    `phase ${director.phase}, pressure ${(director.pressure * 100).toFixed(0)}%`);
 
   const heldAt = director.wave;
-  step(sim, 60 * 40);
-  ok("and it stays held while the field stays crowded", director.wave === heldAt,
-    `wave ${director.wave}`);
+  step(sim, 60 * 60);
+  ok("and it stays halted for as long as that lasts", director.wave === heldAt,
+    `wave ${director.wave} after another minute`);
 
-  // Clearing the field must release it.
+  // Recovering must release it -- after the guaranteed breather and the
+  // telegraph, not instantly.
   horde.clear();
-  step(sim, 60 * 3);
-  ok("clearing the field releases the next wave", director.wave > heldAt,
+  trampler.repairAll();
+  sim.player.hp = sim.player.maxHp;
+  sim.player.timeSinceHurt = 99;
+  step(sim, 60 * 5);
+  ok("recovering does not fire the next wave instantly", director.wave === heldAt,
+    `phase ${director.phase}`);
+
+  step(sim, 60 * (CFG.waves.minRest + CFG.waves.prepTime + 3));
+  ok("but it does come after the rest and the telegraph", director.wave > heldAt,
     `wave ${director.wave}`);
 }
 
@@ -2035,16 +2167,18 @@ console.log("\n51. Calling a wave early overrides the hold");
   const { horde, director } = sim;
 
   sim.waves = true;
-  step(sim, 60 * 45);
+  step(sim, 60 * 60);
   ok("field is crowded and the wave is held",
     horde.liveCount > CFG.waves.holdUntilCleared && director.holding,
-    `${horde.liveCount} alive, wave ${director.wave}`);
+    `${horde.liveCount} alive, wave ${director.wave}, phase ${director.phase}`);
 
   const before = director.wave;
   ok("Q is accepted", director.callEarly());
   step(sim, 60 * 2);
   ok("stacking waves remains the player's choice", director.wave > before,
     `wave ${before} -> ${director.wave}`);
+  ok("and calling early skips the prep window -- that is the risk",
+    director.phase === PHASE.SPAWNING, `phase ${director.phase}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2078,84 +2212,437 @@ console.log("\n52. Climbers do not pop when they latch on");
 }
 
 // ---------------------------------------------------------------------------
-// A playtester repaired a leg mid-fight and lost it again immediately. Measured:
-// a fresh 120 hp leg survives about three seconds against four chewers, and
-// repair takes 1.1 s -- so patching without clearing is always a losing trade.
-// Making it an explicit rule turns a hidden trap into a teachable one.
-console.log("\n53. Repair is blocked while hostiles are on you");
+// A playtester repaired a leg mid-fight and lost it again immediately. The first
+// fix blocked contested repair outright, which was an over-correction: repair does
+// 110 hp/s against roughly 40 hp/s of chewing, so the operative's own health was
+// always the real limiter. A hard block also breaks co-op, because the check
+// measures hostiles near the PLAYER -- a teammate defending the repairer would
+// have frozen the work. Now it is slowed to 35%, which is roughly a stalemate
+// against four chewers: hold the leg while someone clears, but do not win alone.
+console.log("\n53. Contested repair is slowed, not blocked");
 {
   const sim = makeSim();
   const { player, trampler, horde, repair } = sim;
 
+  // Keep the operative planted at the leg. Only x/z are re-set so gravity can
+  // settle y -- forcing y every frame would mask a placement bug.
+  const standAtLeg = () => {
+    const at = trampler.legAttackWorld(0, new THREE.Vector3());
+    player.position.set(at.x, player.position.y, at.z);
+  };
+
   trampler.damageLeg(0, 1e6);
-  const at = trampler.legAttackWorld(0, new THREE.Vector3());
-  player.position.set(at.x, 1.2, at.z);
+  {
+    const at = trampler.legAttackWorld(0, new THREE.Vector3());
+    player.position.set(at.x, 1.2, at.z);
+  }
   player.base = null;
   player.velocity.set(0, 0, 0);
   step(sim, 10);
   ok("a repair is offered", !!repair.target, repair.target?.label);
-  ok("and it is not blocked with nothing around", !repair.threatened);
+  ok("nothing nearby means it is uncontested", !repair.threatened);
 
-  // Park a chewer on top of the player.
+  // Measure half a second of unopposed work.
+  trampler.damageLeg(0, 1e6);
+  step(sim, 30, () => {
+    standAtLeg();
+    sim.input.keys.add(CFG.repair.key);
+  });
+  const clearGain = trampler.legHp[0];
+  ok("unopposed repair is fast", clearGain > 40, `${clearGain.toFixed(0)} hp in 0.5 s`);
+
+  // Now with a chewer parked on the player.
   const e = horde.spawn(CHEWER);
-  const hpBefore = trampler.legHp[0];
-  step(sim, 90, () => {
+  trampler.damageLeg(0, 1e6);
+  step(sim, 30, () => {
+    standAtLeg();
     e.x = player.position.x + 1.0;
     e.y = player.position.y;
     e.z = player.position.z;
     sim.input.keys.add(CFG.repair.key);
   });
+  const contestedGain = trampler.legHp[0];
 
   ok("the threat is detected", repair.threatened);
-  ok("no repair happens while contested", trampler.legHp[0] === hpBefore,
-    `${hpBefore} hp, unchanged after 1.5 s of holding E`);
-  ok("and the work is reported as blocked, not silently failing", !repair.active);
+  // The co-op case depends on this: a teammate fighting beside the repairer must
+  // not freeze the work, only slow it.
+  ok("work still progresses while contested", contestedGain > 0,
+    `${contestedGain.toFixed(0)} hp in 0.5 s`);
+  ok("the interaction stays active rather than refusing", repair.active);
+  ok("but it is clearly slower than unopposed",
+    contestedGain < clearGain * 0.6,
+    `${contestedGain.toFixed(0)} vs ${clearGain.toFixed(0)} hp`);
 
-  // Kill it and the work resumes.
+  // Contested repair should roughly match a small group's damage, not beat it.
+  const perSecond = contestedGain * 2;
+  ok("contested rate is in the stalemate band, not a win button",
+    perSecond > 20 && perSecond < 60, `${perSecond.toFixed(0)} hp/s while contested`);
+
+  // Full speed from ~19 hp needs about 0.9 s at 110 hp/s. Allow 1.25 s so the
+  // assertion tests that repair completes, not that it completes in a tight
+  // window.
   horde.damage(e, 1e6);
-  step(sim, 90, () => {
-    const s = trampler.legAttackWorld(0, new THREE.Vector3());
-    player.position.set(s.x, player.position.y, s.z);
+  step(sim, 75, () => {
+    standAtLeg();
     sim.input.keys.add(CFG.repair.key);
   });
-
-  ok("clearing the area unblocks it", !repair.threatened);
-  ok("and the leg comes back", trampler.legHp[0] > hpBefore,
-    `${hpBefore} -> ${trampler.legHp[0].toFixed(0)} hp`);
+  ok("clearing restores full speed", !repair.threatened);
+  ok("and the leg comes back", trampler.legHp[0] >= CFG.trampler.legHp - 1,
+    `${trampler.legHp[0].toFixed(0)} / ${CFG.trampler.legHp} hp`);
 }
 
 // ---------------------------------------------------------------------------
-console.log("\n54. Spawning never depends on whether the fortress is moving");
+console.log("\n54. Stopping never brings enemies closer, or more of them");
 {
-  const counts = [];
-  for (const stopped of [false, true]) {
+  // Placement, isolated from pacing: spawn directly and measure the ring.
+  const ring = (stopped) => {
+    const sim = makeSim();
+    if (stopped) for (let i = 0; i < 4; i++) sim.trampler.damageLeg(i, 1e6);
+    step(sim, 30);
+    ok(`the ${stopped ? "stopped" : "walking"} case is set up correctly`,
+      sim.trampler.immobilised === stopped);
+
+    const d = [];
+    for (let i = 0; i < 40; i++) {
+      const e = sim.horde.spawn(CHEWER);
+      d.push(Math.hypot(
+        e.x - sim.trampler.group.position.x,
+        e.z - sim.trampler.group.position.z,
+      ));
+    }
+    return {
+      min: Math.min(...d),
+      mean: d.reduce((a, b) => a + b, 0) / d.length,
+    };
+  };
+
+  const walking = ring(false);
+  const stopped = ring(true);
+
+  ok("nothing spawns close in either case", walking.min > 40 && stopped.min > 40,
+    `nearest ${walking.min.toFixed(1)} m walking, ${stopped.min.toFixed(1)} m stopped`);
+  ok("and the ring is the same distance either way",
+    Math.abs(walking.mean - stopped.mean) < 4,
+    `mean ${walking.mean.toFixed(1)} m vs ${stopped.mean.toFixed(1)} m`);
+
+  // Pacing: a stopped fortress must never receive MORE waves. It now receives
+  // fewer -- being immobilised holds the pacing outright.
+  const spawnsOver = (stopped) => {
     const sim = makeSim();
     sim.player.position.set(700, 1.2, 700);
     sim.player.base = null;
-
-    if (stopped) {
-      for (let i = 0; i < 4; i++) sim.trampler.damageLeg(i, 1e6);
-    }
+    if (stopped) for (let i = 0; i < 4; i++) sim.trampler.damageLeg(i, 1e6);
 
     let spawned = 0;
     const orig = sim.horde.spawn.bind(sim.horde);
-    sim.horde.spawn = (t, s) => {
-      const e = orig(t, s);
+    sim.horde.spawn = (t, s, a) => {
+      const e = orig(t, s, a);
       if (e) spawned++;
       return e;
     };
 
     sim.waves = true;
-    // Keep the field clear so the wave hold never interferes with the count.
-    step(sim, 60 * 50, () => sim.horde.clear());
+    step(sim, 60 * 60, () => sim.horde.clear()); // keep the field clear
+    return spawned;
+  };
 
-    counts.push(spawned);
-    if (stopped) ok("the stopped case really was immobilised", sim.trampler.immobilised);
+  const walkSpawns = spawnsOver(false);
+  const stopSpawns = spawnsOver(true);
+
+  ok("a walking fortress does get waves", walkSpawns > 0, `${walkSpawns} spawned`);
+  ok("a stopped one never gets more than a walking one",
+    stopSpawns <= walkSpawns,
+    `walking ${walkSpawns}, stopped ${stopSpawns}`);
+  ok("in fact being crippled halts reinforcements entirely", stopSpawns === 0,
+    `${stopSpawns} spawned while immobilised`);
+}
+
+// ---------------------------------------------------------------------------
+// The core of the pacing rework: waves are gated on how much trouble the crew is
+// actually in, not on a head count. Eight healthy enemies loitering at 60 m is
+// not the same problem as eight chewing the legs, and the old gate could not tell
+// those apart.
+console.log("\n55. Pacing is gated on crew pressure, not a head count");
+{
+  const sim = makeSim();
+  const { player, trampler, horde, director } = sim;
+  player.position.set(700, 1.2, 700);
+  player.base = null;
+  step(sim, 5);
+
+  ok("an untouched crew reads as calm", director.calm,
+    `pressure ${(director.pressure * 100).toFixed(0)}%`);
+
+  // Each signal on its own has to register.
+  const base = director.pressure;
+
+  player.hp = player.maxHp * 0.3;
+  const hurt = director.pressure;
+  ok("losing health raises pressure", hurt > base,
+    `${(base * 100).toFixed(0)}% -> ${(hurt * 100).toFixed(0)}%`);
+  player.hp = player.maxHp;
+
+  for (let i = 0; i < 4; i++) trampler.damageLeg(i, 1e6);
+  ok("an immobilised fortress raises pressure", director.pressure > base,
+    `${(director.pressure * 100).toFixed(0)}%`);
+  ok("and that alone is enough to stop the pacing advancing", !director.calm);
+  trampler.repairAll();
+
+  // Hostiles under the hull must count for more than hostiles far away.
+  const far = [];
+  for (let i = 0; i < 8; i++) far.push(horde.spawn(CHEWER));
+  step(sim, 2);
+  const distant = director.pressure;
+
+  const at = trampler.legAttackWorld(0, new THREE.Vector3());
+  step(sim, 4, () => {
+    for (const e of far) {
+      e.x = at.x;
+      e.y = at.y;
+      e.z = at.z;
+    }
+  });
+  const beneath = director.pressure;
+
+  ok("the same eight enemies read as more pressure once they are under the hull",
+    beneath > distant,
+    `${(distant * 100).toFixed(0)}% at range -> ${(beneath * 100).toFixed(0)}% beneath`);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n56. A guaranteed breather follows every wave");
+{
+  const sim = makeSim();
+  const { horde, director } = sim;
+  sim.player.position.set(700, 1.2, 700);
+  sim.player.base = null;
+  sim.waves = true;
+
+  // Force a wave, then wipe it instantly to simulate a flawless clear.
+  director.callEarly();
+  step(sim, 2);
+  while (director.phase === PHASE.SPAWNING) step(sim, 1);
+  horde.clear();
+  step(sim, 5);
+
+  ok("a cleared wave drops into rest, not straight into the next telegraph",
+    director.phase === PHASE.REST, `phase ${director.phase}`);
+  ok("the rest is a real length, not a formality",
+    director.timer > CFG.waves.minRest * 0.5,
+    `${director.timer.toFixed(1)}s of ${CFG.waves.minRest}s remaining`);
+
+  const waveAt = director.wave;
+  step(sim, 60 * (CFG.waves.minRest - 2));
+  ok("no telegraph during the guaranteed rest", director.phase === PHASE.REST,
+    `phase ${director.phase}`);
+
+  step(sim, 60 * 3);
+  ok("then the telegraph opens", director.phase === PHASE.PREP, `phase ${director.phase}`);
+  ok("and still no new wave until the telegraph finishes", director.wave === waveAt,
+    `wave ${director.wave}`);
+}
+
+// ---------------------------------------------------------------------------
+// The simulation was on Math.random in four places, which meant the same code
+// measured 15.2 s and 19.3 s on consecutive runs and the assertion guarding
+// invariant 2b passed or failed at random. Everything stochastic is seeded now.
+// This locks that down, including the part that is easy to get wrong: a RESTART
+// has to rewind the streams, or two attempts at the same wave are different
+// fights and the seeds buy nothing.
+console.log("\n57. A restarted encounter replays the same fight");
+{
+  const sim = makeSim();
+  const { trampler, horde, director } = sim;
+  sim.waves = true;
+
+  // Record each spawn's offset from the hull AT THE MOMENT it is created. World
+  // positions are the wrong measure -- what has to repeat is the decisions.
+  const spawnLog = [];
+  const realSpawn = horde.spawn.bind(horde);
+  horde.spawn = (type, hpScale, arcOffset) => {
+    const e = realSpawn(type, hpScale, arcOffset);
+    if (e) {
+      const dx = e.x - trampler.group.position.x;
+      const dz = e.z - trampler.group.position.z;
+      spawnLog.push(`${type}@${Math.hypot(dx, dz).toFixed(3)}/${Math.atan2(dz, dx).toFixed(3)}`);
+    }
+    return e;
+  };
+
+  const play = () => {
+    spawnLog.length = 0;
+    step(sim, 60 * 45);
+    return { seq: spawnLog.join(" "), bearing: director.arcOffset, wave: director.wave };
+  };
+
+  const first = play();
+  ok("the run actually spawned something (test is not vacuous)", first.seq.length > 0,
+    `${first.seq.split(" ").length} spawns, wave ${first.wave}`);
+
+  // Exactly what resetEncounter() does in main.js.
+  horde.clear();
+  trampler.repairAll();
+  trampler.resetPose();
+  director.reset();
+
+  const second = play();
+  ok("the same seed replays the same spawn sequence", first.seq === second.seq,
+    first.seq === second.seq ? "identical" : `\n    ${first.seq.slice(0, 90)}\n    ${second.seq.slice(0, 90)}`);
+  ok("and the same wave bearing", first.bearing === second.bearing,
+    `${first.bearing.toFixed(4)} vs ${second.bearing.toFixed(4)}`);
+  ok("and reaches the same wave", first.wave === second.wave,
+    `wave ${first.wave} vs ${second.wave}`);
+
+  // The pose rewind is the part that is easy to forget: spawn bearings derive
+  // from the hull's heading, so leaving it mid-patrol silently changes the fight.
+  trampler.resetPose();
+  ok("resetPose puts the fortress back on its start heading",
+    Math.abs(trampler.yaw - Math.PI) < 1e-9, `yaw ${trampler.yaw.toFixed(4)}`);
+  ok("and back at its start position on the patrol ring",
+    Math.abs(trampler.group.position.x - CFG.world.patrolRadius) < 1e-9
+    && Math.abs(trampler.group.position.z) < 1e-9,
+    `(${trampler.group.position.x.toFixed(2)}, ${trampler.group.position.z.toFixed(2)})`);
+}
+
+// ---------------------------------------------------------------------------
+// Enemy speed is the one difficulty number measurement cannot settle -- an oracle
+// defender that teleports is indifferent to it -- so it is a live knob instead of
+// a decided value. The knob mutates global CFG, which is exactly the kind of thing
+// that silently poisons every later test, so restoring it is asserted too.
+console.log("\n58. The live enemy-speed knob scales and restores cleanly");
+{
+  const baseChewer = CFG.enemies.chewer.speed;
+  const baseClimber = CFG.enemies.climber.speed;
+
+  const half = applyEnemySpeedScale(0.5);
+  ok("scaling down changes both enemy types",
+    Math.abs(half.chewer - baseChewer * 0.5) < 1e-9
+    && Math.abs(half.climber - baseClimber * 0.5) < 1e-9,
+    `chewer ${half.chewer.toFixed(2)}, climber ${half.climber.toFixed(2)}`);
+
+  ok("and it warns once they are slower than the hull itself", half.outrun,
+    `slowest ${Math.min(half.chewer, half.climber).toFixed(2)} vs hull ${CFG.trampler.speed}`);
+
+  const clampedLow = applyEnemySpeedScale(0.01);
+  ok("the scale is clamped at the low end", clampedLow.scale === CFG.debug.minEnemyScale,
+    `${clampedLow.scale}`);
+  const clampedHigh = applyEnemySpeedScale(99);
+  ok("and at the high end", clampedHigh.scale === CFG.debug.maxEnemyScale,
+    `${clampedHigh.scale}`);
+
+  // Scaling always applies to the AUTHORED speed, never compounding on the last
+  // result -- otherwise repeated presses would drift away from the base value.
+  applyEnemySpeedScale(1.2);
+  applyEnemySpeedScale(1.2);
+  ok("repeated scaling does not compound",
+    Math.abs(CFG.enemies.chewer.speed - baseChewer * 1.2) < 1e-9,
+    `${CFG.enemies.chewer.speed.toFixed(3)} vs expected ${(baseChewer * 1.2).toFixed(3)}`);
+
+  const restored = applyEnemySpeedScale(1);
+  ok("and 1.0x restores the authored speeds exactly",
+    CFG.enemies.chewer.speed === baseChewer && CFG.enemies.climber.speed === baseClimber,
+    `chewer ${CFG.enemies.chewer.speed}, climber ${CFG.enemies.climber.speed}`);
+  // Authored climbers sit just 0.02 m/s above the hull, so this assertion is
+  // genuinely load-bearing rather than decorative -- it is the tripwire for
+  // anyone nudging either number without checking the other.
+  ok("the authored speeds stay above the hull's own speed",
+    !restored.outrun,
+    `slowest ${Math.min(restored.chewer, restored.climber)} vs hull ${CFG.trampler.speed}`);
+}
+
+// ---------------------------------------------------------------------------
+// A playtest reported waiting around for enemies. Measured cause: the director
+// picked each wave's bearing across +/-72 deg, and a wave committed near abeam was
+// walked past by the fortress and spent the rest of the wave in a stern chase --
+// 23.2 s median to engage versus 7.1 s dead ahead. Narrowing the arc to 0.9 rad cut
+// that to 10.3 s, which beat slowing the hull by 29%.
+//
+// The arc cannot be narrowed indefinitely though: the telegraph's whole job is to
+// say WHERE, and that requires waves actually arriving from different directions.
+console.log("\n59. The wave bearing stays varied enough to be worth telegraphing");
+{
+  const sim = makeSim();
+  const { director } = sim;
+
+  const seen = {};
+  const offsets = [];
+  for (let i = 0; i < 60; i++) {
+    director.arcOffset = (director.random() * 2 - 1) * CFG.waves.forwardArc;
+    offsets.push(director.arcOffset);
+    seen[director.bearingLabel] = (seen[director.bearingLabel] || 0) + 1;
   }
 
-  ok("a stopped fortress does not attract extra spawns",
-    Math.abs(counts[0] - counts[1]) <= 2,
-    `walking ${counts[0]} spawned, stopped ${counts[1]} spawned`);
+  const labels = Object.keys(seen);
+  ok("all three bearings still occur", labels.length === 3,
+    labels.map((l) => `${l} ${seen[l]}`).join(", "));
+
+  // None may dominate, or the warning stops being information.
+  const most = Math.max(...Object.values(seen));
+  ok("and none of them dominates the telegraph", most < 60 * 0.6,
+    `most common appeared ${most}/60`);
+
+  const spread = Math.max(...offsets) - Math.min(...offsets);
+  ok("waves still arrive from meaningfully different directions",
+    spread > 1.0, `${(spread * 180 / Math.PI).toFixed(0)} deg of spread used`);
+
+  // The arc still has to point FORWARD -- a wave spawned abeam or behind is the
+  // stern chase this fixed.
+  ok("the arc stays within the forward hemisphere",
+    CFG.waves.forwardArc < Math.PI / 2,
+    `${(CFG.waves.forwardArc * 180 / Math.PI).toFixed(0)} deg either side`);
+}
+
+// ---------------------------------------------------------------------------
+// A siege has a finish line. Without one the fight is endless, and a playtester
+// averaging wave 4 read that as repeated failure rather than as nearly holding --
+// there was nothing being reached. Difficulty was deliberately NOT nerfed to suit
+// it: enemy strength is quadratic against a flat 200 dps, so the missing half is
+// the player's power curve.
+console.log("\n60. A siege ends when its last wave is resolved");
+{
+  const sim = makeSim();
+  const { horde, director, trampler } = sim;
+  sim.waves = true;
+
+  // Stand in for a competent crew: keep the field clear so waves keep resolving.
+  const clearField = () => {
+    for (const e of horde.pool) if (e.alive) horde.damage(e, 1e6);
+    trampler.repairAll();
+  };
+
+  let sawHeld = false;
+  let waveAtHeld = 0;
+  let spawnedAfterHeld = 0;
+
+  step(sim, 60 * 400, () => {
+    if (director.held) {
+      if (!sawHeld) {
+        sawHeld = true;
+        waveAtHeld = director.wave;
+      }
+      spawnedAfterHeld += horde.liveCount;
+    }
+    clearField();
+  });
+
+  ok("the siege reaches its end", sawHeld, `phase ${director.phase}`);
+  ok("and it ends on the configured wave, not before or after",
+    waveAtHeld === CFG.waves.siegeLength,
+    `held at wave ${waveAtHeld}, siegeLength ${CFG.waves.siegeLength}`);
+  ok("nothing spawns once it is held", spawnedAfterHeld === 0,
+    `${spawnedAfterHeld} enemy-frames after the siege ended`);
+  ok("the wave count does not creep past the siege length",
+    director.wave === CFG.waves.siegeLength, `wave ${director.wave}`);
+  ok("and calling a wave early cannot restart a finished siege",
+    director.callEarly() === false);
+
+  // A reset has to make it runnable again, or a win is a dead end.
+  horde.clear();
+  trampler.repairAll();
+  trampler.resetPose();
+  director.reset();
+  ok("resetting clears the held state", !director.held && director.wave === 0,
+    `phase ${director.phase}, wave ${director.wave}`);
 }
 
 ok("no boarder ever floated off the deck footprint", !sawFloatingBoarder);

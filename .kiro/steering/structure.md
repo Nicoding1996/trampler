@@ -5,7 +5,7 @@
 ```
 index.html          canvas, HUD markup, importmap, click-to-play gate
 server.mjs          loopback-only static server
-verify.mjs          headless test harness (49 sections, 198 checks)
+verify.mjs          headless test harness (61 sections, 272 checks)
 src/
   config.js    365   every tunable, with a comment explaining each value
   util.js       49   box(), boxToMesh(), seeded RNG, clamp/lerp/damp/smoothstep
@@ -15,7 +15,7 @@ src/
   player.js    556   FPS controller, based movement, mantle, health
   grapple.js   260   winch: hull-local anchors, brake, cut-vs-arrive release
   enemies.js   509   pooled horde, instanced draw, spatial hash, two AI types
-  waves.js      81   director; difficulty from elapsed time
+  waves.js     210   director: pacing gated on crew pressure, bounded siege
   weapon.js    216   the single hitscan path, tracers, impacts
   deckgun.js   245   manned mounts, hull-local traverse arcs, heat
   repair.js    139   contextual repair, ground markers, grace window

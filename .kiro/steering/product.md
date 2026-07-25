@@ -52,7 +52,19 @@ silhouette, while personal upgrades stack without limit in the Risk of Rain
 style. Growth shows up as accretion on a fixed frame, not as infinite geometry.
 
 **Difficulty scales with elapsed time, not wave number.** Getting stronger has to
-be a race against a clock, not a staircase climbed at your own pace.
+be a race against a clock, not a staircase climbed at your own pace. This is also
+the anti-stall valve: the rest phase cannot be farmed, because waiting makes
+everything tougher.
+
+**Pace off what the crew is actually enduring, not off a head count.** Following
+Left 4 Dead's director: spawning stops entirely while pressure is high, then a
+guaranteed calm follows. Pressure comes from health lost, hostiles under the hull,
+hostiles aboard, and whether the fortress is stopped. Eight healthy enemies
+loitering at 60 m are not the same problem as eight chewing the legs.
+
+**Telegraph every wave.** A preparation window with a named bearing is what makes
+deployable defences a decision and gives the guns a reason to be manned at a
+specific moment. Borrowed from Deep Rock Galactic's swarm warning.
 
 **Automation is the floor, manned action is the ceiling.** Deployable defences
 exist to buy time while you are somewhere else, never to hold a position on their
@@ -61,6 +73,20 @@ there and a pillar dies. Measure this, do not estimate it — the first pass at
 shock emitters looked weak on paper (a third of a player's damage) and held the
 under-hull area indefinitely, because automation never aims, never dies, and
 never has to break off to repair something.
+
+**Separate "impossible" from "too demanding" before tuning anything.** Wave 3 was
+called a wall three times and three different fixes were aimed at it. The useful
+move was an **oracle defender** — teleports, never misses, never takes damage,
+limited only to one action per frame — which survived past wave 6 untouched. That
+proved the fight was winnable and the real constraint was travel and reaction
+time, which points at completely different knobs. Build the upper bound before
+adjusting numbers.
+
+**Enemy speed is a human-facing knob, not a difficulty knob.** Slowing enemies 16%
+changed the oracle's survival by one second in 227, because the oracle never
+travels. Speed spends itself almost entirely on a human's travel and reaction
+time, so it is the right lever for "this feels frantic" and the wrong lever for
+"this is too easy".
 
 **Solo is designed, not scaled down.** Co-op is the primary experience, but the
 solo answer is a system (deployables, in the Deep Rock Galactic / Bosco mould),

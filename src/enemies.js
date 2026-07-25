@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { CFG } from "./config.js";
+import { makeRandom } from "./util.js";
 
 // Pooled horde on InstancedMesh with a spatial hash for separation.
 //
@@ -60,8 +61,18 @@ class Grid {
 }
 
 export class Horde {
-  constructor(scene, trampler) {
+  constructor(scene, trampler, seed = CFG.enemies.seed) {
     this.trampler = trampler;
+    this.seed = seed;
+
+    // Spawn bearings and leg choices were on Math.random, which made the whole
+    // simulation unreproducible. That is fine for a game and fatal for the test
+    // harness: test 48 measures how long emitters delay an immobilisation, and
+    // with random spawn arcs the same code produced 15.2s and 19.3s on
+    // consecutive runs, so the assertion guarding invariant 2b was a coin flip.
+    // Seeded per Horde, so every sim starts from the same stream.
+    this.random = makeRandom(seed);
+
     this.liveCount = 0;
     this.underHull = 0;
     this.aboard = 0;
@@ -75,6 +86,10 @@ export class Horde {
         x: 0, y: 0, z: 0, vx: 0, vz: 0,
         state: S.HUNT_LEG, legIndex: 0, routeIndex: 0, climbT: 0, atkCd: 0,
         onHull: false, yaw: 0, flash: 0,
+        // Latched onto a leg and being carried by the hull. Chewers cannot
+        // out-run an outboard attack point on a turning fortress, so they hold on
+        // instead of chasing.
+        latched: false,
         // Where a climb actually began, in hull space. Lerping from the route's
         // start instead snapped the enemy up to 1.6 m the instant it latched on.
         climbFrom: new THREE.Vector3(),
@@ -137,11 +152,17 @@ export class Horde {
     const hp = this.trampler.legHp;
     const open = [];
     for (let i = 0; i < hp.length; i++) if (hp[i] > 0) open.push(i);
-    if (open.length === 0) return (Math.random() * hp.length) | 0;
-    return open[(Math.random() * open.length) | 0];
+    if (open.length === 0) return (this.random() * hp.length) | 0;
+    return open[(this.random() * open.length) | 0];
   }
 
-  spawn(type, hpScale = 1) {
+  /**
+   * @param arcOffset radians from the hull's heading. When the director supplies
+   *        one, the wave arrives in a tight cone around that bearing so it can be
+   *        telegraphed and defended against. Omitted, it scatters across the
+   *        whole forward arc.
+   */
+  spawn(type, hpScale = 1, arcOffset = null) {
     const e = this.#free();
     if (!e) return null;
 
@@ -152,8 +173,10 @@ export class Horde {
     // Spawning behind it means chasing a moving target at a 1.5 m/s closing
     // speed, and the wave simply never lands.
     const fwd = Math.atan2(-Math.cos(t.yaw), -Math.sin(t.yaw));
-    const ang = fwd + (Math.random() * 2 - 1) * CFG.waves.forwardArc;
-    const r = CFG.waves.spawnRadius * (0.85 + Math.random() * 0.3);
+    const aimed = arcOffset !== null;
+    const spread = aimed ? CFG.waves.waveSpread : CFG.waves.forwardArc;
+    const ang = fwd + (aimed ? arcOffset : 0) + (this.random() * 2 - 1) * spread;
+    const r = CFG.waves.spawnRadius * (0.85 + this.random() * 0.3);
 
     e.alive = true;
     e.type = type;
@@ -167,6 +190,7 @@ export class Horde {
     e.atkCd = 0;
     e.climbT = 0;
     e.onHull = false;
+    e.latched = false; // pooled objects are reused, so every field must be reset
     e.yaw = 0;
 
     if (type === CHEWER) {
@@ -174,7 +198,7 @@ export class Horde {
       e.legIndex = this.#pickLeg();
     } else {
       e.state = S.TO_CLIMB;
-      e.routeIndex = (Math.random() * t.climbRoutes.length) | 0;
+      e.routeIndex = (this.random() * t.climbRoutes.length) | 0;
     }
 
     this.liveCount++;
@@ -184,6 +208,11 @@ export class Horde {
   clear() {
     for (const e of this.pool) e.alive = false;
     this.liveCount = 0;
+
+    // Re-seed, so a restarted encounter is the SAME fight. Seeding exists to make
+    // two attempts comparable; carrying the stream across a reset would hand the
+    // player a different wave pattern and quietly defeat the whole point.
+    this.random = makeRandom(this.seed);
   }
 
   // ------------------------------------------------------------------ update
@@ -216,9 +245,10 @@ export class Horde {
       e.atkCd = Math.max(0, e.atkCd - dt);
       if (e.flash > 0) e.flash = Math.max(0, e.flash - dt);
 
-      // Enemies standing on the deck ride the hull exactly the way the player
-      // does -- same prev-frame-local to current-frame-world transform.
-      if (e.onHull) {
+      // Anything attached to the fortress rides it exactly the way the player
+      // does -- same prev-frame-local to current-frame-world transform. That is
+      // boarders standing on the deck, and chewers latched onto a leg.
+      if (e.onHull || e.latched) {
         _v.set(e.x, e.y, e.z);
         t.worldToPrevLocal(_v);
         t.localToWorld(_v);
@@ -236,24 +266,56 @@ export class Horde {
           // fortress crippled but the threat gone. So they escalate and board.
           if (t.brokenLegs() >= t.legHp.length) {
             e.state = S.TO_CLIMB;
+            e.latched = false;
             e.climbT = 0;
-            e.routeIndex = (Math.random() * t.climbRoutes.length) | 0;
+            e.routeIndex = (this.random() * t.climbRoutes.length) | 0;
             break;
           }
 
-          if (t.legHp[e.legIndex] <= 0) e.legIndex = this.#pickLeg();
+          if (t.legHp[e.legIndex] <= 0) {
+            e.legIndex = this.#pickLeg();
+            e.latched = false;
+          }
           t.legAttackWorld(e.legIndex, _v);
-          const d = this.#steer(e, cfg, _v);
 
-          if (d < cfg.reach) {
-            // Stand and chew. Enemies have no collision against the fortress,
-            // so without halting they walk straight on through it.
+          // Once in reach a chewer LATCHES to the hull and is carried by it,
+          // rather than re-chasing a point every frame.
+          //
+          // Chasing was never actually winnable. A leg's attack point is outboard,
+          // so the hull's yaw adds tangential speed on top of its 4.5 m/s: measured
+          // at 4.71 m/s mean and 6.33 m/s peak on the legs outside the turn. That is
+          // faster than any chewer has ever been able to run, so damage output
+          // fluctuated with the hull's turn phase, and below ~4.71 m/s it stopped
+          // entirely -- chewers trailed the fortress forever and dealt zero damage,
+          // which quietly removes the whole reason to fight beneath the hull.
+          //
+          // Latching decouples the two jobs: speed decides how fast they ARRIVE,
+          // the latch decides whether they can HOLD ON. That is what makes enemy
+          // speed a free tuning knob instead of a number secretly coupled to the
+          // hull's turn rate and leg geometry.
+          const d = Math.hypot(e.x - _v.x, e.z - _v.z);
+
+          // Neighbour separation can shove a latched chewer off its spot. Well
+          // outside reach, let go and walk back in.
+          if (e.latched && d > cfg.reach * 1.6) e.latched = false;
+
+          if (e.latched) {
+            // Enemies have no collision against the fortress, so holding still is
+            // what stops them walking straight through it.
             e.vx = 0;
             e.vz = 0;
-            if (e.atkCd <= 0) {
-              t.damageLeg(e.legIndex, cfg.damage);
-              e.atkCd = 1 / cfg.attackRate;
+          } else {
+            this.#steer(e, cfg, _v);
+            if (d < cfg.reach) {
+              e.latched = true;
+              e.vx = 0;
+              e.vz = 0;
             }
+          }
+
+          if (e.latched && e.atkCd <= 0) {
+            t.damageLeg(e.legIndex, cfg.damage);
+            e.atkCd = 1 / cfg.attackRate;
           }
           break;
         }
@@ -353,7 +415,7 @@ export class Horde {
             e.onHull = false;
             e.state = S.TO_CLIMB;
             e.climbT = 0;
-            e.routeIndex = (Math.random() * t.climbRoutes.length) | 0;
+            e.routeIndex = (this.random() * t.climbRoutes.length) | 0;
           }
         }
       }

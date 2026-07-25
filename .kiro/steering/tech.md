@@ -21,7 +21,7 @@ node --check <file> # syntax only
 ## Verification
 
 `verify.mjs` runs the real simulation modules in Node with no DOM and no
-renderer. 44 sections, 177 assertions. **Run it after every change.** The
+renderer. 61 sections, 272 assertions. **Run it after every change.** The
 failure modes here — drift, being yanked off a turning deck, an anchor that does
 not track the hull, an enemy shielded by geometry — are invisible to inspection
 and tedious to confirm by hand.
@@ -37,6 +37,15 @@ information, not as an obstacle.
   `node verify.mjs > out.txt 2>&1`. Clean the file up afterwards.
 - **Writing a file and running it in the same tool block races.** The run can
   execute the previous version. Issue the write, then the run, separately.
+- **Reusing an output filename fails** with "the process cannot access the file"
+  while a previous run still holds it. Use a fresh name, and delete the scratch
+  files afterwards.
+- **Grep `includePattern` only honours globs starting with `**/`.** `src/*.js` and
+  brace lists like `{a.js,b.js}` silently match *nothing*, which reads as "clean"
+  and is how unseeded `Math.random` calls went unnoticed through several searches.
+  Use `**/*.js` or `**/enemies.js`.
+- Redirecting through PowerShell writes UTF-16, which `findstr` refuses. Redirect
+  from cmd, or read the file with the file tools.
 
 ## Tests that lie — check for these before trusting a pass
 
@@ -54,6 +63,16 @@ Every one of these produced a green or red result that was wrong:
   gives you last frame's orientation unless matrices are refreshed.
 - **Assertions the fix deliberately invalidated.** When behaviour intentionally
   changes, old assertions fail *correctly*. Read before repairing.
+- **Nondeterministic scenarios.** Spawn arcs were on `Math.random`, so the same
+  code measured 15.2 s and 19.3 s on consecutive runs and an assertion guarding a
+  pillar invariant passed or failed at random. The horde now draws from a seeded
+  stream (`CFG.enemies.seed`). If a result moves when nothing changed, suspect
+  entropy before suspecting your edit — and confirm by running the suite twice.
+- **Test scaffolding that inherits the wrong state.** A helper that placed the
+  operative with `player.position.y || 1.2` picked up their *deck* height on the
+  first call, so they hovered above the leg and no repair was ever offered. Set
+  the axis you mean explicitly the first time; only preserve values you want
+  carried.
 
 ## Coordinate traps
 

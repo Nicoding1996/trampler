@@ -15,7 +15,7 @@ The four-step prove-it plan set out before any code was written is complete.
 | 4. Spatial damage, repair, and a reason to be on the deck | done |
 | 5. Deployable defences — the tower-defence layer | done |
 
-198 headless checks pass. The prototype contains both halves of the pillar, makes
+244 headless checks pass. The prototype contains both halves of the pillar, makes
 them mutually exclusive, and gives one player a way to cover their own absence.
 
 ## The pillar is confirmed
@@ -35,6 +35,78 @@ Two problems came out of the same session, both now addressed:
   against 28-second waves, so it is a small slice of playtime by construction.
   Still open — see Tier 2.
 
+## The wave-3 wall, and what is behind it
+
+Wave 3 was reported as a wall three times. Three separate fixes were aimed at it
+— repair rate, pressure-gated pacing, contested repair — and the third playtest
+finally cleared it, reaching wave 4 "barely".
+
+Before the third fix, the wall was diagnosed properly instead of guessed at, with
+an **oracle defender**: teleports, never misses, never takes damage, perfect
+information, and exactly one real limitation — a single action per frame, shoot or
+repair. It is a strict upper bound on solo play.
+
+| Scenario | Outcome |
+|---|---|
+| Nobody defending | reactor lost at 53.8 s, wave 1 |
+| Oracle defender | survived past wave 6, reactor untouched, all legs full |
+| Oracle, enemies 16% slower | past wave 6 again — 226 s vs 228 s |
+
+Two conclusions, both load-bearing:
+
+- **The arithmetic is not the wall.** A player who is always in the right place
+  wins comfortably. What beats a real player is getting there.
+- **Enemy speed is therefore a human-facing knob, not a difficulty knob.** It
+  barely moved the oracle, because the oracle never travels. Everything it buys
+  goes to a human's travel and reaction time. So it was settled in play with a live
+  knob (`,` / `.`) rather than by argument: **chewers 4.70 m/s, climbers 4.52**,
+  against the hull's 4.5 and a walking player's 7.0.
+
+  Raw speed-vs-hull comparison badly overstates the risk of going low. Climbers at
+  4.52 still put 8 of 8 boarders on a hull walking at full speed, only 0.7 s later
+  than at 5.2, because waves arrive head-on and the fortress walks a circle that
+  trailing enemies cut inside. What low speed actually costs is the stern chase:
+  closing a 30 m gap from behind went from 24 s to 81 s, so a healthy fortress now
+  sheds anything it gets past.
+
+  Dropping to 4.70 exposed a **silent** bug that had been there all along: chewers
+  chased a leg attack point moving at up to 6.33 m/s and simply fell behind, dealing
+  0.5 hp/s instead of 9.9 — the under-hull threat evaporating with nothing looking
+  wrong. Chewers now latch onto a leg and ride the hull. Four on one leg finally
+  deal the 39.6 hp/s the rest of the design was already tuned against.
+
+  Side effect to watch: every speed reduction makes automation relatively stronger,
+  because emitters do not have to chase anything. The fixed-force emitter measure
+  has gone 1.37x -> 1.54x -> 2.18x across these cuts. Invariant 2b still holds, but
+  it is the guard that will break first if speed drops again.
+
+- **Waiting around for enemies was the wave bearing, not the hull speed.** The
+  director picked each wave's bearing across ±72°, and a wave committed near abeam
+  got walked past — 23.2 s median to engage against 7.1 s dead ahead, so roughly a
+  third of waves were a stern chase. `forwardArc` narrowed 1.25 → 0.9 rad, worst
+  case now 10.3 s. Slowing the hull was the proposed fix and measured worse: a 29%
+  cut only reached 13.3 s, and it does not stop bad bearings being handed out. The
+  bearing-label threshold is now derived from the arc so the telegraph cannot
+  silently degenerate to always DEAD AHEAD.
+
+**The next wall is already visible in the numbers.** Reactor time-to-death, if
+every climber in a wave reaches it:
+
+| Wave | Climbers | Reactor dps | Dies in |
+|---|---|---|---|
+| 1 | 3 | 45 | 9.3 s |
+| 2 | 5 | 75 | 5.6 s |
+| 3 | 6 | 90 | 4.7 s |
+| 4 | 8 | 120 | 3.5 s |
+
+Repair is 60 hp/s, so from wave 2 onward the reactor cannot be out-repaired while
+boarders stand on it — by design. But 3.5 s is less than the time to notice,
+grapple up, turn and engage, which makes wave 4 a reaction-time wall rather than a
+decision. Candidate fixes, to be tried **one at a time** so the effect is
+measurable: cap how many boarders can engage the reactor at once, flatten
+`climberShare` growth, or give the reactor a visible countdown so the trip up is
+planned rather than reactive.
+
 ## Still to judge in play
 
 - Does the recovery loop hold at wave 3+ now, or does it just fail later?
@@ -49,6 +121,16 @@ Two problems came out of the same session, both now addressed:
 ## Tier 1 — turn an encounter into a run
 
 Nothing here is polish. Without it there is no roguelike, just an endless fight.
+
+0. **A finish line — done.** A siege is `CFG.waves.siegeLength` waves (5, about
+   three minutes) and ends in a HELD state that stops spawning and does not
+   auto-reset. Added because a playtester averaging wave 4 read it as repeated
+   failure when it is a reasonable curve against a fixed rifle; nothing was being
+   reached. Deliberately shipped **without** nerfing difficulty, because enemy
+   strength is quadratic (count x time-scaled hp) against a flat 200 dps — the
+   missing half is the player's power curve, and nerfing now would have to be undone
+   the moment upgrades land. Move `siegeLength`, not the enemy numbers.
+   → test 60
 
 1. **Economy.** Kills drop scrap; scrap buys things. This is the current blocker
    on everything else: the "call the wave early" key exists and works, but there

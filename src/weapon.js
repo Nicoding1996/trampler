@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { CFG } from "./config.js";
+import { makeRandom } from "./util.js";
 
 // Hitscan rifle. Deliberately plain -- it exists so there is something to do
 // about the horde, not because gunplay is the question under test.
@@ -34,6 +35,11 @@ export class Weapon {
     this.hitFlash = 0;      // drives the crosshair hitmarker
 
     this.raycaster = new THREE.Raycaster();
+
+    // Cone spread is seeded, like every other stochastic part of the sim. At
+    // 0.007 rad it scatters a shot by ~0.2 m at 30 m, which was enough to make a
+    // measured tracer length differ between otherwise identical runs.
+    this.random = makeRandom(CFG.combat.weapon.seed);
 
     // Railings are collision geometry for BODIES, not for bullets. They are
     // solid boxes only so the player cannot walk through them; a real railing is
@@ -129,8 +135,8 @@ export class Weapon {
     if (profile.spread > 0) {
       _right.crossVectors(dir, UP_Y).normalize();
       _up.crossVectors(_right, dir).normalize();
-      const a = Math.random() * Math.PI * 2;
-      const r = Math.sqrt(Math.random()) * profile.spread;
+      const a = this.random() * Math.PI * 2;
+      const r = Math.sqrt(this.random()) * profile.spread;
       dir.addScaledVector(_right, Math.cos(a) * r).addScaledVector(_up, Math.sin(a) * r).normalize();
     }
 

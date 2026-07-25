@@ -83,11 +83,16 @@ never beat chewer damage of 48-154 hp/s at any wave size, so falling behind was
 unrecoverable. Now 110 hp/s: a dead leg takes about a second.
 → test 45
 
-**12c. Repair is blocked while hostiles are within 6 m.** A fresh 120 hp leg
-survives about three seconds against four chewers, so patching without clearing
-first is always a losing trade. It used to be *allowed* but futile, which is a
-hidden trap. Blocking it, and saying CLEAR THE AREA, makes the intended order
-explicit: kill, then patch.
+**12c. Contested repair is slowed to 35%, never blocked.** Blocking it was an
+over-correction and was reverted. Repair does 110 hp/s against roughly 40 hp/s of
+chewing, so the operative's own health — 40 hp/s incoming against 100 hp — was
+always the real limiter; the rule was redundant. It also measures hostiles near
+the *player*, so a hard block froze the work whenever a teammate fought beside the
+repairer, which breaks the division of labour co-op is built on. At 35% (38 hp/s)
+contested leg repair roughly matches four chewers: hold a leg while someone else
+clears, but do not win alone. Contested reactor repair (21 hp/s) still loses to
+three boarders, so the reactor demands clearing either way. The HUD says
+CONTESTED rather than refusing, so the player sees the trade.
 → test 53
 
 **13. Only one station can be manned at a time, and manning one pins you.**
@@ -115,14 +120,79 @@ standing on the spawn point.
 escalate to boarding rather than idling under a wrecked fortress.
 → test 20
 
-**19. Waves must never stack onto an unresolved fight.** The next wave waits for
-the field to thin below a threshold. On a fixed clock, falling behind once was
-unrecoverable — measured as 16 hostiles parked under an immobilised hull with more
-arriving on schedule. Calling a wave early with Q deliberately bypasses the hold,
-so stacking stays a player choice.
-→ tests 50, 51
+**18b. An attacker that has reached its target rides it.** Chewers latch to a leg
+rather than re-chasing it each frame, because the target moves faster than they
+do: a leg's attack point is outboard, so the hull's yaw adds tangential speed on
+top of its 4.5 m/s — measured at 4.71 m/s mean and **6.33 m/s peak** on the legs
+outside a turn, which exceeds even the fastest chewer speed ever configured.
+Chasing made leg damage fluctuate with the hull's turn phase, and below ~4.71 m/s
+it collapsed to 0.5 hp/s from a nominal 9.9: the fortress walks on untouched and
+the reason to fight beneath it disappears. This failed **silently** — nothing
+looked wrong, the enemies were simply always slightly behind.
+
+Latching decouples the two jobs: speed decides how fast they arrive, the latch
+decides whether they can hold on. Never make an attacker's damage depend on
+out-running a point attached to a turning fortress.
+→ tests 15, 15b
+
+**19. Waves must never stack onto an unresolved fight.** Pacing follows L4D's
+model: REST → PREP → SPAWNING → ENGAGED, gated on measured crew *pressure* rather
+than a head count. On a fixed clock, falling behind once was unrecoverable —
+measured as 16 hostiles parked under an immobilised hull with more arriving on
+schedule. A stopped fortress alone now halts reinforcements outright.
+→ tests 16, 50, 54, 55
+
+**19b. Every wave is telegraphed, and a guaranteed rest precedes it.** Deep Rock
+Galactic gives 15-20 s before a swarm so players can set defences; that window is
+what makes deployable emitters a decision rather than an afterthought. Calling a
+wave early with Q bypasses both the hold and the telegraph — getting no prep time
+is the price of stacking.
+→ tests 16, 51, 56
+
+**19d. The telegraph has to actually say something, so waves must arrive from
+genuinely different bearings.** All three labels must occur and none may dominate.
+This is in tension with arrival time: a wave committed near abeam gets walked past
+by the fortress and spends the rest of the wave in a stern chase — measured at
+23.2 s median to engage at 72° off the bow, against 7.1 s dead ahead, which a
+playtester experienced as waiting around for enemies. `forwardArc` is the balance
+point between those two failures, currently 0.9 rad. Narrow it and the telegraph
+degenerates to always DEAD AHEAD; widen it and a third of waves are a stern chase.
+The label threshold is derived from the arc rather than fixed, so the two cannot
+drift apart.
+
+Slowing the hull was the alternative and is strictly worse: a 29% cut only reaches
+13.3 s, and hull speed already scales 4.5/3.4/2.3/1.1 with legs lost, so lowering
+the base compresses the range that tells the player how damaged the fortress is.
+→ test 59
+
+**19c. Pacing is adaptive, so "buying time" is not measurable in wall-clock
+terms.** Killing enemies faster lowers pressure, which brings the next wave
+sooner. Any test of a defensive tool's contribution must take the director out of
+the loop (fixed enemy set) or it will measure nothing.
+→ test 48
 
 **20. Enemies must never teleport.** Worst legitimate frame-to-frame movement is
 about one stride. A climber used to snap up to 1.6 m sideways when it latched onto
 a climb route, which read to a playtester as enemies materialising out of nowhere.
 → test 52
+
+**21. The simulation is reproducible, including across a restart.** Every
+stochastic choice draws from a seeded stream, never `Math.random`, and every seed
+lives in `config.js`: spawn bearing, spawn radius, leg choice and climb-route
+choice (`CFG.enemies.seed`), wave bearing and the climber interleave
+(`CFG.waves.seed`), weapon cone spread (`CFG.combat.weapon.seed`), rock and ruin
+scatter (`CFG.world.seed`). Before this, the same code measured 15.2 s and 19.3 s
+on consecutive runs of the emitter test, so the assertion guarding invariant 2b
+passed or failed at random. Two full runs of the suite now differ **only** in the
+wall-clock perf reading.
+
+Restarting has to rewind three things or the seeds buy nothing: `horde.clear()`
+re-seeds, `director.reset()` re-seeds, and `trampler.resetPose()` puts the
+fortress back on its start heading — spawn bearings are computed from that
+heading, so a restart mid-patrol is measurably a different fight from the same
+seed. The point of the seeds is comparing two attempts at the same wave.
+
+Never reintroduce unseeded randomness into a simulation module. Note that
+searching for it is easy to get wrong: four of the five hid behind grep patterns
+that silently matched nothing.
+→ test 57

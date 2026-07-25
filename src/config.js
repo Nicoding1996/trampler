@@ -146,6 +146,10 @@ export const CFG = {
   },
 
   world: {
+    // Rock and ruin scatter. Kept at its original value so the terrain players
+    // have been testing against does not move.
+    seed: 20260725,
+
     fogColor: 0xc7b299,
     fogNear: 70,
     fogFar: 460,
@@ -167,6 +171,7 @@ export const CFG = {
       damage: 25,
       fireRate: 8,      // shots per second
       spread: 0.007,    // radians of cone
+      seed: 4242,       // cone spread draws from this, never Math.random
       range: 220,
 
       // Enemies are hit as BOXES matching what is drawn, not as spheres. A
@@ -203,12 +208,36 @@ export const CFG = {
   enemies: {
     max: 420,
 
+    // Spawn bearings, spawn radius, leg choice and climb-route choice all draw
+    // from one seeded stream per Horde rather than Math.random. A fixed seed
+    // means a scenario replays identically, which the harness needs: with random
+    // arcs, the same emitter test measured 15.2 s and 19.3 s on back-to-back
+    // runs. Change this number to get a different but still reproducible fight.
+    seed: 20260725,
+
     // Chewers attack the legs from INBOARD, under the hull slab. That is not
     // decoration: the deck physically blocks line of sight to anything directly
     // beneath it, so they cannot be answered from up top. This is the forcing
     // function that makes players dismount at all.
+    // Speed is a HUMAN-facing knob, not a difficulty knob. Measured with an
+    // oracle defender that teleports and never misses: dropping enemy speed 16%
+    // changed its survival by one second out of 227, because it never had to
+    // travel. Everything speed buys goes to a real player's travel and reaction
+    // time, which is what actually decides these fights. So it was settled in
+    // play, with the , and . keys, not by argument -- 0.87x of the previous
+    // 5.4/5.2 was the chosen feel.
+    //
+    // 4.70 gives a walking player (7.0) 2.3 m/s of room to back off while
+    // shooting, against 0.8 originally.
+    //
+    // Speed used to be secretly coupled to the hull's turn rate and leg geometry:
+    // a chewer chased a leg attack point that moves at 4.71 m/s mean and 6.33 peak
+    // on the legs outside a turn, so at 4.70 it fell behind forever and dealt
+    // 0.5 hp/s instead of 9.9. Chewers now LATCH to a leg once in reach and are
+    // carried by the hull, so this number only decides how fast they ARRIVE and
+    // can be tuned freely. See the latch in enemies.js and test 15b.
     chewer: {
-      hp: 50, speed: 6.2, damage: 9, attackRate: 1.1,
+      hp: 50, speed: 4.7, damage: 9, attackRate: 1.1,
       radius: 0.5, height: 1.6, reach: 2.0,
 
       // How far inboard of centre they plant themselves. This doubles as the
@@ -229,8 +258,23 @@ export const CFG = {
     // Climbers board via authored attach points and go for the reactor, which
     // is the opposite pressure: staying on the ground too long costs you.
     climber: {
-      // Must outpace the hull by a clear margin or boarders never arrive at all.
-      hp: 80, speed: 6.0, damage: 15, attackRate: 1.0,
+      // 4.52 sits 0.02 m/s above the hull's 4.5, which is a rounding error rather
+      // than a margin -- so this was measured before being trusted. Boarding is
+      // unharmed: 8 of 8 climbers still get aboard a hull walking at full speed,
+      // arriving 0.7 s later than at 5.2, and the reactor is still destroyed.
+      //
+      // Two reasons the near-zero margin does not matter. Waves spawn in the
+      // FORWARD arc, so the approach is head-on at a ~9 m/s closing speed, and the
+      // fortress walks a patrol CIRCLE, so it is always turning and a trailing
+      // enemy cuts the corner. Raw speed comparison against the hull overstates
+      // the danger badly -- even 4.40 still boards.
+      //
+      // What it does cost is the stern chase: closing a 30 m gap from behind went
+      // from 24 s to 81 s. A healthy fortress now sheds anything it gets past.
+      // If climbers ever stop reaching the deck, this is the first number to
+      // suspect, because losing boarders removes the reason to go back up and
+      // takes half the pillar with it. Guarded by tests 14 and 26.
+      hp: 80, speed: 4.52, damage: 15, attackRate: 1.0,
       radius: 0.55, height: 1.9, reach: 2.4,
       climbTime: 2.2,
 
@@ -320,13 +364,22 @@ export const CFG = {
     // vanishing made it look like it was.
     graceTime: 0.7,
 
-    // You cannot weld while something is chewing on you. Measured: a freshly
-    // repaired leg has 120 hp and four chewers do about 40 hp/s, so it survives
-    // roughly three seconds if you leave them alive -- repairing without clearing
-    // first is a guaranteed losing trade, and nothing was telling the player
-    // that. Blocking it turns a hidden trap into an explicit rule: clear, then
-    // patch.
     threatRange: 6.0,
+
+    // Contested repair is SLOWED, not blocked. Blocking it was an
+    // over-correction: repair already does 110 hp/s against roughly 40 hp/s of
+    // chewing, so the real limiter was always the operative's own health, not the
+    // repair rate. A hard block also removed a legitimate risky play.
+    //
+    // Worse, the check measures hostiles near the PLAYER -- so in co-op a
+    // teammate fighting beside the repairer would have stopped the work dead,
+    // breaking the exact division of labour the game is built around.
+    //
+    // At 35%, contested leg repair (38 hp/s) roughly matches four chewers' damage
+    // (40 hp/s): you can hold a leg while someone else clears, but you cannot fix
+    // it alone under fire. Contested reactor repair (21 hp/s) loses to three
+    // boarders (45 hp/s), so the reactor still demands clearing.
+    contestedRate: 0.35,
 
     // Raised from 45. Measured: chewers deal 48-154 hp/s to the legs, so at 45
     // hp/s repair could never win the race at ANY wave size -- once you fell
@@ -375,13 +428,51 @@ export const CFG = {
   },
 
   waves: {
-    firstDelay: 14,
-    between: 28,
+    // Pacing follows Left 4 Dead's director shape: build up, peak, fade, relax.
+    // Four phases -- REST, PREP, SPAWNING, ENGAGED -- with two rules that matter
+    // more than the numbers:
+    //
+    //   Spawning stops entirely while the players are under real pressure, and a
+    //   guaranteed calm period follows before anything else happens. L4D stops
+    //   spawning at peak intensity for exactly this reason.
+    //
+    //   Every wave is telegraphed with a preparation window. Deep Rock Galactic
+    //   gives 15-20 s before a swarm specifically so players can set up defences,
+    //   which is the moment our emitters exist for and previously never had.
+    // Wave bearing and the climber interleave draw from this seed rather than
+    // Math.random, so a run is reproducible and a difficulty change can be
+    // compared against the same fight instead of a different one.
+    seed: 90210,
+
+    // How many waves make up one siege. THIS IS THE FINISH LINE, and it exists
+    // because the fight was previously endless: a playtester averaging wave 4 read
+    // that as repeated failure, when against a fixed rifle and no upgrades yet it
+    // is a perfectly reasonable curve. Nothing was being reached.
+    //
+    // Five waves is about three minutes, which is one leg of the intended journey
+    // rather than a whole run. Difficulty is deliberately NOT being tuned to fit
+    // this: enemy strength is quadratic (count x time-scaled hp) against a flat
+    // 200 dps, so the missing half is the player's power curve, not a nerf. Move
+    // this number, not the enemy numbers, if a siege feels the wrong length.
+    siegeLength: 5,
+
+    firstDelay: 12,   // calm before the very first telegraph
+    minRest: 10,      // guaranteed breather once a wave is resolved
+    prepTime: 12,     // telegraphed warning window
+
     baseCount: 10,
     perWave: 5,
     climberShare: 0.3,
     spawnRadius: 74,
-    spawnRate: 9,     // enemies per second released into a wave
+    // Trickle, do not dump. At 9/s a wave of twenty was fully on the field in
+    // 2.2 seconds, which is why the deck guns only ever got one pass at an
+    // approach. Both reference directors release continuously.
+    spawnRate: 2.5,   // enemies per second released into a wave
+
+    // Each wave commits to ONE bearing, chosen when its telegraph starts, and
+    // arrives in a tight cone around it. A wave smeared across the full 143 deg
+    // arc cannot be warned about usefully or defended against deliberately.
+    waveSpread: 0.35,
     hpRamp: 100,      // seconds of elapsed time to double enemy health
 
     // The next wave waits for the field to thin out. Without this, waves land on
@@ -394,15 +485,71 @@ export const CFG = {
     // stays available as a choice.
     holdUntilCleared: 8,
 
+    // Our equivalent of L4D's "survivor intensity". Counting live enemies is a
+    // crude proxy: eight healthy ones wandering at 60 m held a wave exactly as
+    // hard as eight chewing your legs. These are the signals that actually mean
+    // the crew is in trouble.
+    pressure: {
+      hurtWeight: 0.40,        // how far the operative's health has fallen
+      underWeight: 0.25,       // hostiles in the hull's shadow
+      underFull: 6,
+      aboardWeight: 0.20,      // hostiles on the deck
+      aboardFull: 4,
+      // A stopped fortress is on its own enough to hold the pacing: it is the
+      // clearest possible signal the crew is in trouble, and it is the exact
+      // state the wave-three spiral used to happen in. Weighted above calmBelow
+      // deliberately, so no new wave arrives while you are dead in the sand.
+      immobileWeight: 0.40,
+      recentHurtWeight: 0.15,
+      recentHurtWindow: 3.0,   // seconds since last taking damage
+      calmBelow: 0.35,         // must fall under this before pacing advances
+    },
+
     // Spawn inside the hull's forward arc. Enemies behind a walking fortress
     // spend the whole wave jogging after it and never arrive.
-    forwardArc: 1.25, // radians either side of the hull's heading
+    //
+    // Narrowed from 1.25 (72 deg) after a playtest reported waiting around for
+    // enemies. Measured time for a wave to engage, by the bearing it committed to:
+    //
+    //   dead ahead   7.1 s median, 10.0 s slowest
+    //   23 deg       7.1 s median,  8.3 s
+    //   46 deg       8.8 s median, 19.0 s
+    //   72 deg      23.2 s median, 35.7 s   <- a third of all waves landed here
+    //
+    // At 72 deg a wave is effectively abeam: the fortress walks past it and the
+    // rest of the wave is a stern chase, which enemies now barely win at all.
+    // 0.9 rad (52 deg) cuts that worst case to 10.3 s.
+    //
+    // Slowing the hull was the other candidate and is strictly worse: it takes a
+    // 29% cut (4.5 -> 3.2 m/s) to reach 13.3 s, it does not stop bad bearings being
+    // handed out, and hull speed already scales 4.5/3.4/2.3/1.1 with legs lost, so
+    // lowering the base compresses the range that tells the player how hurt the
+    // fortress is.
+    //
+    // Also used as the scatter for unaimed spawns, which wants the same thing.
+    // Do not narrow this much further: the bearing telegraph derives its three
+    // labels from a third of this arc, and if waves stop arriving from noticeably
+    // different directions the warning stops being information at all, which
+    // removes the reason the preparation window exists. Guarded by test 59.
+    forwardArc: 0.9, // radians either side of the hull's heading
   },
 
   debug: {
     speedStep: 0.5,
     minSpeed: 0,
     maxSpeed: 14,
+
+    // Live enemy-speed multiplier, on , and .
+    //
+    // This one is a knob rather than a decided number on purpose. Speed is the
+    // single difficulty value that measurement cannot settle: an oracle defender
+    // that teleports and never misses was completely indifferent to it (227 s vs
+    // 226 s survival at a 16% cut), which means everything speed buys goes to a
+    // human's travel and reaction time. Only hands on the controls can judge it.
+    enemySpeedScale: 1,
+    enemyScaleStep: 0.1,
+    minEnemyScale: 0.5,
+    maxEnemyScale: 1.5,
   },
 };
 
@@ -422,3 +569,37 @@ export function applyReleasePreset(index) {
 }
 
 export const releasePresetName = () => CFG.releasePresets[CFG.releasePreset].name;
+
+// Captured once, so the multiplier always applies to the AUTHORED speeds instead
+// of compounding on whatever the last adjustment produced.
+const BASE_ENEMY_SPEED = {
+  chewer: CFG.enemies.chewer.speed,
+  climber: CFG.enemies.climber.speed,
+};
+
+/**
+ * Scale enemy movement speed live, for judging it in play.
+ *
+ * `outrun` reports when the scaled speed has fallen to or below the hull's own
+ * speed. It is a warning, not a wall: measured, enemies still reach a fortress
+ * walking at full speed well below this line, because waves arrive head-on and
+ * the hull walks a circle that trailing enemies can cut inside. What is genuinely
+ * lost is the stern chase -- anything the fortress gets past stops mattering.
+ * Reported rather than clamped away, because knowing where that edge sits is the
+ * informative part.
+ */
+export function applyEnemySpeedScale(scale) {
+  const d = CFG.debug;
+  const clamped = Math.max(d.minEnemyScale, Math.min(d.maxEnemyScale, scale));
+  d.enemySpeedScale = Math.round(clamped * 100) / 100;
+
+  CFG.enemies.chewer.speed = BASE_ENEMY_SPEED.chewer * d.enemySpeedScale;
+  CFG.enemies.climber.speed = BASE_ENEMY_SPEED.climber * d.enemySpeedScale;
+
+  return {
+    scale: d.enemySpeedScale,
+    chewer: CFG.enemies.chewer.speed,
+    climber: CFG.enemies.climber.speed,
+    outrun: Math.min(CFG.enemies.chewer.speed, CFG.enemies.climber.speed) <= CFG.trampler.speed,
+  };
+}

@@ -30,8 +30,8 @@ export class Repair {
 
     this.target = null;    // { kind: "leg" | "reactor", index?, label }
     this.progress = 0;     // 0..1 of the target's health
-    this.active = false;   // currently holding the key, in range, unopposed
-    this.threatened = false; // a hostile is close enough to stop the work
+    this.active = false;   // currently holding the key and in range
+    this.threatened = false; // a hostile is close enough to SLOW the work
     this.grace = 0;        // keeps the interaction alive through brief drift
     this.restored = 0;     // legs brought back from dead, for the HUD
 
@@ -144,15 +144,20 @@ export class Repair {
       ? t.legHp[tgt.index] / CFG.trampler.legHp
       : t.reactorHp / CFG.trampler.reactorHp;
 
-    // Work only happens while genuinely in range and unopposed. Grace keeps the
-    // prompt alive through brief drift, never the progress.
-    this.active = holding && !!best && !this.threatened;
+    // Work only happens while genuinely in range. Grace keeps the prompt alive
+    // through brief drift, never the progress.
+    this.active = holding && !!best;
     if (!this.active) return;
 
+    // Contested work is slowed, not stopped. Your own health is the real limit on
+    // standing here, and a hard stop would break co-op: it measures hostiles near
+    // the player, so a teammate defending you would freeze the repair.
+    const rate = this.threatened ? r.contestedRate : 1;
+
     if (tgt.kind === "leg") {
-      if (t.repairLeg(tgt.index, r.legRate * dt)) this.restored++;
+      if (t.repairLeg(tgt.index, r.legRate * rate * dt)) this.restored++;
     } else {
-      t.repairReactor(r.reactorRate * dt);
+      t.repairReactor(r.reactorRate * rate * dt);
     }
   }
 }

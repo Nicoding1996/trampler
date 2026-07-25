@@ -426,6 +426,25 @@ export class Trampler {
   }
 
   /**
+   * Put the fortress back at its starting point on the patrol ring.
+   *
+   * Restarting an encounter has to rewind this too, not just the damage. Enemy
+   * spawn bearings are computed from the hull's heading, so a restart that left
+   * the fortress mid-patrol produced a measurably different fight from the same
+   * seed -- which defeats the reason the seeds exist, namely being able to
+   * compare two attempts at the same wave.
+   */
+  resetPose() {
+    const r = CFG.world.patrolRadius;
+    this.group.position.set(r, CFG.trampler.deckHeight, 0);
+    this.yaw = Math.PI;
+    this.yawRate = 0;
+    this.yawDelta = 0;
+    this.group.rotation.y = this.yaw;
+    this.group.updateMatrixWorld(true);
+  }
+
+  /**
    * Where a chewer plants itself to attack a leg: well INBOARD of the hull
    * edge, underneath the slab. The hull blocks line of sight straight down, so
    * this position cannot be shot from the deck. That is the point.

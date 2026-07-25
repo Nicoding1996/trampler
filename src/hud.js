@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { CFG, releasePresetName } from "./config.js";
+import { PHASE } from "./waves.js";
 
 const _v = new THREE.Vector3();
 
@@ -41,6 +42,8 @@ export class Hud {
       emitters: id("r-emitters"),
       wave: id("r-wave"),
       next: id("r-next"),
+      pressure: id("r-pressure"),
+      threat: id("r-threat"),
       live: id("r-live"),
       kd: id("r-kd"),
     };
@@ -54,6 +57,22 @@ export class Hud {
     this.help = document.getElementById("help");
     this.questions = document.getElementById("questions");
     this.banner = document.getElementById("banner");
+
+    this.telegraph = document.getElementById("telegraph");
+    this.telegraphHead = document.getElementById("t-head");
+    this.telegraphSub = document.getElementById("t-sub");
+    this.telegraphBar = document.getElementById("t-bar");
+  }
+
+  #showTelegraph(head, sub, frac) {
+    if (this.telegraphHead.textContent !== head) this.telegraphHead.textContent = head;
+    if (this.telegraphSub.textContent !== sub) this.telegraphSub.textContent = sub;
+    fill(this.telegraphBar, frac);
+    if (this.telegraph.className !== "show") this.telegraph.className = "show";
+  }
+
+  #hideTelegraph() {
+    if (this.telegraph.className !== "") this.telegraph.className = "";
   }
 
   toggleHelp() {
@@ -76,11 +95,18 @@ export class Hud {
     this.banner.classList.remove("show");
   }
 
-  #prompt(key, label, progress, working, blocked = false) {
+  /**
+   * `state` is one of "", "working", "contested", "blocked". A single state
+   * rather than a pair of booleans, because "working" and "blocked" were both
+   * settable at once and contested repair genuinely needs a third reading:
+   * progress IS happening, just badly. Showing that in the red "blocked" style
+   * said the opposite of what the filling bar said.
+   */
+  #prompt(key, label, progress, state = "") {
     if (this.promptKey.textContent !== key) this.promptKey.textContent = key;
     if (this.promptLabel.textContent !== label) this.promptLabel.textContent = label;
     fill(this.promptBar, progress);
-    const cls = blocked ? "show blocked" : working ? "show working" : "show";
+    const cls = state ? `show ${state}` : "show";
     if (this.prompt.className !== cls) this.prompt.className = cls;
   }
 
@@ -152,37 +178,83 @@ export class Hud {
         "F",
         gun.overheated ? `${gun.name}  OVERHEATED` : gun.name,
         1 - gun.heat,
-        !gun.overheated,
+        gun.overheated ? "blocked" : "working",
       );
     } else if (gun?.canMount) {
-      this.#prompt("F", `MAN THE ${gun.name}`, 1, false);
+      this.#prompt("F", `MAN THE ${gun.name}`, 1);
     } else if (repair?.target) {
-      // Saying WHY the work is blocked is the whole point: repairing while
-      // hostiles are still chewing is a losing trade the player cannot see.
-      if (repair.threatened) {
-        this.#prompt("!", `CLEAR THE AREA  ·  ${repair.target.label}`, repair.progress, false, true);
-      } else {
-        this.#prompt(
-          "HOLD E",
-          `REPAIR ${repair.target.label}  ${Math.round(repair.progress * 100)}%`,
-          repair.progress,
-          repair.active,
-        );
-      }
+      // Contested work still happens, just slowly. Saying so matters: the player
+      // needs to know the trade they are making, not be told no. Amber, not red --
+      // red would contradict the bar, which is still filling.
+      const pct = Math.round(repair.progress * 100);
+      this.#prompt(
+        "HOLD E",
+        repair.threatened
+          ? `CONTESTED  ·  ${repair.target.label}  ${pct}%`
+          : `REPAIR ${repair.target.label}  ${pct}%`,
+        repair.progress,
+        repair.threatened ? "contested" : repair.active ? "working" : "",
+      );
     } else if (this.prompt.className !== "") {
       this.prompt.className = "";
     }
 
-    set(this.el.wave, String(director.wave));
+    // Shown as progress toward the siege, not a bare count. The number only means
+    // something if you can see what it is counting toward.
     set(
-      this.el.next,
-      director.spawning
-        ? "incoming"
-        : director.holding
-          ? `held · clear ${horde.liveCount - CFG.waves.holdUntilCleared}  (Q)`
-          : `${Math.max(0, director.timer).toFixed(0)} s  (Q)`,
-      director.spawning ? "bad" : director.holding ? "on" : "",
+      this.el.wave,
+      `${director.wave} / ${CFG.waves.siegeLength}`,
+      director.held ? "on" : "",
     );
+    // Pacing phase, so the player can read why nothing is happening yet.
+    let pace = "";
+    let paceCls = "";
+    switch (director.phase) {
+      case PHASE.REST:
+        if (director.timer > 0) {
+          pace = `rest ${Math.ceil(director.timer)} s`;
+        } else {
+          pace = `settling · ${Math.max(0, horde.liveCount - CFG.waves.holdUntilCleared)} left`;
+          paceCls = "on";
+        }
+        break;
+      case PHASE.PREP:
+        pace = `PREP ${Math.ceil(director.timer)} s`;
+        paceCls = "on";
+        break;
+      case PHASE.SPAWNING:
+        pace = `incoming · ${director.queue} to come`;
+        paceCls = "bad";
+        break;
+      case PHASE.HELD:
+        pace = "siege held";
+        paceCls = "on";
+        break;
+      default:
+        pace = director.calm ? "resolving" : "engaged";
+        paceCls = "bad";
+    }
+    set(this.el.next, pace, paceCls);
+
+    const pressure = director.pressure;
+    set(this.el.pressure, `${Math.round(pressure * 100)}%`,
+      pressure >= CFG.waves.pressure.calmBelow ? "bad" : "on");
+
+    // The anti-stall clock, made visible: resting does not make you safer.
+    set(this.el.threat, `x${director.hpScale().toFixed(2)}`);
+
+    if (director.phase === PHASE.PREP) {
+      const next = director.wave + 1;
+      this.#showTelegraph(
+        next >= CFG.waves.siegeLength
+          ? `FINAL WAVE INCOMING`
+          : `WAVE ${next} OF ${CFG.waves.siegeLength} INCOMING`,
+        `${director.bearingLabel}  ·  ${Math.ceil(director.timer)}s`,
+        1 - director.timer / CFG.waves.prepTime,
+      );
+    } else {
+      this.#hideTelegraph();
+    }
     set(
       this.el.live,
       `${horde.liveCount}  (${horde.underHull ?? 0} under, ${horde.aboard ?? 0} aboard)`,
