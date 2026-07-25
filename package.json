@@ -1,0 +1,14 @@
+{
+  "name": "trampler-feel-test",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Grey-box prototype: walking on a moving kinematic platform, and grappling back onto it.",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check src/main.js"
+  },
+  "dependencies": {
+    "three": "0.170.0"
+  }
+}
