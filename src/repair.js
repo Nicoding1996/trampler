@@ -34,6 +34,7 @@ export class Repair {
     this.threatened = false; // a hostile is close enough to SLOW the work
     this.grace = 0;        // keeps the interaction alive through brief drift
     this.restored = 0;     // legs brought back from dead, for the HUD
+    this.rateScale = 1;    // multiplier owned by the economy's repair rig
 
     this.#buildMarkers();
   }
@@ -152,7 +153,7 @@ export class Repair {
     // Contested work is slowed, not stopped. Your own health is the real limit on
     // standing here, and a hard stop would break co-op: it measures hostiles near
     // the player, so a teammate defending you would freeze the repair.
-    const rate = this.threatened ? r.contestedRate : 1;
+    const rate = (this.threatened ? r.contestedRate : 1) * this.rateScale;
 
     if (tgt.kind === "leg") {
       if (t.repairLeg(tgt.index, r.legRate * rate * dt)) this.restored++;

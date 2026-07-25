@@ -41,7 +41,11 @@
     border-radius: 6px; padding: 10px 12px; font-size: 12px; line-height: 1.55;
     pointer-events: none; backdrop-filter: blur(3px);
   }
-  #hud { left: 14px; top: 14px; min-width: 232px; }
+  /* Diagnostics. Hidden by default: this is instrumentation for whoever is
+     tuning the thing, not information the player needs to fight. Nine panels on
+     screen at once meant none of them got read. Toggled with ` */
+  #hud { left: 14px; top: 14px; min-width: 232px; display: none; }
+  #hud.show { display: block; }
   .panel .row { display: flex; justify-content: space-between; gap: 14px; }
   .panel .k { opacity: 0.6; }
   .panel .v { font-variant-numeric: tabular-nums; }
@@ -64,6 +68,29 @@
   #pips .pip { flex: 1; height: 7px; border-radius: 2px; background: #7ee081; }
   #pips .pip.hurt { background: var(--warn); }
   #pips .pip.broken { background: #4a2b2b; }
+
+  /* ---- purchases: only visible between waves, because that is the only time
+     buying is allowed. A panel that were always up would imply otherwise. ---- */
+  #shop { right: 14px; top: 14px; min-width: 268px; display: none; }
+  #shop.show { display: block; }
+  #shop .item { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+  #shop .item + .item { margin-top: 7px; }
+  #shop .key {
+    display: inline-block; min-width: 15px; color: var(--accent); font-weight: 600;
+  }
+  #shop .nm { letter-spacing: 0.05em; }
+  #shop .dt { font-size: 10px; opacity: 0.5; }
+  #shop .px { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* Affordability has to be readable at a glance mid-siege, so it is colour plus
+     dimming rather than colour alone. */
+  #shop .item.can .px { color: var(--accent); }
+  #shop .item.cant { opacity: 0.42; }
+  #shop .item.cant .key { color: #6b7280; }
+  #shop .item.done { opacity: 0.42; }
+  #shop .item.done .px { color: #6b7280; }
+  #shop .purse { display: flex; justify-content: space-between; gap: 10px; }
+  #shop .purse .v { font-variant-numeric: tabular-nums; color: var(--accent); }
+  #shop .bonus { color: var(--warn); font-size: 10px; letter-spacing: 0.1em; margin-top: 6px; }
 
   /* ---- wave telegraph ---- */
   #telegraph {
@@ -113,18 +140,30 @@
   #prompt .bar > span { background: var(--warn); }
   #prompt.working .bar > span { background: #7ee081; }
 
-  #help { right: 14px; top: 14px; max-width: 330px; }
+  /* One centred overlay instead of two permanent side panels. Controls and the
+     test's purpose are both things you read while stopped, so they do not belong
+     on screen while playing -- and the controls panel used to sit exactly where
+     the refit panel now appears, so the two overlapped into mush. */
+  /* Sized to fit a short window without scrolling, because the panel cannot be
+     scrolled: .panel is pointer-events:none, and making it interactive would
+     swallow the clicks that fire the rifle. So it has to fit instead. */
+  #help {
+    left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: min(900px, 94vw); background: rgba(12,12,14,0.94);
+    padding: 14px 18px; font-size: 11px; line-height: 1.42;
+  }
+  #help.hidden { display: none; }
+  #help .cols {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 18px;
+  }
   #help .title { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; opacity: 0.5; margin-bottom: 8px; }
-  #help dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; }
+  #help dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; align-content: start; }
   #help dt { color: var(--accent); white-space: nowrap; }
   #help dd { margin: 0; opacity: 0.82; }
-  #help .note { margin-top: 10px; padding-top: 9px; border-top: 1px solid rgba(255,255,255,0.10); opacity: 0.75; }
-  #help.hidden { display: none; }
-
-  #questions { left: 14px; bottom: 14px; max-width: 430px; }
-  #questions .title { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; opacity: 0.5; margin-bottom: 7px; }
-  #questions ol { margin: 0; padding-left: 18px; }
-  #questions li { margin-bottom: 4px; opacity: 0.85; }
+  #help ol { margin: 0; padding-left: 18px; }
+  #help li { margin-bottom: 4px; opacity: 0.85; }
+  #help .note { margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.10); opacity: 0.75; }
+  #help .dismiss { margin-top: 14px; text-align: center; opacity: 0.55; letter-spacing: 0.12em; font-size: 11px; }
 
   /* ---- click to play ---- */
   #gate {
@@ -166,10 +205,17 @@
     <div class="row"><span class="k">hardpoints only</span><span class="v off" id="r-hp">off</span></div>
     <div class="row"><span class="k">release feel</span><span class="v on" id="r-release">braked</span></div>
     <hr />
+    <div class="title">Director</div>
+    <div class="row"><span class="k">pressure</span><span class="v" id="r-pressure">0%</span></div>
+    <div class="row"><span class="k">threat ramp</span><span class="v" id="r-threat">x1.00</span></div>
+    <div class="row"><span class="k">kills / deaths</span><span class="v" id="r-kd">0 / 0</span></div>
+    <hr />
     <div class="row"><span class="k">fps</span><span class="v" id="r-fps">0</span></div>
   </div>
 
-  <div id="help" class="panel">
+  <div id="help" class="panel hidden">
+   <div class="cols">
+    <div>
     <div class="title">Controls</div>
     <dl>
       <dt>WASD</dt><dd>move</dd>
@@ -184,11 +230,26 @@
       <dt>C</dt><dd>pick the nearest emitter back up</dd>
       <dt>F</dt><dd>man / leave a gun (bow sponson, stern engine block)</dd>
       <dt>&mdash;</dt><dd>mantle is automatic: jump at a ledge and look at it</dd>
+      <dt>1&ndash;4</dt><dd>buy a refit &mdash; between waves only</dd>
+      <dt>Q</dt><dd>call next wave early &mdash; pays more, costs your prep time</dd>
       <dt>Esc</dt><dd>release cursor</dd>
     </dl>
+
     <div class="note">
+      <div class="title">What this test is for</div>
+      <ol>
+        <li>Do you naturally <em>oscillate</em> between deck and ground, or does one spot dominate?</li>
+        <li>Chewers hide under the hull where the deck can't see them. Does that pull you down convincingly?</li>
+        <li>Climbers board and eat the reactor. Does that pull you back up in time?</li>
+        <li>Is calling a wave early ever tempting, or is the safe line always correct?</li>
+      </ol>
+    </div>
+    </div>
+
+    <div>
+      <div class="title">Test rig</div>
       <dl>
-        <dt>Q</dt><dd>call next wave early</dd>
+        <dt>`</dt><dd>show / hide the diagnostics panel</dd>
         <dt>K</dt><dd>restart the siege (repair + clear + rewind)</dd>
         <dt>R</dt><dd>respawn on deck</dd>
         <dt>T</dt><dd>drop to ground ahead of it</dd>
@@ -199,19 +260,10 @@
         <dt>B</dt><dd>toggle deck bob</dd>
         <dt>G</dt><dd>hardpoints-only grapple</dd>
         <dt>M</dt><dd>cycle release feel</dd>
-        <dt>H</dt><dd>hide this panel</dd>
       </dl>
     </div>
-  </div>
-
-  <div id="questions" class="panel">
-    <div class="title">What this test is for</div>
-    <ol>
-      <li>Do you naturally <em>oscillate</em> between deck and ground, or does one spot dominate?</li>
-      <li>Chewers hide under the hull where the deck can't see them. Does that pull you down convincingly?</li>
-      <li>Climbers board and eat the reactor. Does that pull you back up in time?</li>
-      <li>Does fighting underneath your own walking fortress feel as good as it sounds?</li>
-    </ol>
+   </div>
+   <div class="dismiss">H to close</div>
   </div>
 
   <div id="combat" class="panel">
@@ -226,19 +278,27 @@
       <div class="pip"></div><div class="pip"></div><div class="pip"></div>
       <div class="pip"></div><div class="pip"></div><div class="pip"></div>
     </div>
+    <!-- Only rows a player acts on. Pressure, the threat ramp and the kill count
+         are director instrumentation and live in the diagnostics panel now. -->
     <div class="row"><span class="k">legs / drive</span><span class="v" id="r-drive">6 · 100%</span></div>
     <div class="row"><span class="k">emitters (X)</span><span class="v" id="r-emitters">3 / 3</span></div>
     <div class="row"><span class="k">siege</span><span class="v" id="r-wave">0 / 5</span></div>
     <div class="row"><span class="k">pacing (Q)</span><span class="v" id="r-next">rest 12 s</span></div>
-    <div class="row"><span class="k">pressure</span><span class="v" id="r-pressure">0%</span></div>
-    <div class="row"><span class="k">threat</span><span class="v" id="r-threat">x1.00</span></div>
     <div class="row"><span class="k">hostiles</span><span class="v" id="r-live">0</span></div>
-    <div class="row"><span class="k">kills / deaths</span><span class="v" id="r-kd">0 / 0</span></div>
   </div>
 
   <div id="prompt">
     <div><span class="key" id="p-key">HOLD E</span> <span id="p-label">REPAIR</span></div>
     <div class="bar"><span id="p-bar"></span></div>
+  </div>
+
+  <div id="shop" class="panel">
+    <div class="title">refit &mdash; between waves only</div>
+    <div class="purse"><span class="k">salvage (yours)</span><span class="v" id="r-salvage">0</span></div>
+    <div class="purse"><span class="k">scrap (crew)</span><span class="v" id="r-scrap">0</span></div>
+    <hr>
+    <div id="shop-items"></div>
+    <div class="bonus" id="shop-bonus"></div>
   </div>
 
   <div id="telegraph">
@@ -251,7 +311,8 @@
 
   <div id="gate">
     <h1>Trampler — Feel Test</h1>
-    <p>Grey box. Steps 1 &amp; 2 only: moving deck + grapple remount.</p>
+    <p>Grey box. Hold a five-wave siege on a walking fortress.<br>
+      <b>H</b> for controls &mdash; <b>`</b> for diagnostics</p>
     <div class="cta">Click to play</div>
     <div class="err" id="gate-err"></div>
   </div>

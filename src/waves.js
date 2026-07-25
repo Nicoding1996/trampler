@@ -54,6 +54,17 @@ export class Director {
     this.spawnAccum = 0;
     this.arcOffset = 0;
     this.forced = false;
+
+    // How many waves the crew has actually SEEN OFF. Not the same as `wave`:
+    // stacking a new wave onto an unresolved one with Q means the first never
+    // resolves on its own, so it never pays. The economy polls this counter rather
+    // than being handed a callback, so the director stays unaware it exists.
+    this.resolved = 0;
+
+    // Was the wave currently in play summoned early? Stays true until the next
+    // wave begins, so the payout for resolving it still counts as part of the
+    // gamble rather than falling outside it by a frame.
+    this.calledEarly = false;
   }
 
   // ----------------------------------------------------------------- pressure
@@ -136,6 +147,9 @@ export class Director {
 
   #startWave() {
     const w = CFG.waves;
+    // Captured before `forced` is cleared: this is what the economy pays a bonus
+    // against, and it is the only record that this wave was a gamble.
+    this.calledEarly = this.forced;
     this.forced = false;
     this.wave++;
 
@@ -197,6 +211,10 @@ export class Director {
           this.#pickBearing();
           this.#startWave();
         } else if (this.calm) {
+          // Seen off. Counted here and nowhere else, so a wave that was buried
+          // under a stacked one never pays -- which is part of what Q costs.
+          this.resolved++;
+
           // Resolving the last wave of the siege ends it. Without a finish line
           // this is an endless fight, and losing on wave 4 reads as failure rather
           // than as nearly holding -- there is nothing being reached.

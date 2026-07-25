@@ -19,11 +19,16 @@ Verified against 15 seconds of relentless jumping at the hull's flank.
 
 **2b. Automation is the floor, never the ceiling.**
 Shock emitters must *delay* the fortress being crippled, not prevent it. Measured
-with no player present at all: 36 s undefended, 56 s with three emitters. The
-first version had unlimited shots and held the under-hull area forever, which
-would have meant never dismounting again. Any future automation — auto-turrets
-especially — has to be checked against this.
-→ test 48
+with no player present at all: 67.7 s undefended, 83.7 s with three emitters, and
+94.7 s with three emitters **plus every fortress upgrade bought**. The first
+version had unlimited shots and held the under-hull area forever, which would have
+meant never dismounting again.
+
+This has to be re-checked whenever anything defensive is added, including
+upgrades — "emitters plus hull plating" is a combination neither system's own test
+covers, and the failure is silent: nothing looks broken, the player simply stops
+having a reason to go down there and half the pillar quietly dies.
+→ tests 48, 66
 
 **3. The crow's nest stays grapple-only.**
 It is the one place with no walkable route. Chained mantles must not reach it.
@@ -98,6 +103,40 @@ CONTESTED rather than refusing, so the player sees the trade.
 **13. Only one station can be manned at a time, and manning one pins you.**
 Zero drift across the deck while holding sprint and jump.
 → tests 36, 42
+
+## Economy
+
+**22. The two purses never mix.** Salvage is personal and paid per kill; scrap is
+shared and paid only when the crew *resolves* a wave. Funding the shared pot from
+the shared objective is what stops one player farming the crew's budget, and the
+split is the "bounded structure, unbounded stacking" principle expressed as income:
+money earned alone buys unbounded personal power, money earned together buys a
+fixed frame. Personal upgrades have no cap; fortress upgrades do.
+→ tests 61, 62
+
+**23. Buying happens between waves only.** Spending mid-fight would let a player
+purchase their way out of trouble and would drain the tension the siege is built
+on. It also gives the preparation window a second job — until the economy existed
+it was only for placing emitters.
+→ test 63
+
+**24. Every kill pays, whatever killed it.** The hook is on `Horde.damage`, the one
+choke point all damage routes through, so a newly added weapon cannot silently pay
+nothing. Wounding pays nothing, or chip damage becomes an income farm.
+→ test 61
+
+**25. A restart reverts every upgrade as well as both purses.** Upgrades are
+instance multipliers, and `Economy.reset()` restores each one. Leaving stats in
+place would make every subsequent attempt quietly easier and destroy the point of
+the seeded fight.
+→ test 65
+
+**26. Calling a wave early must pay.** Q existed for a long time with nothing to be
+greedy for: the cost was losing a 12 s preparation window and the reward was
+nothing, so a risk with no upside was not a decision. It now costs three things —
+no prep, a tougher combined fight, and the buried wave's clear payout, since only
+resolved waves pay — against a 1.5x multiplier on everything that wave earns.
+→ tests 64, 51
 
 ## Hygiene
 

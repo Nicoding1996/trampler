@@ -534,6 +534,76 @@ export const CFG = {
     forwardArc: 0.9, // radians either side of the hull's heading
   },
 
+  // The economy, and the two currencies are deliberately separate FROM THE START.
+  //
+  // One pooled pot generates a co-op argument every single wave -- whoever spends
+  // it spent everyone's money -- and it is painful to retrofit a split later
+  // because every price and payout has to be re-derived. So:
+  //
+  //   SALVAGE is personal and comes from what YOU kill. It buys your own kit and
+  //   stacks without limit, Risk of Rain style.
+  //   SCRAP is shared and comes from the crew HOLDING A WAVE, which is the shared
+  //   objective. It buys fortress upgrades, which are bounded.
+  //
+  // That mapping is the point: the money you earn alone buys unbounded personal
+  // power, the money you earn together buys a fixed frame. It is the "bounded
+  // structure, unbounded stacking" principle expressed as income.
+  economy: {
+    // Per kill. Climbers pay more because reaching them costs you position --
+    // they are up on the deck or climbing toward it, so killing one means leaving
+    // whatever you were doing underneath.
+    chewer: { salvage: 2, scrap: 1 },
+    climber: { salvage: 4, scrap: 2 },
+
+    // Paid to the shared pot when a wave is resolved, not per kill: the fortress
+    // is funded by surviving, so nobody can farm the crew's budget alone.
+    waveClearScrap: 18,
+    waveClearGrowth: 6, // added per wave number
+
+    // Over a full 5-wave siege that budgets roughly 260 salvage and 280 scrap,
+    // which is about three personal stacks OR two fortress upgrades plus change.
+    // Not enough for both: that is the decision.
+
+    // Calling a wave early with Q pays this much more for the whole wave. Q has
+    // existed since the pacing rework with nothing to be greedy FOR, so the risk
+    // was pure downside and no one would ever press it. The cost of pressing it is
+    // losing the 12 s preparation window; this is what you are buying with it.
+    earlyCallBonus: 0.5,
+
+    // Buying is a BETWEEN-WAVES act. Allowing it mid-fight would let players spend
+    // their way out of trouble and would drain the tension the whole siege is
+    // built on. It also gives the preparation window a second job -- until now it
+    // only existed for placing emitters.
+    keys: ["Digit1", "Digit2", "Digit3", "Digit4"],
+
+    catalogue: [
+      // Personal, unbounded. The main answer to the difficulty curve: enemy
+      // strength is quadratic while base damage is flat, so this is the term that
+      // has to grow. Additive stacking keeps it legible -- three stacks is plainly
+      // "+75%" rather than a compounding number nobody can predict.
+      {
+        id: "rifle", name: "RIFLE CALIBRATION", detail: "+25% weapon damage",
+        pool: "salvage", cost: 45, growth: 1.55, max: Infinity,
+      },
+      {
+        id: "vitals", name: "VITALS", detail: "+25 max health, healed",
+        pool: "salvage", cost: 40, growth: 1.5, max: Infinity,
+      },
+
+      // Fortress, bounded -- these are the stand-in for hardpoints until real
+      // modules exist, so a run keeps a readable silhouette instead of growing
+      // without limit.
+      {
+        id: "plating", name: "HULL PLATING", detail: "fortress takes 15% less damage",
+        pool: "scrap", cost: 60, growth: 1.6, max: 4,
+      },
+      {
+        id: "rig", name: "REPAIR RIG", detail: "+30% repair speed",
+        pool: "scrap", cost: 55, growth: 1.6, max: 3,
+      },
+    ],
+  },
+
   debug: {
     speedStep: 0.5,
     minSpeed: 0,

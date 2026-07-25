@@ -48,6 +48,7 @@ export class Hud {
       kd: id("r-kd"),
     };
 
+    this.diagnostics = document.getElementById("hud");
     this.pips = [...document.querySelectorAll("#pips .pip")];
     this.prompt = document.getElementById("prompt");
     this.promptKey = document.getElementById("p-key");
@@ -55,13 +56,69 @@ export class Hud {
     this.promptBar = document.getElementById("p-bar");
     this.crosshair = document.getElementById("crosshair");
     this.help = document.getElementById("help");
-    this.questions = document.getElementById("questions");
     this.banner = document.getElementById("banner");
 
     this.telegraph = document.getElementById("telegraph");
     this.telegraphHead = document.getElementById("t-head");
     this.telegraphSub = document.getElementById("t-sub");
     this.telegraphBar = document.getElementById("t-bar");
+
+    this.shop = document.getElementById("shop");
+    this.shopItems = document.getElementById("shop-items");
+    this.shopBonus = document.getElementById("shop-bonus");
+    this.shopSalvage = document.getElementById("r-salvage");
+    this.shopScrap = document.getElementById("r-scrap");
+    this.shopSignature = "";
+  }
+
+  /**
+   * The purchase list, rebuilt only when something about it actually changed.
+   *
+   * The signature guard is not premature optimisation: this panel is nine elements
+   * of innerHTML and reassigning it every frame reparses the DOM at 60 Hz, which
+   * made the loss banner visibly flicker when that mistake was made there.
+   */
+  #shopPanel(economy) {
+    if (!economy) return;
+
+    const open = economy.open;
+    const cls = open ? "panel show" : "panel";
+    if (this.shop.className !== cls) this.shop.className = cls;
+    if (!open) return;
+
+    const entries = economy.entries;
+    const signature = [
+      Math.floor(economy.salvage), Math.floor(economy.scrap),
+      ...entries.map((e) => `${e.stacks}:${e.cost}:${e.affordable ? 1 : 0}:${e.soldOut ? 1 : 0}`),
+    ].join("|");
+    if (signature === this.shopSignature) return;
+    this.shopSignature = signature;
+
+    this.shopSalvage.textContent = String(Math.floor(economy.salvage));
+    this.shopScrap.textContent = String(Math.floor(economy.scrap));
+
+    this.shopItems.innerHTML = entries.map((e) => {
+      const state = e.soldOut ? "done" : e.affordable ? "can" : "cant";
+      // Stacks are shown for everything, with a cap only where one exists: that is
+      // the bounded-fortress versus unbounded-personal split made visible.
+      const count = e.max === Infinity
+        ? (e.stacks > 0 ? ` x${e.stacks}` : "")
+        : ` ${e.stacks}/${e.max}`;
+      const price = e.soldOut ? "MAX" : `${e.cost} ${e.pool === "scrap" ? "scrap" : "salv"}`;
+      return `<div class="item ${state}">`
+        + `<span><span class="key">${e.key.replace("Digit", "")}</span> `
+        + `<span class="nm">${e.name}${count}</span><br>`
+        + `<span class="dt">${e.detail}</span></span>`
+        + `<span class="px">${price}</span>`
+        + `</div>`;
+    }).join("");
+
+    // Only shown while the gamble is actually live, so it reads as a state you are
+    // in rather than a rule you have to remember.
+    const bonus = economy.bonus > 1
+      ? `EARLY CALL · +${Math.round((economy.bonus - 1) * 100)}% THIS WAVE`
+      : "";
+    if (this.shopBonus.textContent !== bonus) this.shopBonus.textContent = bonus;
   }
 
   #showTelegraph(head, sub, frac) {
@@ -75,9 +132,18 @@ export class Hud {
     if (this.telegraph.className !== "") this.telegraph.className = "";
   }
 
+  /**
+   * Diagnostics are off by default. Nine panels were on screen at once, two of
+   * them overlapping into unreadable mush, and the effect of showing everything
+   * was that none of it got read. What stays up while playing is only what a
+   * player acts on; everything for whoever is tuning the thing lives here.
+   */
+  toggleDiagnostics() {
+    this.diagnostics.classList.toggle("show");
+  }
+
   toggleHelp() {
     this.help.classList.toggle("hidden");
-    this.questions.classList.toggle("hidden");
   }
 
   // Guarded against rewriting identical markup: this is called every frame
@@ -111,7 +177,10 @@ export class Hud {
   }
 
   update(ctx) {
-    const { player, trampler, grapple, horde, director, weapon, repair, emitters, gun, fps } = ctx;
+    const {
+      player, trampler, grapple, horde, director, weapon, repair, emitters, economy, gun, fps,
+    } = ctx;
+    this.#shopPanel(economy);
 
     // ---- movement readout
     const world = player.worldVelocity(_v);

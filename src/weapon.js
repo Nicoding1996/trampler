@@ -36,6 +36,9 @@ export class Weapon {
 
     this.raycaster = new THREE.Raycaster();
 
+    // Multiplier on outgoing damage, owned by the economy. 1 means no upgrades.
+    this.damageScale = 1;
+
     // Cone spread is seeded, like every other stochastic part of the sim. At
     // 0.007 rad it scatters a shot by ~0.2 m at 30 m, which was enough to make a
     // measured tracer length differ between otherwise identical runs.
@@ -153,7 +156,10 @@ export class Weapon {
       dist = hit.distance;
       this.hits++;
       this.hitFlash = w.hitFlash;
-      if (this.horde.damage(hit.enemy, profile.damage)) this.kills++;
+      // damageScale is where personal upgrades land. Applied here rather than by
+      // editing CFG, so a run's upgrades cannot leak into global config -- and it
+      // covers the rifle and both deck guns, since every shot routes through here.
+      if (this.horde.damage(hit.enemy, profile.damage * this.damageScale)) this.kills++;
     } else if (solid.length > 0) {
       this.blockedByHull++;
     }

@@ -531,6 +531,10 @@ export class Horde {
     if (e.hp > 0) return false;
     e.alive = false;
     this.liveCount--;
+    // Single choke point for every kill in the game, whatever fired the shot --
+    // rifle, either deck gun, a shock emitter. The economy hooks here so a new
+    // damage source cannot silently pay nothing.
+    this.onKill?.(e);
     return true;
   }
 }

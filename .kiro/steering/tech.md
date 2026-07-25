@@ -21,7 +21,7 @@ node --check <file> # syntax only
 ## Verification
 
 `verify.mjs` runs the real simulation modules in Node with no DOM and no
-renderer. 61 sections, 272 assertions. **Run it after every change.** The
+renderer. 68 sections, 319 assertions. **Run it after every change.** The
 failure modes here — drift, being yanked off a turning deck, an anchor that does
 not track the hull, an enemy shielded by geometry — are invisible to inspection
 and tedious to confirm by hand.
@@ -63,6 +63,11 @@ Every one of these produced a green or red result that was wrong:
   gives you last frame's orientation unless matrices are refreshed.
 - **Assertions the fix deliberately invalidated.** When behaviour intentionally
   changes, old assertions fail *correctly*. Read before repairing.
+- **Anything DOM-shaped is untested at runtime.** The harness has no DOM, so HUD
+  markup is checked as *text* instead: test 67 asserts every id `hud.js` reaches for
+  exists in `index.html`, that no two always-visible panels share a screen anchor,
+  and that no more than two are up while playing. A `getElementById` that misses
+  returns null and only throws later, somewhere unrelated-looking.
 - **Nondeterministic scenarios.** Spawn arcs were on `Math.random`, so the same
   code measured 15.2 s and 19.3 s on consecutive runs and an assertion guarding a
   pillar invariant passed or failed at random. The horde now draws from a seeded

@@ -12,6 +12,7 @@ import { Weapon } from "./weapon.js";
 import { Repair } from "./repair.js";
 import { DeckGun, handleStationInput } from "./deckgun.js";
 import { Emitters } from "./emitters.js";
+import { Economy } from "./economy.js";
 import { Hud } from "./hud.js";
 
 const canvas = document.getElementById("c");
@@ -44,6 +45,10 @@ function boot() {
   const guns = CFG.deckGun.mounts.map((m) => new DeckGun(scene, trampler, m));
   const emitters = new Emitters(scene, trampler, horde);
 
+  // Constructed last because it reaches into most of the above to apply upgrades,
+  // and it hooks horde.onKill, which every damage source funnels through.
+  const economy = new Economy({ player, trampler, weapon, repair, horde, director });
+
   // Whichever mount the HUD should be talking about: the manned one, else the
   // one you are standing next to.
   const activeGun = () =>
@@ -66,6 +71,9 @@ function boot() {
   function resetEncounter() {
     horde.clear();
     emitters.clear();
+    // Wipes both purses AND reverts every upgrade. Carrying stats across a restart
+    // would make each attempt quietly easier, which defeats the seeded fight.
+    economy.reset();
     trampler.repairAll();
     // Rewind the patrol too, not just the damage. Spawn bearings derive from the
     // hull's heading, so leaving it mid-patrol makes a restart a different fight
@@ -94,6 +102,7 @@ function boot() {
     if (input.pressed("KeyG")) CFG.grapple.hardpointsOnly = !CFG.grapple.hardpointsOnly;
     if (input.pressed("KeyM")) applyReleasePreset(CFG.releasePreset + 1);
     if (input.pressed("KeyH")) hud.toggleHelp();
+    if (input.pressed("Backquote")) hud.toggleDiagnostics();
     if (input.pressed("KeyR")) player.respawnOnDeck();
     if (input.pressed("KeyT")) player.dropToGround();
     // E is held for repair, so calling a wave early moved to Q.
@@ -144,7 +153,7 @@ function boot() {
   }
 
   const hudCtx = {
-    player, trampler, grapple, horde, director, weapon, repair, emitters,
+    player, trampler, grapple, horde, director, weapon, repair, emitters, economy,
     gun: null, fps: 0,
   };
 
@@ -200,6 +209,17 @@ function boot() {
     for (const g of guns) g.update(dt, input, player, weapon);
     repair.update(dt, input);
     emitters.update(dt, input, player);
+    // After the director, so a wave resolved this frame pays this frame.
+    economy.update(dt, input);
+    if (economy.lastEvent) {
+      const ev = economy.lastEvent;
+      toast(
+        ev.kind === "bought"
+          ? `${ev.name}<small>${ev.detail} · stack ${ev.stacks} · spent ${ev.cost}</small>`
+          : `CANNOT BUY<small>${ev.reason}</small>`,
+        1.8,
+      );
+    }
     horde.update(dt, player);
     grapple.updateVisuals(dt);
 

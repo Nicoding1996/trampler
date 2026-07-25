@@ -132,12 +132,24 @@ Nothing here is polish. Without it there is no roguelike, just an endless fight.
    the moment upgrades land. Move `siegeLength`, not the enemy numbers.
    → test 60
 
-1. **Economy.** Kills drop scrap; scrap buys things. This is the current blocker
-   on everything else: the "call the wave early" key exists and works, but there
-   is nothing to be greedy *for*, so the risk/reward loop the design is built
-   around cannot be tested. **Split the currency from the start** — shared scrap
-   for the fortress, personal salvage for your own kit — because one pooled pot
-   generates a co-op argument every wave and is painful to retrofit.
+1. **Economy — done.** Split from the start, as planned. Salvage is personal and
+   paid per kill; scrap is shared and paid only when the crew *resolves* a wave, so
+   nobody can farm the crew's budget alone. Four refits, bought with `1`-`4` between
+   waves: rifle calibration and vitals stack without limit on salvage, hull plating
+   (max 4) and a repair rig (max 3) are bounded and cost scrap. That asymmetry is
+   the "bounded structure, unbounded stacking" principle expressed as income.
+
+   **Q finally has a reason to exist.** Calling a wave early pays 1.5x on everything
+   that wave earns, against three costs: no preparation window, a tougher combined
+   fight, and the buried wave's clear payout, since only *resolved* waves pay.
+
+   A full 5-wave siege budgets roughly 260 salvage and 280 scrap — about three
+   personal stacks or two fortress upgrades, deliberately not both.
+
+   Still open, and only playtesting can answer it: is the greed actually tempting,
+   or is the safe line always correct? If nobody presses Q, raise
+   `CFG.economy.earlyCallBonus` before touching anything else.
+   → tests 61-66
 2. **Modules on hardpoints.** The bounded build layer — a limited number of
    sockets on the fortress, so a run has a readable silhouette. This is the
    game's identity, not a feature.
@@ -153,10 +165,20 @@ Nothing here is polish. Without it there is no roguelike, just an endless fight.
 The gun is currently an opening move only, which matches its design but makes it
 a small fraction of playtime. Two candidate fixes, cheapest first:
 
-- Push spawns out from 74 m to ~110 m, roughly doubling the approach window.
+- ~~Push spawns out from 74 m to ~110 m, roughly doubling the approach window.~~
+  **Rejected.** This looked cheap and is actively harmful now. A playtest reported
+  waiting around for enemies, measured as 23.2 s for a wave committed near abeam to
+  engage, and the fix was narrowing the bearing arc to bring the worst case down to
+  10.3 s. Pushing the spawn ring out scales every one of those numbers back up and
+  reintroduces exactly the dead air we just removed. Approach *window* and approach
+  *wait* are the same quantity seen from two positions — the gun wants it long, the
+  player on foot wants it short, and the gun does not get to win that trade by
+  making everyone wait.
 - Add an **armoured enemy** the rifle can barely dent, which has to be killed at
   range before it arrives. That turns the gun from an opener into the answer to a
   recurring threat, which pulls the player back up repeatedly rather than once.
+  Now the only candidate here, since it buys the gun a job without lengthening the
+  approach for anyone else.
 
 ## Tier 2 — feel and content
 

@@ -7,6 +7,7 @@
 //   node verify.mjs
 
 import * as THREE from "three";
+import { readFileSync } from "node:fs";
 import {
   CFG, applyReleasePreset, releasePresetName, applyEnemySpeedScale,
 } from "./src/config.js";
@@ -20,6 +21,7 @@ import { Weapon } from "./src/weapon.js";
 import { Repair } from "./src/repair.js";
 import { DeckGun, handleStationInput } from "./src/deckgun.js";
 import { Emitters } from "./src/emitters.js";
+import { Economy } from "./src/economy.js";
 
 const DT = 1 / 60;
 
@@ -81,12 +83,13 @@ function makeSim() {
   const repair = new Repair(player, trampler, horde);
   const guns = CFG.deckGun.mounts.map((m) => new DeckGun(scene, trampler, m));
   const emitters = new Emitters(scene, trampler, horde);
+  const economy = new Economy({ player, trampler, weapon, repair, horde, director });
 
   scene.updateMatrixWorld(true);
 
   return {
     scene, camera, world, trampler, player, grapple,
-    horde, director, weapon, repair, guns, gun: guns[0], emitters,
+    horde, director, weapon, repair, guns, gun: guns[0], emitters, economy,
     input: makeInput(),
     waves: false, // opt in per test, so random spawns cannot pollute a scenario
   };
@@ -119,6 +122,7 @@ function step(sim, frames, hook, dt = DT) {
     for (const g of sim.guns) g.update(dt, sim.input, sim.player, sim.weapon);
     sim.repair.update(dt, sim.input);
     sim.emitters.update(dt, sim.input, sim.player);
+    sim.economy.update(dt, sim.input);
     sim.horde.update(dt, sim.player);
     sim.grapple.updateVisuals(dt);
     sim.input.endFrame();
@@ -2643,6 +2647,335 @@ console.log("\n60. A siege ends when its last wave is resolved");
   director.reset();
   ok("resetting clears the held state", !director.held && director.wave === 0,
     `phase ${director.phase}, wave ${director.wave}`);
+}
+
+// ---------------------------------------------------------------------------
+// The economy exists to give Q something to be greedy FOR. Calling a wave early
+// has been in the build since the pacing rework and there was never a reason to
+// press it: the cost was losing a 12 s preparation window and the reward was
+// nothing. A risk with no upside is not a decision.
+console.log("\n61. Kills pay into two separate purses");
+{
+  const sim = makeSim();
+  const { horde, economy } = sim;
+
+  ok("both purses start empty", economy.salvage === 0 && economy.scrap === 0);
+
+  const chewer = horde.spawn(CHEWER);
+  horde.damage(chewer, 1e6);
+  const e = CFG.economy.chewer;
+  ok("a chewer pays personal salvage", economy.salvage === e.salvage,
+    `${economy.salvage} salvage`);
+  ok("and a little shared scrap", economy.scrap === e.scrap, `${economy.scrap} scrap`);
+
+  const climber = horde.spawn(CLIMBER);
+  horde.damage(climber, 1e6);
+  ok("a climber pays more, because reaching one costs you position",
+    economy.salvage === e.salvage + CFG.economy.climber.salvage,
+    `${economy.salvage} salvage`);
+
+  // Every damage source funnels through Horde.damage, so nothing can pay nothing.
+  const before = economy.salvage;
+  const viaEmitter = horde.spawn(CHEWER);
+  horde.damage(viaEmitter, 1e6);
+  ok("kills from any source pay, not just the rifle", economy.salvage > before);
+
+  // Damage that does NOT kill must not pay, or chip damage becomes an income farm.
+  const survivor = horde.spawn(CHEWER);
+  const held = economy.salvage;
+  horde.damage(survivor, 1);
+  ok("wounding pays nothing", economy.salvage === held, `${economy.salvage} salvage`);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n62. Refits apply, escalate in price, and respect their bounds");
+{
+  const sim = makeSim();
+  const { economy, weapon, player, trampler, repair } = sim;
+  const idx = Object.fromEntries(CFG.economy.catalogue.map((c, i) => [c.id, i]));
+
+  economy.salvage = 100000;
+  economy.scrap = 100000;
+
+  const baseDamage = weapon.damageScale;
+  const firstCost = economy.costOf(idx.rifle);
+  ok("a purchase reports what it did", !!economy.buy(idx.rifle));
+  ok("and the effect actually lands", weapon.damageScale > baseDamage,
+    `damage scale ${baseDamage} -> ${weapon.damageScale}`);
+  ok("the next stack costs more than the first",
+    economy.costOf(idx.rifle) > firstCost,
+    `${firstCost} -> ${economy.costOf(idx.rifle)}`);
+
+  const hpBefore = player.maxHp;
+  economy.buy(idx.vitals);
+  ok("vitals raises max health", player.maxHp > hpBefore, `${hpBefore} -> ${player.maxHp}`);
+  ok("and heals by the same amount, so it helps immediately",
+    player.hp === player.maxHp, `${player.hp} / ${player.maxHp}`);
+
+  const platingBefore = trampler.damageScale;
+  economy.buy(idx.plating);
+  ok("plating reduces incoming fortress damage", trampler.damageScale < platingBefore,
+    `${platingBefore} -> ${trampler.damageScale.toFixed(3)}`);
+
+  const rigBefore = repair.rateScale;
+  economy.buy(idx.rig);
+  ok("the repair rig speeds up repair", repair.rateScale > rigBefore,
+    `${rigBefore} -> ${repair.rateScale.toFixed(2)}`);
+
+  // Bounded structure, unbounded stacking -- the whole intended roguelike shape,
+  // asserted rather than assumed.
+  for (let i = 0; i < 40; i++) economy.buy(idx.plating);
+  const platingMax = CFG.economy.catalogue[idx.plating].max;
+  ok("fortress upgrades stop at their cap",
+    economy.stacks.plating === platingMax,
+    `${economy.stacks.plating} / ${platingMax}`);
+  ok("and say so rather than silently failing",
+    economy.buy(idx.plating) === null && economy.blockedReason.includes("MAXIMUM"),
+    economy.blockedReason);
+
+  for (let i = 0; i < 40; i++) economy.buy(idx.rifle);
+  ok("personal upgrades keep stacking with no cap",
+    economy.stacks.rifle > platingMax + 10, `${economy.stacks.rifle} stacks`);
+
+  // Plating must never trivialise the under-hull fight, because that fight is the
+  // entire reason a player dismounts.
+  ok("even fully plated, the fortress still takes real damage",
+    trampler.damageScale > 0.4, `takes ${(trampler.damageScale * 100).toFixed(0)}% damage`);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n63. Buying is a between-waves act only");
+{
+  const sim = makeSim();
+  const { economy, director } = sim;
+  sim.waves = true;
+  economy.salvage = 100000;
+  economy.scrap = 100000;
+
+  ok("the shop is open during the opening rest", economy.open,
+    `phase ${director.phase}`);
+
+  // Run until a wave is actually on the field.
+  let sawSpawning = false;
+  let boughtWhileEngaged = null;
+  let openWhileFighting = true;
+  step(sim, 60 * 90, () => {
+    if (director.phase === PHASE.SPAWNING || director.phase === PHASE.ENGAGED) {
+      sawSpawning = true;
+      if (economy.open) openWhileFighting = false;
+      if (boughtWhileEngaged === null) boughtWhileEngaged = economy.buy(0);
+    }
+  });
+
+  ok("a wave did arrive (test is not vacuous)", sawSpawning);
+  ok("the shop closes once a wave is out", openWhileFighting);
+  ok("and buying mid-wave is refused", boughtWhileEngaged === null);
+  ok("with a reason given", economy.blockedReason === "NOT BETWEEN WAVES",
+    economy.blockedReason);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n64. Calling a wave early pays more, and skipping the fight pays less");
+{
+  // Two runs of the same seeded fight: one waits, one gambles.
+  const run = (callEarly) => {
+    const sim = makeSim();
+    const { director, horde, economy, trampler } = sim;
+    sim.waves = true;
+
+    let called = false;
+    step(sim, 60 * 120, () => {
+      if (callEarly && !called && director.phase === PHASE.PREP) {
+        called = director.callEarly();
+      }
+      // Stand in for a competent crew so waves keep resolving either way.
+      for (const e of horde.pool) if (e.alive) horde.damage(e, 1e6);
+      trampler.repairAll();
+    });
+    return { earned: economy.earned, resolved: director.resolved, wave: director.wave, called };
+  };
+
+  const patient = run(false);
+  const greedy = run(true);
+
+  ok("the gamble was actually taken (test is not vacuous)", greedy.called);
+  ok("both runs fought the same number of waves",
+    greedy.wave >= patient.wave, `patient ${patient.wave}, greedy ${greedy.wave}`);
+  ok("calling early earns more salvage for the same fight",
+    greedy.earned.salvage > patient.earned.salvage,
+    `patient ${patient.earned.salvage.toFixed(0)}, greedy ${greedy.earned.salvage.toFixed(0)}`);
+
+  // And the bonus has to be the CONFIGURED size, not merely non-zero.
+  const sim = makeSim();
+  const { director, economy, horde } = sim;
+  sim.waves = true;
+  step(sim, 60 * 20, () => {
+    if (director.phase === PHASE.PREP) director.callEarly();
+  });
+  ok("the wave is flagged as called early", director.calledEarly, `wave ${director.wave}`);
+  ok("and the multiplier matches config",
+    Math.abs(economy.bonus - (1 + CFG.economy.earlyCallBonus)) < 1e-9,
+    `x${economy.bonus}`);
+
+  const before = economy.salvage;
+  const e = horde.spawn(CHEWER);
+  horde.damage(e, 1e6);
+  ok("so a kill during it pays the bonus rate",
+    Math.abs((economy.salvage - before) - CFG.economy.chewer.salvage * economy.bonus) < 1e-9,
+    `paid ${(economy.salvage - before).toFixed(1)} for a ${CFG.economy.chewer.salvage} kill`);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n65. A restart wipes the purses AND reverts every upgrade");
+{
+  const sim = makeSim();
+  const { economy, weapon, player, trampler, repair } = sim;
+  const idx = Object.fromEntries(CFG.economy.catalogue.map((c, i) => [c.id, i]));
+
+  economy.salvage = 100000;
+  economy.scrap = 100000;
+  for (const id of ["rifle", "vitals", "plating", "rig"]) economy.buy(idx[id]);
+
+  ok("upgrades were in place before the reset",
+    weapon.damageScale > 1 && trampler.damageScale < 1 && repair.rateScale > 1
+    && player.maxHp > CFG.combat.playerHp);
+
+  economy.reset();
+
+  // This is the part that silently ruins a seeded fight: a restart that keeps the
+  // previous run's stats makes every subsequent attempt quietly easier.
+  ok("weapon damage is back to baseline", weapon.damageScale === 1);
+  ok("fortress plating is back to baseline", trampler.damageScale === 1);
+  ok("repair rate is back to baseline", repair.rateScale === 1);
+  ok("max health is back to baseline", player.maxHp === CFG.combat.playerHp,
+    `${player.maxHp}`);
+  ok("both purses are empty", economy.salvage === 0 && economy.scrap === 0);
+  ok("and no stacks remain",
+    Object.values(economy.stacks).every((n) => n === 0),
+    JSON.stringify(economy.stacks));
+}
+
+// ---------------------------------------------------------------------------
+// Invariant 2b, re-checked WITH upgrades bought. Test 48 proves emitters cannot
+// hold the under-hull area alone at baseline, but hull plating halves incoming
+// damage, and "emitters plus plating" is a combination no earlier test covers.
+// If automation can hold a position unattended, the player stops going there and
+// the dismount half of the pillar dies -- silently, because nothing looks broken.
+console.log("\n66. Even fully refitted, automation cannot hold the line alone");
+{
+  const sim = makeSim();
+  const { player, trampler, emitters, economy, director } = sim;
+  const idx = Object.fromEntries(CFG.economy.catalogue.map((c, i) => [c.id, i]));
+
+  economy.scrap = 100000;
+  for (let i = 0; i < 20; i++) economy.buy(idx.plating);
+  for (let i = 0; i < 20; i++) economy.buy(idx.rig);
+  ok("the fortress is fully refitted (test is not vacuous)",
+    economy.stacks.plating === CFG.economy.catalogue[idx.plating].max
+    && economy.stacks.rig === CFG.economy.catalogue[idx.rig].max,
+    `plating ${economy.stacks.plating}, rig ${economy.stacks.rig}, ` +
+    `takes ${(trampler.damageScale * 100).toFixed(0)}% damage`);
+
+  for (const legIndex of [0, 2, 4]) {
+    const at = trampler.legAttackWorld(legIndex, new THREE.Vector3());
+    player.position.set(at.x, 1.2, at.z);
+    player.base = null;
+    player.velocity.set(0, 0, 0);
+    step(sim, 6);
+    sim.input.presses.add(CFG.emitters.deployKey);
+    step(sim, 2);
+  }
+  ok("and three emitters are down", emitters.deployedCount === 3,
+    `${emitters.deployedCount} placed`);
+
+  // Player entirely out of the fight. Nothing is defending but automation.
+  player.position.set(700, 1.2, 700);
+  player.base = null;
+  sim.waves = true;
+
+  let frames = 0;
+  const cap = 60 * 400;
+  while (!trampler.immobilised && frames < cap) {
+    step(sim, 1);
+    frames++;
+  }
+
+  ok("the fortress is still crippled with nobody aboard",
+    trampler.immobilised,
+    trampler.immobilised
+      ? `crippled at ${(frames / 60).toFixed(1)}s, wave ${director.wave}`
+      : "AUTOMATION PLUS UPGRADES HELD THE LINE -- THE PILLAR IS BROKEN");
+
+  // A repair rig cannot repair anything on its own either: it scales a rate that
+  // only exists while a player is holding the key.
+  ok("and the repair rig did nothing unattended",
+    trampler.legHp.some((h) => h <= 0),
+    `legs [${trampler.legHp.map((h) => Math.round(h)).join(",")}]`);
+}
+
+// ---------------------------------------------------------------------------
+// The HUD has no DOM tests, because the harness runs headless. That gap let two
+// real faults through: a refit panel added at the same screen corner as the
+// controls panel, overlapping into unreadable mush, and nine panels on screen at
+// once, the effect of which was that none of them got read.
+//
+// This checks the markup as TEXT, which needs no DOM and catches both.
+console.log("\n67. The HUD is wired to markup that exists, and panels do not pile up");
+{
+  const html = readFileSync("index.html", "utf8");
+  const hudSrc = readFileSync("src/hud.js", "utf8");
+
+  // Two spellings: direct getElementById calls, and the local `id()` helper the
+  // readout rows go through. Missing the helper would have made this test look
+  // like it was checking everything while actually checking a third of it.
+  const ids = [
+    ...[...hudSrc.matchAll(/getElementById\("([^"]+)"\)/g)].map((m) => m[1]),
+    ...[...hudSrc.matchAll(/(?<![\w.])id\("([^"]+)"\)/g)].map((m) => m[1]),
+  ];
+  ok("the HUD reaches for a meaningful number of elements", ids.length > 30,
+    `${ids.length} lookups`);
+
+  // A getElementById that misses returns null and only explodes when the value is
+  // used, which can be many frames later and in an unrelated-looking place.
+  const missing = ids.filter((i) => !html.includes(`id="${i}"`));
+  ok("every element the HUD reaches for exists in the markup", missing.length === 0,
+    missing.length ? `MISSING: ${missing.join(", ")}` : "all present");
+
+  const panels = [...html.matchAll(/<div id="([\w-]+)" class="panel([^"]*)"/g)]
+    .map((m) => ({ id: m[1], classes: m[2] }));
+  ok("panels were found to inspect", panels.length >= 4,
+    panels.map((p) => p.id).join(", "));
+
+  const ruleOf = (id) => {
+    const m = html.match(new RegExp(`#${id}\\s*\\{([^}]*)\\}`));
+    return m ? m[1] : "";
+  };
+  const anchorOf = (id) => {
+    const body = ruleOf(id);
+    return ["left", "right", "top", "bottom"]
+      .filter((s) => new RegExp(`(?:^|;|\\s)${s}:`).test(body))
+      .join("+") || "none";
+  };
+
+  // Visible with no key pressed: not marked hidden in the markup and not display:none.
+  const alwaysUp = panels.filter(
+    (p) => !/\bhidden\b/.test(p.classes) && !/display:\s*none/.test(ruleOf(p.id)),
+  );
+
+  const anchors = alwaysUp.map((p) => anchorOf(p.id));
+  ok("no two always-visible panels share a screen anchor",
+    new Set(anchors).size === anchors.length,
+    alwaysUp.map((p, i) => `${p.id}@${anchors[i]}`).join(", "));
+
+  // The real lesson, encoded: panels accumulate one reasonable addition at a time.
+  ok("only a couple of panels are up while actually playing", alwaysUp.length <= 2,
+    `${alwaysUp.length} always visible (${alwaysUp.map((p) => p.id).join(", ") || "none"})`);
+
+  // Everything else must be reachable, or it is just dead markup.
+  for (const p of panels.filter((x) => !alwaysUp.includes(x))) {
+    const toggled = new RegExp(`"${p.id}"`).test(hudSrc);
+    ok(`${p.id} is toggled from code rather than orphaned`, toggled);
+  }
 }
 
 ok("no boarder ever floated off the deck footprint", !sawFloatingBoarder);

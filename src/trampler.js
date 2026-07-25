@@ -42,6 +42,11 @@ export class Trampler {
     this.reactorHp = CFG.trampler.reactorHp;
     this.destroyed = false;
 
+    // Incoming damage multiplier, owned by the economy's hull plating. 1 is
+    // unarmoured. Applied to legs and the reactor alike, in damageLeg and
+    // damageReactor, so no attacker can bypass it by using a different path.
+    this.damageScale = 1;
+
     // Deck extents, so other systems can ask whether something is still aboard.
     this.halfW = HALF_W;
     this.halfL = HALF_L;
@@ -372,7 +377,7 @@ export class Trampler {
 
   damageLeg(index, amount) {
     if (this.legHp[index] <= 0) return false;
-    this.legHp[index] = Math.max(0, this.legHp[index] - amount);
+    this.legHp[index] = Math.max(0, this.legHp[index] - amount * this.damageScale);
 
     if (this.legHp[index] <= 0) {
       this.#legMaterial(index);
@@ -405,7 +410,7 @@ export class Trampler {
 
   damageReactor(amount) {
     if (this.destroyed) return;
-    this.reactorHp = Math.max(0, this.reactorHp - amount);
+    this.reactorHp = Math.max(0, this.reactorHp - amount * this.damageScale);
     this.#refreshReactorLook();
     if (this.reactorHp <= 0) this.destroyed = true;
   }

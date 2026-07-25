@@ -46,10 +46,21 @@ the rule became spatial and legible: *the hull's shadow is the safe zone*.
 Prefer rules a player can see. "You cannot shoot through your own fortress" is
 better than "the gun elevates between -12 and +35 degrees".
 
-**Bounded structure, unbounded stacking.** The intended roguelike shape (not yet
-built): the fortress has a limited number of hardpoints, so a run has a readable
-silhouette, while personal upgrades stack without limit in the Risk of Rain
-style. Growth shows up as accretion on a fixed frame, not as infinite geometry.
+**Bounded structure, unbounded stacking.** The fortress has a limited number of
+upgrade slots, so a run has a readable silhouette, while personal upgrades stack
+without limit in the Risk of Rain style. Growth shows up as accretion on a fixed
+frame, not as infinite geometry.
+
+This is now expressed as *income*, not just as caps: personal salvage is earned
+alone, per kill, and buys the unbounded track; shared scrap is earned together, by
+resolving a wave, and buys the bounded one. Splitting the currency on day one was
+deliberate — one pooled pot generates a co-op argument every wave, and retrofitting
+a split means re-deriving every price and payout.
+
+**A risk with no upside is not a decision.** Calling a wave early existed for a
+long time with nothing to be greedy for, so nobody would ever press it. Any
+mechanic offering the player a gamble needs a measurable payoff on the other side
+of it, or it is dead weight that reads as a mistake waiting to happen.
 
 **Difficulty scales with elapsed time, not wave number.** Getting stronger has to
 be a race against a clock, not a staircase climbed at your own pace. This is also
@@ -61,6 +72,16 @@ Left 4 Dead's director: spawning stops entirely while pressure is high, then a
 guaranteed calm follows. Pressure comes from health lost, hostiles under the hull,
 hostiles aboard, and whether the fortress is stopped. Eight healthy enemies
 loitering at 60 m are not the same problem as eight chewing the legs.
+
+**On-screen panels accumulate, and the default has to be hidden.** Every panel was
+a reasonable addition on its own; together they reached nine at once, two of them
+overlapping into unreadable mush, and the effect of showing everything was that
+none of it got read. What stays up while playing is only what a player *acts on*:
+the stakes, the contextual prompt, the wave telegraph, and the refit list during
+the window when buying is possible. Everything for whoever is tuning the thing is
+behind a key. A readout that answers "is this working?" is instrumentation; a
+readout that answers "what should I do now?" is UI.
+→ test 67 guards it, since the headless harness cannot see the DOM
 
 **Telegraph every wave.** A preparation window with a named bearing is what makes
 deployable defences a decision and gives the guns a reason to be manned at a

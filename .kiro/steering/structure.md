@@ -1,29 +1,46 @@
 # Trampler — code structure
 
-16 modules, ~4,000 lines in `src/`, plus a 1,975-line headless harness.
+17 modules, ~4,700 lines in `src/`, plus a 2,900-line headless harness.
 
 ```
 index.html          canvas, HUD markup, importmap, click-to-play gate
 server.mjs          loopback-only static server
-verify.mjs          headless test harness (61 sections, 272 checks)
+verify.mjs          headless test harness (68 sections, 319 checks)
 src/
-  config.js    365   every tunable, with a comment explaining each value
-  util.js       49   box(), boxToMesh(), seeded RNG, clamp/lerp/damp/smoothstep
-  collision.js 177   space-agnostic AABB resolve, ground probe, mantle search
-  world.js     132   terrain, lighting, rocks and ruins, sun follow
-  trampler.js  516   the fortress: geometry, gait, spatial damage, transforms
-  player.js    556   FPS controller, based movement, mantle, health
-  grapple.js   260   winch: hull-local anchors, brake, cut-vs-arrive release
-  enemies.js   509   pooled horde, instanced draw, spatial hash, two AI types
-  waves.js     210   director: pacing gated on crew pressure, bounded siege
-  weapon.js    216   the single hitscan path, tracers, impacts
-  deckgun.js   245   manned mounts, hull-local traverse arcs, heat
-  repair.js    139   contextual repair, ground markers, grace window
-  emitters.js  250   hull-mounted shock emitters: the tower-defence layer
-  hud.js       174   readouts, bars, leg pips, contextual prompt
-  input.js      86   keyboard/mouse, pointer lock
-  main.js      176   wiring and the frame loop
+  config.js    675   every tunable, with a comment explaining each value
+  util.js       48   box(), boxToMesh(), seeded RNG, clamp/lerp/damp/smoothstep
+  collision.js 176   space-agnostic AABB resolve, ground probe, mantle search
+  world.js     133   terrain, lighting, rocks and ruins, sun follow
+  trampler.js  542   the fortress: geometry, gait, spatial damage, transforms
+  player.js    555   FPS controller, based movement, mantle, health
+  grapple.js   259   winch: hull-local anchors, brake, cut-vs-arrive release
+  enemies.js   598   pooled horde, instanced draw, spatial hash, two AI types
+  waves.js     236   director: pacing gated on crew pressure, bounded siege
+  weapon.js    227   the single hitscan path, tracers, impacts
+  deckgun.js   244   manned mounts, hull-local traverse arcs, heat
+  repair.js    164   contextual repair, ground markers, grace window
+  emitters.js  249   hull-mounted shock emitters: the tower-defence layer
+  economy.js   235   two purses, refit catalogue, the early-call bonus
+  hud.js       330   bars, leg pips, prompt, refit panel, toggled overlays
+  input.js      85   keyboard/mouse, pointer lock
+  main.js      243   wiring and the frame loop
 ```
+
+### Upgrades are instance multipliers, never edits to CFG
+
+`economy.js` applies every purchase as a multiplier on the owning object —
+`weapon.damageScale`, `trampler.damageScale`, `repair.rateScale`, `player.maxHp` —
+and `Economy.reset()` restores all of them.
+
+Two reasons this matters more than it looks. Writing a run's upgrades into `CFG`
+would leak them into every later test in the same process, which a debug knob very
+nearly did once already. And a restart that kept the previous run's stats would
+make each attempt quietly easier, which destroys the whole point of the seeded
+fight: two attempts at the same wave being comparable.
+
+Effects live in an `EFFECTS` map in `economy.js`, not in `config.js`. Config holds
+tunable *data*; a closure in a config file cannot be read at a glance beside the
+number it modifies.
 
 ## Architectural patterns
 
