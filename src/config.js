@@ -1325,6 +1325,39 @@ export const CFG = {
     horizonRadius: 620,
   },
 
+  // ---------------------------------------------------------------------------
+  // Particles.
+  //
+  // Only the two numbers below live here so far. The other sixty in fx.js are
+  // still literals, which is debt rather than a decision -- but moving them is a
+  // refactor, and a refactor folded into a behaviour change produces a diff
+  // nobody can read.
+  fx: {
+    // How much of the frame ONE sprite is allowed to own, as a fraction of the
+    // drawing buffer's height.
+    //
+    // fx.js sizes points as `aSize * 320 / viewDepth`, which is unbounded as the
+    // depth goes to zero. The muzzle flash is the case that proves it: it spawns
+    // about a metre from the lens, so uncapped one flash sprite measured
+    // 1460-3290 px across -- several times the width of the screen -- and five of
+    // them go off per shot. A playtest reported that firing blanked the view.
+    //
+    // Half the frame's height is where the line goes, because a soft sprite bigger
+    // than that is a screen wipe rather than an effect and nothing in fx.js is
+    // authored wanting to wipe the frame. A fraction rather than a pixel count so
+    // it means the same thing after a resize and at every adaptive render scale.
+    maxScreenFraction: 0.5,
+
+    // How far past `player.handPosition` the rifle's flash is thrown, in metres.
+    //
+    // handPosition is the GRAPPLE's rope origin -- roughly a right hand, 0.35 m
+    // from the lens. The viewmodel's muzzle brake is at about 1.0 m, so the flash
+    // was being born two thirds of a metre behind the barrel it is meant to leave,
+    // inside the receiver and that much nearer the eye. Nearer is also bigger: the
+    // same sprite is three times the screen size at 0.35 m as at 1.0 m.
+    muzzleStandoff: 0.65,
+  },
+
   debug: {
     speedStep: 0.5,
     minSpeed: 0,

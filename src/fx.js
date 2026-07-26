@@ -19,6 +19,7 @@ const MAX = 1400;
 const _v = new THREE.Vector3();
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
+const _buffer = new THREE.Vector2();
 
 /**
  * Soft round sprite, drawn once into a canvas.
@@ -49,6 +50,7 @@ const ParticleShader = {
     attribute float aSize;
     attribute float aAlpha;
     attribute vec3 aColor;
+    uniform float uMaxSize;
     varying float vAlpha;
     varying vec3 vColor;
     void main() {
@@ -57,7 +59,15 @@ const ParticleShader = {
       vec4 mv = modelViewMatrix * vec4(position, 1.0);
       // Perspective sizing, so a puff of dust forty metres away is small rather
       // than the same pixel size as one at your feet.
-      gl_PointSize = aSize * (320.0 / max(-mv.z, 0.1));
+      //
+      // CAPPED, because that expression is unbounded as the depth goes to zero and
+      // the near field is exactly where this system emits: the muzzle flash spawns
+      // about a metre from the lens. Uncapped, one flash sprite was 1460-3290 px
+      // across against a 1080-tall buffer, and five go off per shot -- a playtest
+      // reported that firing blanked the screen. uMaxSize is a fraction of the
+      // buffer the renderer is actually drawing into, so the bound holds after a
+      // resize and at every adaptive render scale.
+      gl_PointSize = min(aSize * (320.0 / max(-mv.z, 0.1)), uMaxSize);
       gl_Position = projectionMatrix * mv;
     }
   `,
@@ -104,7 +114,10 @@ export class Fx {
     geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e6);
 
     this.points = new THREE.Points(geo, new THREE.ShaderMaterial({
-      uniforms: { uMap: { value: sprite() } },
+      // uMaxSize is refreshed every frame from the renderer's drawing buffer.
+      // Seeded high enough to be inert rather than at 0, so a frame drawn before
+      // the first update still shows particles.
+      uniforms: { uMap: { value: sprite() }, uMaxSize: { value: 1e4 } },
       vertexShader: ParticleShader.vertexShader,
       fragmentShader: ParticleShader.fragmentShader,
       transparent: true,
@@ -330,7 +343,18 @@ export class Fx {
    * renderer.
    */
   update(dt, ctx) {
-    const { trampler, weapon, horde, guns, player } = ctx;
+    const { trampler, weapon, horde, guns, player, renderer } = ctx;
+
+    // ---- size cap
+    //
+    // Read every frame rather than latched at construction, because the adaptive
+    // resolution scaler moves the drawing buffer between 0.6 and 1.0 of the canvas
+    // and a cap in pixels means nothing without knowing which buffer it is in.
+    const bufferHeight = renderer?.getDrawingBufferSize(_buffer).y ?? 0;
+    if (bufferHeight > 0) {
+      this.points.material.uniforms.uMaxSize.value =
+        bufferHeight * CFG.fx.maxScreenFraction;
+    }
 
     // ---- integrate
     for (let i = 0; i < MAX; i++) {
@@ -399,6 +423,11 @@ export class Fx {
       } else {
         player.handPosition(_v);
         player.lookDirection(_fwd);
+        // Thrown forward to the rifle's muzzle brake. handPosition is the winch's
+        // rope origin and sits 0.35 m from the lens, well behind the barrel, so a
+        // flash spawned there appears inside the receiver -- and being that much
+        // nearer the eye made it three times the screen size it should be.
+        _v.addScaledVector(_fwd, CFG.fx.muzzleStandoff);
         this.muzzle(_v, _fwd);
       }
     }

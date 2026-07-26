@@ -4240,7 +4240,17 @@ console.log("\n83. The particle and viewmodel layer runs against the real sim");
     const viewmodel = new ViewModel(sim.camera);
     ok("both constructed against a real scene and camera", !!fx.points && !!viewmodel.group);
 
-    const ctx = { ...sim, guns: sim.guns, input: sim.input };
+    // A renderer stub, because fx.js now reads the drawing buffer's height every
+    // frame to bound how much of the screen one sprite may own. Only
+    // getDrawingBufferSize is reached, and only for its y. Without the stub that
+    // path is skipped by the optional chain and the wiring goes uncovered -- which
+    // is the whole reason this section exists.
+    const ctx = {
+      ...sim,
+      guns: sim.guns,
+      input: sim.input,
+      renderer: { getDrawingBufferSize: (out) => out.set(1920, 1080) },
+    };
 
     // A real fight, so footfalls, gunfire, kills and deaths all actually happen.
     sim.waves = false;
@@ -4284,6 +4294,31 @@ console.log("\n83. The particle and viewmodel layer runs against the real sim");
     const alive = [...fx.geo.attributes.aAlpha.array].filter((a) => a > 0).length;
     ok("particles were actually alive at the end (test is not vacuous)", alive > 0,
       `${alive} live particles`);
+
+    // The sprite size cap, as far as it can be checked without a GL context.
+    //
+    // What this proves: the uniform is wired and tracks the buffer the renderer is
+    // drawing into, so a resize or an adaptive scale change carries through.
+    // What it CANNOT prove is the min() in the vertex shader, which runs on a GPU
+    // that does not exist here -- that part is eyes-only. Worth stating rather
+    // than leaving a reader to assume the assertion covers more than it does.
+    const cap = fx.points.material.uniforms.uMaxSize.value;
+    ok("the sprite size cap tracks the drawing buffer",
+      cap === 1080 * CFG.fx.maxScreenFraction,
+      `uMaxSize ${cap.toFixed(1)} px from a 1080-tall buffer`);
+    // And that it is a bound on something rather than on nothing: the muzzle flash,
+    // born about a metre from the lens, is the emitter that exceeds it. Run through
+    // the same arithmetic the vertex shader does.
+    //
+    // 3.6 is the largest size `muzzle()` in fx.js authors (1.6 + 2.0) and 0.35 m is
+    // handPosition's forward offset. Both are literals over there, so if either
+    // moves this reads as a stale number in the output rather than passing quietly
+    // on a scenario that no longer happens.
+    const flashDepth = CFG.fx.muzzleStandoff + 0.35;
+    const flashWants = (3.6 * 320) / flashDepth;
+    ok("and the muzzle flash is a case that needs it", flashWants > cap,
+      `largest flash sprite wants ${flashWants.toFixed(0)} px at ${flashDepth.toFixed(2)} m,`
+      + ` capped to ${cap.toFixed(0)}`);
 
     // The viewmodel must react, and must stay finite.
     ok("the viewmodel recoils when the gun fires", viewmodel.lastShots === sim.weapon.shots,
