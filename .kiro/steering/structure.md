@@ -1,6 +1,6 @@
 # Trampler — code structure
 
-24 modules, ~9,700 lines in `src/`, plus a ~5,100-line headless harness.
+26 modules, ~11,000 lines in `src/`, plus a ~6,100-line headless harness.
 
 Line counts below are rounded to the nearest ten and are there for a sense of
 weight, not as a fact to rely on. They drift every commit.
@@ -19,40 +19,42 @@ tools/
   summarise.mjs     failures + totals from a run, since the output is 700 lines
 assets/             vendored CC0 textures + HDRI, plus manifest.json
 src/
-  config.js   1400  every tunable, with a comment explaining each value
+  config.js   1670  every tunable, with a comment explaining each value
   util.js       60  box(), boxToMesh(), seeded RNG, clamp/lerp/damp/smoothstep
   look.js      480  HEADLESS-SAFE materials, UV tiling, enemy silhouettes
   collision.js 180  space-agnostic AABB resolve, ground probe, mantle search
   world.js     440  terrain, lighting, scatter, horizon silhouettes, fog
-  trampler.js  990  the fortress: geometry, gait, spatial damage, transforms
+  trampler.js 1000  the fortress: geometry, gait, spatial damage, transforms
   player.js    570  FPS controller, based movement, mantle, health
   grapple.js   260  winch: hull-local anchors, brake, cut-vs-arrive release
-  enemies.js   980  pooled horde, instanced draw, spatial hash, six AI types
+  enemies.js  1010  pooled horde, instanced draw, spatial hash, six AI types
   waves.js     340  director: pacing on crew pressure, composition, the boss
-  run.js       200  legs of a journey, road choice, cumulative modifiers
-  weapon.js    230  the single hitscan path, tracers, impacts
+  run.js       230  legs of a journey, the salvage pick, road choice, modifiers
+  weapon.js    260  the single hitscan path, tracers, impacts
   deckgun.js   250  manned mounts, hull-local traverse arcs, heat
-  repair.js    160  contextual repair, ground markers, grace window
+  repair.js    180  contextual repair, ground markers, grace window
   emitters.js  290  hull-mounted shock emitters: the tower-defence layer
   modules.js   200  three hardpoints, six modules, absolute-from-count effects
-  economy.js   430  two purses, refits, modules, the early-call bonus
-  hud.js       580  gauges, prompts, refit panel, refit bay, route choice
-  render.js    330  renderer, EffectComposer chain, camera shake
-  fx.js        440  one pooled particle system, muzzle light
+  events.js    120  the kill/hit bus items hang procs off, with a depth cap
+  items.js     330  the salvage table: static effects, conditionals, procs
+  economy.js   670  two purses, the re-rolled shop, the pick, the early call
+  hud.js       670  gauges, prompts, refit panel, bay, pick, route, buff strip
+  render.js    390  renderer, EffectComposer chain, camera shake
+  fx.js        470  one pooled particle system, muzzle light
   viewmodel.js 160  the rifle in your hands
   audio.js     290  synthesised mixer, no audio files
   input.js      90  keyboard/mouse, pointer lock
-  main.js      390  wiring and the frame loop
+  main.js      430  wiring and the frame loop
 ```
 
 ## The headless boundary
 
 This is the most important structural rule in the project, and it is what makes a
-5,100-line test harness possible at all.
+6,100-line test harness possible at all.
 
 The harness constructs the **real** `World`, `Trampler`, `Player`, `Horde`,
-`Director`, `Weapon`, `Repair`, `DeckGun`, `Emitters`, `Modules`, `Economy` and
-`Run` in plain node, with no GL context and no DOM. So:
+`Director`, `Weapon`, `Repair`, `DeckGun`, `Emitters`, `Modules`, `Events`,
+`Economy`, `Items` and `Run` in plain node, with no GL context and no DOM. So:
 
 - Anything those modules import must work with no `document` and no `window`.
   `look.js` is the only visual module they are allowed to touch, and it checks
@@ -169,9 +171,52 @@ the reset, and there is no separate revert path to forget to write. The bug that
 rules out — a modifier surviving a reset because someone added a purchase path and
 not its opposite — is invisible until two runs disagree.
 
-Effects live in `EFFECTS` maps in `economy.js` and `modules.js`; their sizes live
-in `config.js` next to their rationale. `tech.md` has the convention under "Config
-conventions".
+Effects live in `ITEM_EFFECTS` in `items.js` and `EFFECTS` in `modules.js`; their
+sizes live in `config.js` next to their rationale. `tech.md` has the convention
+under "Config conventions".
+
+### Conditional effects are a SEPARATE field, rebuilt every frame
+
+Half the salvage table only pays under a condition — beneath the hull, on a
+station, for three seconds after boarding, while the reactor is failing. None of
+that can live in `weapon.damageScale`, and the reason is the rule above: that field
+is derived absolutely from stack counts, so a timed write into it is either erased
+by the next recompute or accumulates forever.
+
+So conditionals land in `weapon.damageBonus`, which `Items.update` **clears and
+rebuilds from current conditions every frame**. Absolute again, for the same
+reason, and the shot reads `damageScale + damageBonus`. Two fields, one discipline.
+`Items` also publishes `bonus` and `reasons` — `["UNDER HULL", "BOARDED"]` — which
+is what the buff strip draws, because a condition the player cannot see is a
+condition they cannot learn.
+
+Note what that means for a reset: `economy.reset()` restores the static half via
+`applyAll()` at zero, and the conditional half is restored by the next frame's
+recompute finding no stacks to read. Neither has an uninstall path. Test 92 reads
+all nine affected fields in one place, so an effect that starts writing somewhere
+new shows up as an unreverted value rather than as two runs disagreeing later.
+
+### Procs hang off a bus, and gate on who caused the kill
+
+`events.js` is a two-channel bus — `onKill` and `onHit` — with named arrays and
+named emit methods rather than a string-keyed map, because a misspelled channel
+name fails *silently* in both directions and a typo should be a `TypeError`.
+`Horde.#kill` and `Weapon.shootFrom` are the publishers; `Economy` (income) and
+`Items` (procs) are the subscribers, and their listeners are **never** removed on
+reset or income stops silently.
+
+Two things about it are load-bearing:
+
+- **A depth cap.** An on-kill item that deals damage re-enters its own listener,
+  and two perfectly reasonable items compose into unbounded recursion.
+  `CFG.events.maxProcDepth` is 4, applied with `try/finally` so a throwing item
+  cannot leave the counter high and kill every proc for the rest of the run.
+- **`source` gates procs, not income.** `Horde.damage(e, amount, source, pierce)`.
+  Emitters pass `"emitter"`, the rifle and both manned guns pass `"player"`, and
+  every proc requires `"player"`. Without that gate an emitter kill triggers a
+  splash that kills two more, which is automation compounding itself with nobody
+  present — invariant 2b failing in a way nothing looks wrong about. Income
+  deliberately ignores `source` and pays either way.
 
 ### Run modifiers are instance state too
 
@@ -195,7 +240,7 @@ six types have an identical field set.
 trampler.update            hull moves first, so everything aboard inherits this frame
 trampler.resolveStomps     footfalls resolve against where things actually are
 director.update            waves
-run.update                 offers roads if the siege is held; advances nothing itself
+run.update                 offers a pick then roads if held; advances nothing itself
 handleStationInput         mount/dismount, so it takes effect the same frame
 grapple.handleInput        fire before the player, so a shot lands the frame it is pressed
 player.update              look, based movement, driven states, integrate, collide
@@ -203,7 +248,8 @@ weapon.update              suppressed while manning a station
 gun.update                 aim visuals, fire, heat
 repair.update
 emitters.update
-handlePurchasing           refits, the bay, or a road choice — exactly one owns the keys
+items.update               conditionals built from the position this frame ENDED in
+handlePurchasing           pick, road, bay or refits — exactly one owns the keys
 horde.update               reads the hull transform after it has moved
 grapple.updateVisuals      against a fresh camera
 world.updateSun
@@ -233,11 +279,15 @@ and children of a camera are only traversed if the camera is in the graph.
 
 ### The number keys have exactly one owner per frame
 
-The refit panel (1-6), the refit bay (Tab, then 1-6) and a road choice (1-2) all
-want the same keys. `routePurchaseInput` in `economy.js` picks one owner in
-priority order — road choice, then bay, then panel — and hands `null` as the input
-to the others. Two consumers of one key set is a bug waiting for the frame both
-are visible.
+The refit panel (1-6), the refit bay (Tab, then 1-6), a road choice (1-2) and a
+pending salvage pick (1-3) all want the same keys. `routePurchaseInput` in
+`economy.js` picks one owner in priority order — **pick, road, bay, panel** — and
+hands `null` as the input to the others. Two consumers of one key set is a bug
+waiting for the frame both are visible.
+
+The precedence is ordered by how stuck the crew is without it. A pending pick
+blocks the road behind it; a road blocks the whole run; the bay and the panel are
+both things you can walk away from.
 
 The rule lives in `economy.js` rather than in the frame loop **so that it can be
 tested**. It was in `main.js`, which the harness cannot import, and an audit of the

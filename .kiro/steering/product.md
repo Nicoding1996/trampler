@@ -63,6 +63,43 @@ a menu where one option is strictly best is a menu, not a decision.
 The last landmark is the boss. About fifteen minutes for a biome, against a
 30-45 minute target for a full run — biomes are the unit that repeats.
 
+Holding a siege pays a free pick of three items before the road choice, so a
+landmark has a shape: fight, get handed something, spend what you earned, then
+gamble on a road. The boss leg pays no pick, because an item you can never spend is
+a menu rather than a reward.
+
+## The salvage table
+
+Eighteen items, and the interesting thing about them is what they are *for* rather
+than how big their numbers are. Four numeric multipliers is not a build: every run
+bought the same +25% damage in the same order, and the only thing that differed
+between two runs was which road you took.
+
+Six of them are still plain numbers, deliberately. A pool of nothing but exotic
+effects has no baseline to judge them against, and "just more damage" is a real pick
+when the alternative does not suit the build you already have. The other twelve fall
+into categories chosen because of what they pay you for:
+
+| category | pays you for | example |
+|---|---|---|
+| position | being in one of the two places | +30% beneath the hull |
+| transition | *moving* between them | +40% for 3 s after boarding |
+| job-linked | doing the work | +30% for 5 s after a repair |
+| risk | the state you would rather not be in | +35% while the reactor is failing |
+| tooling | changing which tool is correct | pierces a bulwark's armour |
+| proc | a chain reaction off your own kills | splash on kill |
+
+The transition pair is the one to protect: one item pays for getting aboard and
+another for dropping off, so a build carrying both is paid for oscillating. That is
+the pillar restated as an upgrade, which is the opposite of what a roguelike item
+pool usually does to a positional game.
+
+Rarity is three tiers, and it carries the price as well as the odds — items declare
+a tier and inherit cost and growth from it. A landmark's shop shows four of the
+sixteen personal items, re-rolled each time, which is why two runs build
+differently. The two fortress refits are always on sale: the bounded track has to be
+dependable enough to plan around.
+
 ## Design principles earned the hard way
 
 **Geometry should enforce rules, not magic numbers.** The gun's depression clamp
@@ -84,6 +121,18 @@ and buys the unbounded track, shared scrap is earned by resolving a wave and buy
 the bounded one. Invariant 22 is the enforced form. Splitting the currency on day
 one was deliberate — one pooled pot generates a co-op argument every wave, and
 retrofitting a split means re-deriving every price and payout.
+
+**Growth has to be qualitative, or the unbounded track is just a number going up.**
+The personal side had four multipliers for a long time, and it worked in the sense
+that the arithmetic kept up with the enemy health curve. It failed in the sense that
+nothing about it was a decision: there was one correct order to buy things in, and
+by the third run you knew it. A pool that shows you a subset is what makes the
+question "what does this run want" rather than "have I bought enough damage yet".
+
+Note which way that pushed the item design. The obvious roguelike items for a game
+like this — an auto-repair drone, a deployable turret, something that reaches under
+the hull from the deck — are all *convenience*, and every one of them deletes a
+reason to move. Invariant 2b-i is the enforced form.
 
 **A risk with no upside is not a decision.** Calling a wave early existed for a
 long time with nothing to be greedy for, so nobody would ever press it. Any
@@ -166,8 +215,9 @@ not a difficulty slider.
 Everything planned below the netcode tier is built and measured: the moving deck,
 grapple boarding, six enemy types creating pressure in every direction, spatial
 damage with repair, two manned guns, deployable shock emitters, a finish line, two
-purses, unbounded personal stacks, three bounded hardpoints, a four-landmark
-journey with branching roads, and a boss that inverts the pillar for one fight.
+purses, an eighteen-item salvage table with rarity tiers and a re-rolled shop, a free
+pick of three at every landmark, three bounded hardpoints, a four-landmark journey
+with branching roads, and a boss that inverts the pillar for one fight.
 
 Sound is synthesised at runtime. The art is eight CC0 texture sets and one CC0
 HDRI, vendored, and entirely optional — everything else is generated in code.
@@ -181,6 +231,14 @@ What is open is no longer arithmetic. Whether three hardpoints is an interesting
 choice, whether the greedy road is ever tempting, whether the boss is an exam or a
 wall, and whether being pinned at a gun feels powerful or trapped — none of that
 can be measured, and all of it needs hands on the controls. See ROADMAP.md.
+
+The salvage table adds its own open questions, and they are the same kind. Whether a
+conditional item reads as a reason to move or as a tax on standing still. Whether the
+transition pair is felt at all, or whether three seconds is too short to notice.
+Whether four shop slots is enough exposure to the pool across a biome, or whether a
+run ends without having seen anything interesting. The composition is measured
+(51/29/20 across the tiers, about three rare offers a run); whether that *feels* like
+a build is not something the harness can answer.
 
 ## Scope discipline
 

@@ -25,6 +25,8 @@ import { Repair } from "./src/repair.js";
 import { DeckGun, handleStationInput } from "./src/deckgun.js";
 import { Emitters } from "./src/emitters.js";
 import { Economy, routePurchaseInput } from "./src/economy.js";
+import { Events } from "./src/events.js";
+import { Items, ITEM_EFFECTS } from "./src/items.js";
 import { Modules } from "./src/modules.js";
 import { Run, RUN } from "./src/run.js";
 
@@ -88,12 +90,23 @@ function makeSim() {
   const repair = new Repair(player, trampler, horde);
   const guns = CFG.deckGun.mounts.map((m) => new DeckGun(scene, trampler, m));
   const emitters = new Emitters(scene, trampler, horde);
+  // Same wiring as main.js: the bus is created before anything subscribes, and
+  // attached to the publishers by assignment. Listener order is registration order
+  // is construction order, which is what keeps a build deterministic.
+  const events = new Events();
+  horde.events = events;
+  weapon.events = events;
   // Same construction order as main.js. Modules before Economy because the
   // economy owns the purse that buys them and calls modules.reset() from its own
   // reset; Run last because it needs both the director and the economy.
   const modules = new Modules({ trampler, horde, emitters, guns });
   const economy = new Economy({
-    player, trampler, weapon, repair, horde, director, modules,
+    player, trampler, weapon, repair, horde, director, modules, events,
+  });
+  // After the economy, because it reads stack counts from it. The dependency runs
+  // one way: the economy has no reference back, and nothing needs one.
+  const items = new Items({
+    economy, player, trampler, weapon, horde, repair, events,
   });
   const run = new Run(director, horde, economy);
 
@@ -102,7 +115,7 @@ function makeSim() {
   return {
     scene, camera, world, trampler, player, grapple,
     horde, director, weapon, repair, guns, gun: guns[0], emitters, economy,
-    modules, run,
+    modules, run, events, items,
     input: makeInput(),
     waves: false, // opt in per test, so random spawns cannot pollute a scenario
     bayOpen: false, // opt in to take the refit bay's side of the key-routing fork
@@ -143,6 +156,9 @@ function step(sim, frames, hook, dt = DT) {
     for (const g of sim.guns) g.update(dt, sim.input, sim.player, sim.weapon);
     sim.repair.update(dt, sim.input);
     sim.emitters.update(dt, sim.input, sim.player);
+    // Same slot as main.js: after repair and the player, before the horde, so the
+    // conditional bonuses are built from the position this frame actually ended in.
+    sim.items.update(dt);
     // Through the same router the game uses, rather than calling economy.update
     // directly. The two had drifted: main.js routes the shared number keys through
     // this and the harness did not, so the one rule keeping three UI states from
@@ -3711,10 +3727,25 @@ console.log("\n77. Fully refitted AND fully moduled, automation still cannot hol
   economy.buyModule(mod.floodlights);
   economy.buyModule(mod.baffles);
 
+  // And the whole salvage table on top, three stacks of every item in it.
+  //
+  // The invariants document asks for this explicitly: 2b has to be re-checked
+  // whenever anything defensive is added, because a combination is covered by
+  // neither system's own test. An eighteen-item pool is the largest such addition
+  // the project has had, and one of those items -- a splash on kill -- composes with
+  // a rack of emitters into automation that compounds itself. Deliberately more than
+  // a real run could ever afford, because this is an upper bound, not a scenario.
+  const salvageItems = CFG.economy.catalogue.filter((c) => c.pool === "salvage");
+  for (let round = 0; round < 3; round++) {
+    for (const item of salvageItems) economy.buy(refit[item.id]);
+  }
+
   ok("everything defensive is bought (test is not vacuous)",
     economy.stacks.plating === 4 && economy.stacks.rig === 3
-    && modules.fittedCount === modules.sockets.length,
+    && modules.fittedCount === modules.sockets.length
+    && salvageItems.every((c) => economy.stacks[c.id] === 3),
     `plating ${economy.stacks.plating}, rig ${economy.stacks.rig}, `
+    + `every one of ${salvageItems.length} items at x3, `
     + `modules [${modules.summary.join(" | ")}], `
     + `takes ${(trampler.damageScale * 100).toFixed(0)}% damage`);
 
@@ -3755,6 +3786,15 @@ console.log("\n77. Fully refitted AND fully moduled, automation still cannot hol
   ok("and no amount of repair rig repaired anything unattended",
     trampler.legHp.some((h) => h <= 0),
     `legs [${trampler.legHp.map((h) => Math.round(h)).join(",")}]`);
+  // The sharpest reading in this test. Every proc in the game is fitted three deep
+  // and the only thing killing anything is a rack of emitters, so the correct number
+  // of procs is zero. One proc here is invariant 2b failing silently -- the fortress
+  // would defend itself a little better every wave and nothing would look wrong.
+  const procs = sim.items.procs;
+  ok("and the whole proc layer stayed inert, because nobody was there to trigger it",
+    procs.fragment === 0 && procs.arc === 0 && procs.executioner === 0,
+    `${procs.fragment} frag, ${procs.arc} arc, ${procs.executioner} exec`
+    + ` across ${sim.horde.killCount} unattended kills`);
 }
 
 // ---------------------------------------------------------------------------
@@ -3878,6 +3918,32 @@ console.log("\n79. A run is legs of a journey with roads you choose between");
 
   ok("the first siege can be held", holdSiege(), `wave ${director.wave}`);
   step(sim, 2);
+
+  // Holding a siege pays a free salvage pick FIRST, and the road choice waits
+  // behind it. Sequential rather than simultaneous: two menus at one moment is
+  // unreadable, and the number keys already had three contenders.
+  ok("holding it offers a salvage pick before anything else",
+    run.picking && economy.pendingPick.length === CFG.economy.pickCount,
+    `phase ${run.phase}, ${economy.pendingPick.length} on offer`);
+  ok("the pick is three different items",
+    new Set(economy.pendingPick).size === economy.pendingPick.length,
+    economy.pickEntries.map((e) => e.name).join(" | "));
+
+  // The road is deliberately NOT reachable yet.
+  const legAtPick = run.leg;
+  step(sim, 60 * 10);
+  ok("and the road choice is blocked until the pick is taken",
+    run.picking && run.offers.length === 0 && run.leg === legAtPick,
+    `phase ${run.phase}, ${run.offers.length} roads, leg ${run.leg}`);
+
+  const tookName = economy.pickEntries[0].name;
+  const took = economy.takePick(0);
+  ok("taking one grants it for free", took && took.cost === 0,
+    `${tookName} -> x${took?.stacks}`);
+  ok("and clears the rest, so it was a choice rather than a shopping list",
+    economy.pendingPick.length === 0);
+
+  step(sim, 2);
   ok("holding it offers roads rather than starting the next siege by itself",
     run.choosing && run.offers.length === CFG.run.branches,
     `phase ${run.phase}, ${run.offers.length} roads`);
@@ -3936,6 +4002,12 @@ console.log("\n79. A run is legs of a journey with roads you choose between");
   while (!run.done && run.leg < CFG.run.legs) {
     if (!holdSiege()) break;
     step(sim, 2);
+    // Clear the salvage pick first. Holding a siege now pays one, and the road sits
+    // behind it -- a loop that only took roads would stall here forever.
+    if (run.picking) {
+      economy.takePick(0);
+      step(sim, 2);
+    }
     if (!run.choosing) break;
     // Force the hardest available road, so every modifier gets exercised.
     const road = hardRoads[run.leg % hardRoads.length];
@@ -3970,9 +4042,13 @@ console.log("\n79. A run is legs of a journey with roads you choose between");
     && CFG.run.bossSiegeLength < CFG.waves.siegeLength,
     `${director.siegeLength} waves vs ${CFG.waves.siegeLength} normally`);
 
+  // And the boss leg pays no pick, because the run ends here and an item you can
+  // never spend is a menu rather than a reward.
   ok("holding the last one ends the biome rather than offering more roads",
     holdSiege() && (step(sim, 2), run.done),
     `phase ${run.phase}, leg ${run.leg}`);
+  ok("the final landmark pays no pick, since there is nothing left to spend it on",
+    economy.pendingPick.length === 0, `${economy.pendingPick.length} on offer`);
   ok("and nothing further spawns once it is done", horde.liveCount === 0);
 
   // A reset has to rewind the whole journey, not just the siege.
@@ -4161,6 +4237,23 @@ console.log("\n82. A full restart replays the same run, modules and roads includ
   ok("state was genuinely dirty before the reset",
     sim.modules.fittedCount > 0 && sim.economy.purchases > 0);
 
+  // Drive a proc before the reset, so the seeded stream inside the item runtime has
+  // genuinely been consumed and rewinding it is a real claim rather than a formality.
+  sim.economy.stacks.arc = 20;
+  sim.economy.applyAll();
+  const procBefore = [];
+  for (let i = 0; i < 6; i++) {
+    const a = sim.horde.spawn(CHEWER);
+    const b = sim.horde.spawn(CHEWER);
+    b.x = a.x + 2;
+    b.y = a.y;
+    b.z = a.z;
+    sim.events.emitHit(a, 20);
+    procBefore.push(sim.items.procs.arc);
+  }
+  ok("the item runtime's seeded stream was actually used (test is not vacuous)",
+    sim.items.procs.arc > 0, `${sim.items.procs.arc} arcs rolled from ${procBefore.length} hits`);
+
   sim.horde.clear();
   sim.emitters.clear();
   sim.economy.reset();
@@ -4168,6 +4261,11 @@ console.log("\n82. A full restart replays the same run, modules and roads includ
   sim.trampler.resetPose();
   sim.director.reset();
   sim.run.reset();
+  // LAST, and after everything that moves the player, exactly as resetEncounter does
+  // it. This line was missing for a while, which left invariant 21's clause for
+  // CFG.items.seed with no test behind it at all: the re-seed inside Items.reset()
+  // could have been deleted and the suite would still have reported green.
+  sim.items.reset();
 
   ok("the fortress is back on its start heading and position",
     Math.abs(sim.trampler.yaw - Math.PI) < 1e-9
@@ -4181,6 +4279,30 @@ console.log("\n82. A full restart replays the same run, modules and roads includ
     sim.run.leg === 1 && sim.run.threatScale === 1 && sim.horde.speedScale === 1);
   ok("and the siege length is back to a normal landmark's",
     sim.director.siegeLength === CFG.waves.siegeLength);
+
+  // The proc stream, replayed. Same stacks, same hits, same rolls in the same order --
+  // otherwise two attempts at the same seeded wave disagree on whether an arc fired,
+  // which is the precise property CFG.items.seed exists to hold.
+  ok("the proc counters are back to zero", sim.items.procs.arc === 0);
+  sim.economy.stacks.arc = 20;
+  sim.economy.applyAll();
+  const procAfter = [];
+  for (let i = 0; i < procBefore.length; i++) {
+    const a = sim.horde.spawn(CHEWER);
+    const b = sim.horde.spawn(CHEWER);
+    b.x = a.x + 2;
+    b.y = a.y;
+    b.z = a.z;
+    sim.events.emitHit(a, 20);
+    procAfter.push(sim.items.procs.arc);
+  }
+  ok("and the proc stream rolls the same chances in the same order after a restart",
+    procAfter.join(",") === procBefore.join(","),
+    `[${procBefore.join(",")}] vs [${procAfter.join(",")}]`);
+
+  sim.economy.reset();
+  sim.items.reset();
+  sim.horde.clear();
 
   sim.player.position.set(700, 1.2, 700);
   sim.player.base = null;
@@ -4446,12 +4568,52 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
 
     // ---- resting, so the refit panel is open
     push(drive("rest"));
-    ok("the refit panel opens during a rest and lists items",
-      hud.shop.className.includes("show") && hud.shopItems.innerHTML.includes("RIFLE"),
-      `class "${hud.shop.className}", ${hud.shopItems.innerHTML.length} chars of list`);
+    // Checks that the panel lists WHAT IS ON SALE, rather than looking for one
+    // hard-coded item name. The shop sells a re-rolled subset of the catalogue now,
+    // so "does it mention RIFLE CALIBRATION" was asserting the roll rather than the
+    // panel -- it passed only while the catalogue was small enough to all fit.
+    const onSale = sim.economy.entries;
+    ok("the refit panel opens during a rest and lists what is on sale",
+      hud.shop.className.includes("show")
+      && onSale.length > 0
+      && onSale.every((e) => hud.shopItems.innerHTML.includes(e.name)),
+      `class "${hud.shop.className}", ${onSale.length} offers, `
+      + `${hud.shopItems.innerHTML.length} chars of list`);
     ok("and it is grouped by purse, which is the whole design",
       hud.shopItems.innerHTML.includes("personal")
       && hud.shopItems.innerHTML.includes("fortress"));
+
+    // ---- the build readout
+    //
+    // The list above shows four of sixteen personal items, so an item taken from a
+    // salvage pick or bought two landmarks ago can be absent from it while very much
+    // still in the build. That is what this readout is for, and it is why the check
+    // below deliberately uses an item the shop is NOT selling: asserting on an
+    // offered item would pass even if the readout only ever echoed the offer list.
+    ok("an empty build says so rather than leaving a blank strip",
+      hud.shopBuild.innerHTML.includes("nothing"),
+      `"${hud.shopBuild.innerHTML}"`);
+
+    const buildSim = makeSim();
+    const buildHud = new Hud();
+    const offSaleIndex = CFG.economy.catalogue.findIndex(
+      (it, i) => it.pool === "salvage" && !buildSim.economy.offers.includes(i),
+    );
+    const offSale = CFG.economy.catalogue[offSaleIndex];
+    buildSim.economy.salvage = 1e6;
+    const boughtOffSale = buildSim.economy.buy(offSaleIndex);
+    try {
+      buildHud.update({
+        ...buildSim, guns: buildSim.guns, input: buildSim.input, gun: null, fps: 60, dt: DT,
+      });
+    } catch (err) {
+      failures.push(`build readout: ${err.message}`);
+    }
+    ok("and an item the shop is not selling still shows up in the build",
+      !!boughtOffSale && buildHud.shopBuild.innerHTML.includes(offSale.name),
+      offSaleIndex >= 0
+        ? `${offSale.name}, not among the ${buildSim.economy.offers.length} on sale`
+        : "EVERY SALVAGE ITEM IS ON SALE -- this check has nothing to measure");
 
     // ---- the bay, which borrows the same keys
     hud.toggleBay();
@@ -4505,6 +4667,10 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     const routeSim = makeSim();
     const routeHud = new Hud();
     routeSim.director.phase = PHASE.HELD;
+    routeSim.run.update();
+    // Holding a siege pays a salvage pick before the road, so take it to reach the
+    // route state this branch is about.
+    routeSim.economy.takePick(0);
     routeSim.run.update();
     const routeCtx = {
       ...routeSim, guns: routeSim.guns, input: routeSim.input,
@@ -4604,6 +4770,59 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     ok("a lit charge warns on the prompt, because nothing else does", sawFuse,
       `"${fuseHud.promptLabel.textContent}"`);
 
+    // ---- the live conditional bonus
+    //
+    // Half the salvage table pays only in a particular place, or for a few seconds
+    // after a transition, and this strip is the ONLY feedback that a condition is
+    // being met. Without it "+30% beneath the hull" is indistinguishable from an item
+    // that does nothing, which is the worst possible property for the two items that
+    // pay for moving between deck and ground.
+    //
+    // Driven with the item genuinely stacked and the player genuinely under the hull
+    // rather than by writing `items.bonus` directly, because what is worth checking is
+    // that the runtime's reading and the HUD's reading of it agree.
+    const buffSim = makeSim();
+    const buffHud = new Hud();
+    const bctx = () => ({
+      ...buffSim, guns: buffSim.guns, input: buffSim.input, gun: null, fps: 60, dt: DT,
+    });
+    buffHud.update(bctx());
+    ok("with no conditional item live, nothing is on screen for it",
+      !buffHud.buffs.className.includes("show"),
+      `class "${buffHud.buffs.className}"`);
+
+    buffSim.trampler.walking = false;
+    buffSim.trampler.turning = false;
+    buffSim.economy.stacks.understudy = 1;
+    buffSim.economy.applyAll();
+    buffSim.player.dropToGround();
+    const beneath = buffSim.trampler.localToWorld(new THREE.Vector3(0, 0, 0));
+    buffSim.player.position.set(beneath.x, 1.2, beneath.z);
+    try {
+      step(buffSim, 2);
+      buffHud.update(bctx());
+    } catch (err) {
+      failures.push(`buffs: ${err.message}`);
+    }
+    ok("standing under the hull with the understudy fitted reports the bonus and why",
+      buffHud.buffs.className.includes("show")
+      && buffHud.buffWhy.textContent.includes("UNDER HULL")
+      && buffHud.buffGain.textContent === `+${Math.round(CFG.items.understudy * 100)}%`,
+      `"${buffHud.buffGain.textContent} ${buffHud.buffWhy.textContent}"`);
+
+    // And it has to go away again the moment the condition does, or it stops being a
+    // reading of the world and becomes a sticker.
+    buffSim.player.position.set(beneath.x + 60, 1.2, beneath.z);
+    try {
+      step(buffSim, 2);
+      buffHud.update(bctx());
+    } catch (err) {
+      failures.push(`buffs cleared: ${err.message}`);
+    }
+    ok("and it clears the moment you walk out from under it",
+      !buffHud.buffs.className.includes("show"),
+      `bonus ${buffSim.items.bonus}, class "${buffHud.buffs.className}"`);
+
     // ---- the alarm, the damage flash, and the crosshair
     const feelSim = makeSim();
     const feelHud = new Hud();
@@ -4662,7 +4881,7 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     // ---- and the whole point: nothing threw anywhere
     ok("no branch of the HUD threw across every state driven above",
       failures.length === 0,
-      failures.length ? failures.join(" | ") : "shop, bay, telegraph, boss, route, repair, contested, fuse, alarm, damage, crosshair");
+      failures.length ? failures.join(" | ") : "shop, build, bay, telegraph, boss, route, repair, contested, fuse, buffs, alarm, damage, crosshair");
   }
 
   delete globalThis.document;
@@ -4851,14 +5070,18 @@ console.log("\n86. Exactly one panel owns the number keys per frame");
     const sim = makeSim();
     sim.economy.salvage = 1e6;
     sim.economy.scrap = 1e6;
+    // Read what key 1 is actually selling before pressing it. The shop offers a
+    // re-rolled subset now, so asserting "rifle" specifically was testing the roll
+    // rather than the key routing this section is about.
+    const first = CFG.economy.catalogue[sim.economy.offers[0]].id;
     press(sim, CFG.economy.keys[0]);
     const routed = routePurchaseInput({
       economy: sim.economy, run: sim.run, bayOpen: false, input: sim.input, dt: DT,
     });
     ok("with nothing else up, the refit panel owns them", routed.owner === "refit",
       routed.owner);
-    ok("and a press buys a refit", sim.economy.stacks.rifle === 1,
-      `rifle x${sim.economy.stacks.rifle}`);
+    ok("and a press buys whatever that key is offering",
+      sim.economy.stacks[first] === 1, `${first} x${sim.economy.stacks[first]}`);
     ok("without fitting a module", sim.modules.fittedCount === 0);
   }
 
@@ -4884,6 +5107,10 @@ console.log("\n86. Exactly one panel owns the number keys per frame");
     sim.economy.salvage = 1e6;
     sim.economy.scrap = 1e6;
     sim.director.phase = PHASE.HELD;
+    sim.run.update();
+    // The salvage pick comes first and blocks the road behind it, so clear it before
+    // testing the road's precedence against the bay.
+    sim.economy.takePick(0);
     sim.run.update();
     ok("the run is asking for a road (test is not vacuous)", sim.run.choosing);
 
@@ -4930,6 +5157,7 @@ console.log("\n86. Exactly one panel owns the number keys per frame");
     const sim = makeSim();
     sim.economy.salvage = 1e6;
     sim.economy.scrap = 1e6;
+    const offered = CFG.economy.catalogue[sim.economy.offers[0]].id;
     press(sim, CFG.economy.keys[0]);
     routePurchaseInput({
       economy: sim.economy, run: sim.run, bayOpen: false, input: sim.input, dt: DT,
@@ -4940,8 +5168,8 @@ console.log("\n86. Exactly one panel owns the number keys per frame");
       economy: sim.economy, run: sim.run, bayOpen: true, input: sim.input, dt: DT,
     });
     ok("a press is consumed by its owner and cannot be read again",
-      sim.economy.stacks.rifle === 1 && sim.modules.fittedCount === 0,
-      `rifle x${sim.economy.stacks.rifle}, modules ${sim.modules.fittedCount}`);
+      sim.economy.stacks[offered] === 1 && sim.modules.fittedCount === 0,
+      `${offered} x${sim.economy.stacks[offered]}, modules ${sim.modules.fittedCount}`);
   }
 }
 
@@ -5161,6 +5389,870 @@ console.log("\n89. The lighting chain cannot blow the image out");
     CFG.render.minExposure < CFG.render.exposure
     && CFG.render.maxExposure > CFG.render.exposure,
     `${CFG.render.minExposure} .. ${CFG.render.maxExposure}`);
+}
+
+// ---------------------------------------------------------------------------
+// The event bus, which exists for one reason: item procs need moments a counter
+// cannot carry. Built before the items that will use it, and tested before them,
+// because a bus that drops an event produces items that "sometimes do not work" --
+// the least debuggable class of bug this design could acquire.
+console.log("\n90. The event bus carries kills and hits to every listener");
+{
+  const sim = makeSim();
+  const { events, horde, weapon, player, economy } = sim;
+
+  // The economy is a real subscriber, and if a future refactor drops that
+  // subscription the income tests fail in a confusing way somewhere else. Assert it
+  // here, where the failure names the cause.
+  ok("the economy is subscribed to kills", events.killListeners.length >= 1,
+    `${events.killListeners.length} kill listeners, ${events.hitListeners.length} hit`);
+
+  // Several listeners, and the order they fire in has to be registration order:
+  // two items reacting to the same kill must resolve the same way every run, or a
+  // seeded fight stops being reproducible.
+  const order = [];
+  const killsSeen = [];
+  events.onKill((e) => { order.push("a"); killsSeen.push(e.type); });
+  events.onKill(() => order.push("b"));
+
+  const hits = [];
+  events.onHit((e, dmg) => hits.push(dmg));
+
+  const victim = horde.spawn(CHEWER);
+  horde.damage(victim, 1e6);
+  ok("a kill reaches a listener", killsSeen.length === 1, `${killsSeen.length} kills seen`);
+  ok("and carries which enemy died, not just that one did", killsSeen[0] === CHEWER,
+    `type ${killsSeen[0]}`);
+  ok("every listener is called, in registration order", order.join("") === "ab",
+    order.join(""));
+
+  // Hits go through the real hitscan path, not a direct call, so this covers the
+  // wiring in shootFrom rather than the bus in isolation.
+  placeOnGroundAt(sim, 0, -30);
+  const target = horde.spawn(CHEWER);
+  target.x = player.position.x;
+  target.y = 0.8;
+  target.z = player.position.z - 6;
+  aimAt(player, new THREE.Vector3(target.x, target.y, target.z));
+  step(sim, 1);
+  aimAt(player, new THREE.Vector3(target.x, target.y, target.z));
+  weapon.fire();
+
+  ok("a hit through the real weapon path reaches a listener", hits.length >= 1,
+    `${hits.length} hits seen`);
+  ok("and carries the damage actually dealt, after upgrades",
+    hits.length > 0 && Math.abs(hits[0] - CFG.combat.weapon.damage * weapon.damageScale) < 1e-9,
+    `${hits[0]} vs ${CFG.combat.weapon.damage * weapon.damageScale}`);
+
+  // An unpaid removal must not fire. A sapper consumed by its own charge is not a
+  // kill anyone earned, and an on-kill item that rewarded it would be paying the
+  // player for FAILING to stop the charge.
+  //
+  // Driven directly rather than hoped for: an earlier version of this ran a long
+  // fight and asserted that the event count matched killCount, which passed while
+  // logging "0 fuses lit" -- it proved the two counters agree and said nothing
+  // about the case it claimed to cover.
+  const sim2 = makeSim();
+  sim2.trampler.walking = false;
+  sim2.trampler.turning = false;
+  const seen2 = [];
+  sim2.events.onKill(() => seen2.push(1));
+
+  const sapper = sim2.horde.spawn(SAPPER);
+  const legPoint = sim2.trampler.legAttackWorld(0, new THREE.Vector3());
+  sapper.x = legPoint.x;
+  sapper.y = legPoint.y;
+  sapper.z = legPoint.z;
+  sapper.legIndex = 0;
+
+  let sawFuse = false;
+  step(sim2, Math.round(60 * (CFG.enemies.sapper.fuse + 2)), () => {
+    if (sapper.fuseT > 0) sawFuse = true;
+  });
+
+  ok("a charge really did go off (test is not vacuous)",
+    sawFuse && !sapper.alive && sim2.trampler.legHp[0] <= 0,
+    `fuse seen ${sawFuse}, sapper alive ${sapper.alive}, leg ${sim2.trampler.legHp[0].toFixed(0)} hp`);
+  ok("a free removal fires no kill event at all", seen2.length === 0,
+    `${seen2.length} events`);
+  ok("and is not counted as a kill either", sim2.horde.killCount === 0,
+    `${sim2.horde.killCount} counted`);
+
+  // Then the paid case in the same sim, so the listener is provably still attached
+  // and the zero above is not simply a dead subscription.
+  sim2.horde.damage(sim2.horde.spawn(CHEWER), 1e6);
+  ok("while a real kill in the same run does fire it",
+    seen2.length === 1 && sim2.horde.killCount === 1,
+    `${seen2.length} events, ${sim2.horde.killCount} counted`);
+
+  // A proc that kills re-enters the same listener. Two reasonable items compose
+  // into unbounded recursion, which is a blown stack rather than a balance problem.
+  const sim3 = makeSim();
+  let depthReached = 0;
+  sim3.events.onKill(() => {
+    depthReached = Math.max(depthReached, sim3.events.depth);
+    // The pathological item: kills something else every time it sees a kill.
+    const next = sim3.horde.pool.find((e) => e.alive);
+    if (next) sim3.horde.damage(next, 1e6);
+  });
+  for (let i = 0; i < 12; i++) sim3.horde.spawn(CHEWER);
+  const first = sim3.horde.pool.find((e) => e.alive);
+  sim3.horde.damage(first, 1e6); // must return rather than recurse forever
+  ok("a proc chain is capped instead of recursing forever",
+    depthReached <= CFG.events.maxProcDepth,
+    `reached depth ${depthReached}, cap ${CFG.events.maxProcDepth}`);
+  ok("and the cap actually had to bite (test is not vacuous)",
+    sim3.events.suppressed > 0, `${sim3.events.suppressed} suppressed`);
+  ok("the depth counter unwinds rather than sticking high", sim3.events.depth === 0,
+    `depth ${sim3.events.depth}`);
+
+  // A throwing item must not disable every proc for the rest of the run, which is
+  // what an un-finallied depth counter would do.
+  const sim4 = makeSim();
+  sim4.events.onKill(() => { throw new Error("a badly written item"); });
+  let threw = false;
+  try {
+    sim4.horde.damage(sim4.horde.spawn(CHEWER), 1e6);
+  } catch {
+    threw = true;
+  }
+  ok("a throwing listener does not leave the bus wedged",
+    threw && sim4.events.depth === 0, `threw=${threw}, depth ${sim4.events.depth}`);
+
+  // And the repair-completion counter, which is the pollable half of this work.
+  const sim5 = makeSim();
+  sim5.trampler.damageLeg(0, 1e6);
+  const legAt = sim5.trampler.legAttackWorld(0, new THREE.Vector3());
+  sim5.player.position.set(legAt.x, 1.2, legAt.z);
+  sim5.player.base = null;
+  sim5.player.velocity.set(0, 0, 0);
+  ok("no repair has completed yet", sim5.repair.completions === 0);
+  step(sim5, 120, () => {
+    const p = sim5.trampler.legAttackWorld(0, new THREE.Vector3());
+    sim5.player.position.set(p.x, sim5.player.position.y, p.z);
+    sim5.input.keys.add(CFG.repair.key);
+  });
+  ok("finishing a repair is counted, for job-linked items to read",
+    sim5.repair.completions === 1,
+    `${sim5.repair.completions} completions, leg at ${sim5.trampler.legHp[0].toFixed(0)} hp`);
+}
+
+// ---------------------------------------------------------------------------
+// The catalogue, checked structurally. This is test 68's argument applied to items:
+// eighteen entries maintained by hand, and the failure mode is that one of them is
+// buyable, priced, listed in the shop, and wired to nothing at all. Nothing throws.
+// The player spends 95 salvage and the game does not change, which is indexed under
+// "this item feels weak" rather than "this item does not exist".
+console.log("\n91. Every item in the catalogue is real, priced, and implemented");
+{
+  const cat = CFG.economy.catalogue;
+  const tiers = CFG.economy.rarity;
+  // Read as text, for the same reason test 67 reads index.html as text: the runtime
+  // half of an item is a `#n("id")` lookup inside a private method, and there is no
+  // way to ask the object which ids it knows about.
+  const itemsSrc = readFileSync("src/items.js", "utf8");
+
+  ok("the catalogue is a pool rather than a shortlist", cat.length >= 16,
+    `${cat.length} items`);
+
+  // The fields the shop, the pick panel and the build readout all destructure. A
+  // missing `detail` renders as "undefined" on a panel; a missing `max` makes
+  // soldOut() compare against undefined, which is always false, so a capped item
+  // silently stops being capped.
+  const required = ["id", "name", "detail", "pool", "max"];
+  const incomplete = [];
+  for (const item of cat) {
+    for (const f of required) {
+      if (item[f] === undefined || item[f] === "") incomplete.push(`${item.id ?? "?"}.${f}`);
+    }
+  }
+  ok("every item carries the fields the shop and the pick both read",
+    incomplete.length === 0,
+    incomplete.length ? `MISSING: ${incomplete.join(", ")}` : `${required.length} fields x ${cat.length} items`);
+
+  // Two pricing routes, and an item must be on exactly one of them. An item with
+  // neither would fall through #priceOf to the common tier and quietly cost 45
+  // whatever it is.
+  const mispriced = cat.filter((item) => {
+    const explicit = item.cost !== undefined;
+    const tiered = item.rarity !== undefined && tiers[item.rarity] !== undefined;
+    return explicit === tiered; // both, or neither
+  });
+  ok("every item is priced by exactly one route: a tier, or its own explicit cost",
+    mispriced.length === 0,
+    mispriced.length
+      ? `AMBIGUOUS: ${mispriced.map((i) => i.id).join(", ")}`
+      : `${cat.filter((i) => i.rarity).length} tiered, ${cat.filter((i) => i.cost !== undefined).length} explicit`);
+
+  // The one that catches a dead item. Either it has a static effect, or the runtime
+  // reads its stack count. Nothing else can make an item do anything.
+  const unimplemented = cat.filter(
+    (item) => !ITEM_EFFECTS[item.id] && !itemsSrc.includes(`#n("${item.id}")`),
+  );
+  ok("every item is implemented, statically or by the runtime",
+    unimplemented.length === 0,
+    unimplemented.length
+      ? `WIRED TO NOTHING: ${unimplemented.map((i) => i.id).join(", ")}`
+      : `${Object.keys(ITEM_EFFECTS).length} static, ${cat.length - Object.keys(ITEM_EFFECTS).length} conditional`);
+
+  // A tier with nothing in it makes its weight a dead letter, and #drawFrom would
+  // hand that share to the others without anybody noticing the config had stopped
+  // meaning what it says.
+  const empty = Object.keys(tiers).filter((name) => !cat.some((i) => i.rarity === name));
+  ok("every rarity tier is populated, so no weight is a dead letter",
+    empty.length === 0,
+    empty.length
+      ? `EMPTY TIERS: ${empty.join(", ")}`
+      : Object.keys(tiers).map((n) => `${n} ${cat.filter((i) => i.rarity === n).length}`).join(", "));
+}
+
+// ---------------------------------------------------------------------------
+// Invariant 25, for the item layer. Effects are recomputed absolutely from stack
+// count, so `applyAll()` at zero IS the reset -- but that only holds if every field
+// an item writes is actually covered by an effect closure. A field written on
+// purchase and not rewritten at zero survives a restart, and the symptom is that
+// two attempts at the same seeded wave disagree, which is the hardest failure in
+// this project to trace back to its cause.
+console.log("\n92. Every item effect reverts, because reset is the same code path");
+{
+  const sim = makeSim();
+  const { economy, weapon, player, trampler, repair } = sim;
+
+  // Every field any static effect touches, read in one place so a new effect that
+  // writes somewhere new shows up here as an unreverted value rather than as a
+  // mystery two runs later.
+  const readAll = () => ({
+    "weapon.damageScale": weapon.damageScale,
+    "weapon.fireRateScale": weapon.fireRateScale,
+    "weapon.armourPierce": weapon.armourPierce,
+    "weapon.damageBonus": weapon.damageBonus,
+    "player.maxHp": player.maxHp,
+    "player.damageScale": player.damageScale,
+    "trampler.damageScale": trampler.damageScale,
+    "repair.rateScale": repair.rateScale,
+    "economy.salvageScale": economy.salvageScale,
+  });
+
+  const round4 = (n) => Number(n.toFixed(4));
+  const baseline = readAll();
+
+  // Three of everything, bought through the real path so the arithmetic is the
+  // game's rather than the test's. Three rather than one because a bug that
+  // increments on purchase instead of recomputing absolutely only shows up once a
+  // second stack lands on top of the first.
+  economy.salvage = 1e9;
+  economy.scrap = 1e9;
+  for (let round = 0; round < 3; round++) {
+    for (let idx = 0; idx < CFG.economy.catalogue.length; idx++) economy.buy(idx);
+  }
+  // The conditional half is rebuilt per frame, so give it a frame to write itself.
+  // Without this `weapon.damageBonus` is still zero and the field reads as one the
+  // effects never touch.
+  placeOnGroundAt(sim, 0, 0);
+  step(sim, 2);
+  const stacked = readAll();
+
+  // The revert check is worthless if nothing moved, so name exactly which fields
+  // the build actually changed and require it to be all of them.
+  const unmoved = Object.keys(baseline).filter((k) => baseline[k] === stacked[k]);
+  ok("a full build moves every field the effects claim to write",
+    unmoved.length === 0,
+    unmoved.length
+      ? `NEVER MOVED: ${unmoved.join(", ")}`
+      : Object.keys(baseline).map((k) => `${k.split(".")[1]} ${baseline[k]} -> ${round4(stacked[k])}`).join(", "));
+
+  // A reset, then a couple of frames, which is what a restart actually looks like.
+  // The static half is restored by `applyAll()` at zero stacks; the conditional half
+  // is restored by the next recompute finding no stacks to read. Two mechanisms, one
+  // rule -- both derive the value absolutely, so neither needs an uninstall path.
+  economy.reset();
+  step(sim, 2);
+  const after = readAll();
+  const stuck = Object.keys(baseline).filter((k) => Math.abs(after[k] - baseline[k]) > 1e-9);
+  ok("and a reset puts every one of them back exactly",
+    stuck.length === 0,
+    stuck.length
+      ? `STUCK: ${stuck.map((k) => `${k} ${round4(after[k])} vs ${round4(baseline[k])}`).join(", ")}`
+      : `${Object.keys(baseline).length} fields restored`);
+
+  const leftover = Object.entries(economy.stacks).filter(([, n]) => n !== 0);
+  ok("with no stacks left behind either", leftover.length === 0,
+    leftover.length ? `LEFT: ${JSON.stringify(Object.fromEntries(leftover))}` : "all zero");
+
+  // The runtime's own state, which `applyAll` cannot reach: timers, the proc stream
+  // and the counters. A timed buff surviving a restart is three free seconds of
+  // damage at the start of every attempt.
+  sim.items.boardT = 2;
+  sim.items.welderT = 4;
+  sim.items.procs.fragment = 7;
+  sim.items.reset();
+  ok("and the runtime's timers and proc counters reset with it",
+    sim.items.boardT === 0 && sim.items.welderT === 0 && sim.items.dropT === 0
+    && sim.items.procs.fragment === 0 && sim.items.bonus === 0
+    && weapon.damageBonus === 0,
+    `boardT ${sim.items.boardT}, welderT ${sim.items.welderT}, frag ${sim.items.procs.fragment}`);
+}
+
+// ---------------------------------------------------------------------------
+// The conditional half of the pool, which is the half that makes it a build rather
+// than a column of multipliers. Each of these pays only in a particular place or
+// for a few seconds after a particular move, and the two most on-theme items in the
+// game -- one for boarding, one for dropping off -- pay a player for OSCILLATING,
+// which is the pillar restated as an upgrade.
+//
+// Driven through the real runtime and the real frame order, never by writing
+// `items.bonus`, because the thing worth checking is that the condition the item
+// claims is the condition the world actually reports.
+console.log("\n93. Conditional items pay only under their condition");
+{
+  const sim = makeSim();
+  const { economy, items, player, trampler, weapon, horde } = sim;
+
+  // Only the conditional items, one stack each. Deliberately no vitals or weave:
+  // those change maxHp and damage taken, and the low-health check below would then
+  // be arithmetic about the test rather than about the item.
+  const conditional = ["understudy", "harness", "redline", "laststand",
+    "spurs", "dropHarness", "welder"];
+  for (const id of conditional) economy.stacks[id] = 1;
+  economy.applyAll();
+
+  trampler.walking = false;
+  trampler.turning = false;
+
+  // ---- neutral: aboard, unhurt, nothing manned, nothing repaired
+  step(sim, 30);
+  ok("standing on the deck with nothing happening pays nothing",
+    items.bonus === 0 && items.reasons.length === 0,
+    `bonus ${items.bonus}, reasons [${items.reasons.join(",")}]`);
+
+  // ---- dropping off the deck. The transition itself is the reward, and it is
+  // detected by comparing `player.base` against last frame rather than by an event,
+  // because the mantle and drop paths write that field directly.
+  player.dropToGround();
+  step(sim, 1);
+  ok("dropping off the deck pays the drop harness",
+    items.reasons.includes("DISMOUNTED"),
+    `[${items.reasons.join(", ")}] +${Math.round(items.bonus * 100)}%`);
+
+  // ---- and it is a window, not a permanent buff
+  step(sim, Math.ceil(60 * (CFG.items.dropHarness.seconds + 0.5)));
+  ok("and it expires rather than lasting the rest of the run",
+    !items.reasons.includes("DISMOUNTED"),
+    `[${items.reasons.join(", ")}]`);
+
+  // ---- position: beneath the hull, which is the dangerous half of the pillar
+  const beneath = trampler.localToWorld(new THREE.Vector3(0, 0, 0));
+  player.position.set(beneath.x, 1.2, beneath.z);
+  player.velocity.set(0, 0, 0);
+  step(sim, 4);
+  ok("standing in the hull's shadow pays the understudy",
+    items.reasons.includes("UNDER HULL")
+    && Math.abs(items.bonus - CFG.items.understudy) < 1e-9,
+    `[${items.reasons.join(", ")}] +${Math.round(items.bonus * 100)}%`);
+
+  // ---- and walking out of it stops paying, the same frame
+  player.position.set(beneath.x + 60, 1.2, beneath.z);
+  step(sim, 4);
+  ok("and stepping out from under it stops paying immediately",
+    !items.reasons.includes("UNDER HULL") && items.bonus === 0,
+    `bonus ${items.bonus}`);
+
+  // ---- getting aboard, which is the other half of the oscillation.
+  //
+  // Attached the way the mantle path does it — `base` and `velocity` written directly
+  // — rather than through `respawnOnDeck()`. That helper is also the DEATH path, so a
+  // test using it cannot tell "boarded" from "died", and the two must not pay the
+  // same (see the death check below).
+  const deckAt = trampler.localToWorld(new THREE.Vector3(-4.5, 1.2, 0));
+  player.position.copy(deckAt);
+  player.base = trampler;
+  player.velocity.set(0, 0, 0);
+  step(sim, 1);
+  ok("boarding pays the spurs",
+    items.reasons.includes("BOARDED"),
+    `[${items.reasons.join(", ")}] +${Math.round(items.bonus * 100)}%`);
+  step(sim, Math.ceil(60 * (CFG.items.spurs.seconds + 0.5)));
+
+  // ---- manning a gun. Buffs the MANNED position, never an automated one, which is
+  // what keeps it on the right side of invariant 2b.
+  sim.guns[0].mount(player);
+  step(sim, 2);
+  ok("manning a deck gun pays the gunner's harness",
+    items.reasons.includes("ON STATION")
+    && Math.abs(items.bonus - CFG.items.harness) < 1e-9,
+    `[${items.reasons.join(", ")}] +${Math.round(items.bonus * 100)}%`);
+  sim.guns[0].dismount(player);
+  step(sim, Math.ceil(60 * (CFG.items.dropHarness.seconds + 0.5)));
+
+  // ---- risk. Both of these pay for a state you would rather not be in, which is
+  // what makes a losing fight worth continuing instead of worth restarting.
+  trampler.damageReactor(trampler.maxReactorHp * 0.7);
+  step(sim, 2);
+  ok("a failing reactor pays the redline governor",
+    items.reasons.includes("REACTOR CRITICAL"),
+    `reactor at ${Math.round(trampler.reactorHp / trampler.maxReactorHp * 100)}%,`
+    + ` [${items.reasons.join(", ")}]`);
+
+  player.spawnGrace = 0;
+  player.hurt(player.maxHp * 0.7);
+  step(sim, 1);
+  ok("and being nearly dead pays the last stand",
+    items.reasons.includes("LAST STAND"),
+    `hp ${Math.round(player.hp)}/${player.maxHp}, [${items.reasons.join(", ")}]`);
+
+  // ---- two conditions at once must ADD, not replace. Both of the above are live.
+  ok("overlapping conditions add up rather than one winning",
+    items.reasons.length >= 2
+    && Math.abs(items.bonus - (CFG.items.redline.gain + CFG.items.laststand.gain)) < 1e-9,
+    `+${Math.round(items.bonus * 100)}% from [${items.reasons.join(", ")}]`);
+
+  // ---- and the whole point: it lands on real damage, through the real hitscan
+  // path, rather than sitting in a field nothing reads.
+  const bonusNow = items.bonus;
+  ok("the bonus is a real bonus (test is not vacuous)", bonusNow > 0,
+    `+${Math.round(bonusNow * 100)}%`);
+
+  placeOnGroundAt(sim, 0, -30);
+  // placeOnGroundAt steps, which re-evaluates the conditions from the new position.
+  // Re-arm the risk conditions so the shot below is fired with a live bonus.
+  player.hp = player.maxHp * 0.2;
+  step(sim, 1);
+  const mark = horde.spawn(CHEWER);
+  mark.x = player.position.x;
+  mark.y = 0.8;
+  mark.z = player.position.z - 6;
+  const markHp = mark.hp;
+  aimAt(player, new THREE.Vector3(mark.x, mark.y, mark.z));
+  step(sim, 1);
+  aimAt(player, new THREE.Vector3(mark.x, mark.y, mark.z));
+  weapon.fire();
+  const dealt = markHp - mark.hp;
+  const plain = CFG.combat.weapon.damage * weapon.damageScale;
+  ok("and it lands on a real shot through the real hitscan path",
+    dealt > plain + 0.5,
+    `${dealt.toFixed(1)} dealt vs ${plain.toFixed(1)} unbuffed`
+    + ` (+${Math.round(weapon.damageBonus * 100)}% live, [${items.reasons.join(", ")}])`);
+
+  // ---- dying on the ground must NOT pay the boarding buff.
+  //
+  // `hurt()` respawns you on the deck, which is a ground->aboard move as far as
+  // `player.base` can tell, and the transition items read exactly that. Paying for it
+  // would be paying the player for failing — the same objection that stops an on-kill
+  // item rewarding a sapper's charge going off, and it is worth a test because nothing
+  // about it looks wrong: you die, and your next three seconds of shots hit harder.
+  const deathSim = makeSim();
+  deathSim.economy.stacks.spurs = 1;
+  deathSim.economy.stacks.dropHarness = 1;
+  deathSim.economy.applyAll();
+  deathSim.trampler.walking = false;
+  deathSim.trampler.turning = false;
+  placeOnGroundAt(deathSim, 0, -30);
+  // Let the drop bonus from placeOnGroundAt expire, so what is measured is the death.
+  step(deathSim, Math.ceil(60 * (CFG.items.dropHarness.seconds + 0.5)));
+  ok("nothing is live before the death (test is not vacuous)",
+    deathSim.items.bonus === 0 && deathSim.player.base === null,
+    `bonus ${deathSim.items.bonus}, base ${deathSim.player.base ? "deck" : "ground"}`);
+
+  deathSim.player.spawnGrace = 0;
+  const deathsBefore = deathSim.player.deaths;
+  deathSim.player.hurt(1e6);
+  step(deathSim, 1);
+  ok("the death actually happened and put the player back on the deck",
+    deathSim.player.deaths === deathsBefore + 1 && !!deathSim.player.base,
+    `${deathSim.player.deaths} deaths, base ${deathSim.player.base ? "deck" : "ground"}`);
+  ok("but dying pays no boarding bonus, because that would reward failing",
+    deathSim.items.bonus === 0 && !deathSim.items.reasons.includes("BOARDED"),
+    `+${Math.round(deathSim.items.bonus * 100)}% [${deathSim.items.reasons.join(", ")}]`);
+
+  // And the transition must be CONSUMED rather than deferred: if the death only
+  // skipped the payout for one frame, the buff would simply arrive on the next.
+  step(deathSim, 30);
+  ok("and it does not arrive a frame later either",
+    !deathSim.items.reasons.includes("BOARDED"),
+    `[${deathSim.items.reasons.join(", ")}]`);
+
+  // ---- a job-linked item, in its own sim because finishing a repair needs the
+  // player parked at a broken leg for a second and nothing else interfering.
+  const jobSim = makeSim();
+  jobSim.economy.stacks.welder = 1;
+  jobSim.economy.applyAll();
+  jobSim.trampler.damageLeg(0, 1e6);
+  const legAt = jobSim.trampler.legAttackWorld(0, new THREE.Vector3());
+  jobSim.player.position.set(legAt.x, 1.2, legAt.z);
+  jobSim.player.base = null;
+  jobSim.player.velocity.set(0, 0, 0);
+  step(jobSim, 4);
+  ok("an unfinished repair pays nothing yet",
+    !jobSim.items.reasons.includes("REPAIRED"),
+    `[${jobSim.items.reasons.join(", ")}]`);
+  step(jobSim, 120, () => {
+    const p = jobSim.trampler.legAttackWorld(0, new THREE.Vector3());
+    jobSim.player.position.set(p.x, jobSim.player.position.y, p.z);
+    jobSim.input.keys.add(CFG.repair.key);
+  });
+  ok("finishing one pays the welder's kit",
+    jobSim.repair.completions === 1 && jobSim.items.reasons.includes("REPAIRED"),
+    `${jobSim.repair.completions} completions, [${jobSim.items.reasons.join(", ")}]`);
+}
+
+// ---------------------------------------------------------------------------
+// THE assertion for the proc items, and it is invariant 2b wearing a different hat.
+//
+// A splash-on-kill item and a rack of shock emitters are each individually fine.
+// Together, with the gate removed, an emitter kills a chewer, the splash kills two
+// more, and each of those splashes again -- automation compounding itself with
+// nobody within a hundred metres. That is precisely the failure the emitters were
+// made weak and finite to avoid, and it would arrive as an item nobody thought of
+// as defensive.
+//
+// The gate is `source === "player"`, and a manned deck gun counts as the player
+// because somebody is sitting in it.
+console.log("\n94. Procs fire for the crew's kills and for nothing else");
+{
+  // ---- the proc works at all. Without this the zero below proves nothing.
+  const sim = makeSim();
+  sim.economy.stacks.fragment = 1;
+  sim.economy.applyAll();
+  sim.trampler.walking = false;
+  sim.trampler.turning = false;
+
+  const centre = sim.trampler.localToWorld(new THREE.Vector3(0, 0, 0));
+  const cluster = [];
+  for (let i = 0; i < 4; i++) {
+    const e = sim.horde.spawn(CHEWER);
+    e.x = centre.x + (i === 0 ? 0 : 1.2 * i);
+    e.y = 0.8;
+    e.z = centre.z;
+    cluster.push(e);
+  }
+  const neighbourHpBefore = cluster.slice(1).map((e) => e.hp);
+  sim.horde.damage(cluster[0], 1e6, "player");
+  const splashed = cluster.slice(1).filter((e, i) => e.hp < neighbourHpBefore[i]).length;
+  ok("a kill the crew caused splashes the bodies around it",
+    splashed > 0 && sim.items.procs.fragment === 1,
+    `${splashed} neighbours hit for ${CFG.items.fragment.damage} each,`
+    + ` ${sim.items.procs.fragment} procs`);
+
+  // ---- and the same item, the same cluster, killed by an emitter instead.
+  //
+  // Through a real deployed emitter rather than by passing the string directly, so
+  // this covers the wiring in emitters.js as well as the gate in items.js. The
+  // string is the whole mechanism, and a test that supplied it itself would pass
+  // while the emitter passed nothing.
+  const auto = makeSim();
+  auto.economy.stacks.fragment = 1;
+  auto.economy.applyAll();
+
+  const under = auto.trampler.legAttackWorld(0, new THREE.Vector3());
+  auto.player.position.set(under.x, 1.2, under.z);
+  auto.player.base = null;
+  auto.player.velocity.set(0, 0, 0);
+  step(auto, 10);
+  auto.input.presses.add(CFG.emitters.deployKey);
+  step(auto, 2);
+  ok("an emitter is live and the player is gone", auto.emitters.deployedCount === 1,
+    `${auto.emitters.deployedCount} deployed`);
+  auto.player.position.set(700, 1.2, 700);
+  auto.player.base = null;
+
+  for (let i = 0; i < 8; i++) auto.horde.spawn(CHEWER);
+  step(auto, 60 * 40);
+
+  ok("the emitter really did kill things (test is not vacuous)",
+    auto.horde.killCount > 0, `${auto.horde.killCount} killed unattended`);
+  ok("but an unattended kill procs NOTHING -- automation must not compound",
+    auto.items.procs.fragment === 0,
+    auto.items.procs.fragment === 0
+      ? "0 procs from automation"
+      : `${auto.items.procs.fragment} PROCS WITH NOBODY PRESENT -- INVARIANT 2b IS BROKEN`);
+
+  // ---- a manned gun is the crew, not automation. Somebody is sitting in it, and
+  // the whole design of the deck gun is that it pins them there.
+  //
+  // Driven by MOUNTING the gun and firing it, not by passing "player" here. That
+  // matters for the same reason the emitter case above deploys a real emitter: the
+  // half of this that can rot is deckgun.js's route through Weapon.shootFrom, and a
+  // test that supplies the source string itself would keep passing after that route
+  // changed. It is also the exact trap tech.md lists under "a test that supplies the
+  // mechanism it is testing", added while writing this section.
+  const manned = makeSim();
+  manned.economy.stacks.fragment = 1;
+  manned.economy.applyAll();
+  manned.trampler.walking = false;
+  manned.trampler.turning = false;
+
+  const gun = manned.guns[0];
+  gun.mount(manned.player);
+  ok("the gun is genuinely manned (test is not vacuous)",
+    gun.mounted && manned.player.station === gun, `${gun.name} mounted`);
+
+  // A tight cluster inside the bow gun's arc, out in the open where it can reach.
+  const ahead = manned.trampler.localToWorld(new THREE.Vector3(0, -CFG.trampler.deckHeight, -70));
+  const cluster2 = [];
+  for (let i = 0; i < 4; i++) {
+    const e = manned.horde.spawn(CHEWER);
+    e.x = ahead.x + (i - 1.5) * 1.1;
+    e.y = 0.8;
+    e.z = ahead.z;
+    cluster2.push(e);
+  }
+  // Aim the mount at them and hold the trigger. The gun fires through the same
+  // shootFrom the rifle uses, which is where "player" is supplied.
+  const aimPoint = new THREE.Vector3(cluster2[0].x, cluster2[0].y, cluster2[0].z);
+  let gunKills = 0;
+  for (let i = 0; i < 180 && manned.items.procs.fragment === 0; i++) {
+    aimAt(manned.player, aimPoint);
+    manned.input.mouseHeld.add(0);
+    step(manned, 1);
+    gunKills = manned.horde.killCount;
+  }
+  manned.input.mouseHeld.clear();
+  ok("and a manned gun's kill does proc, because somebody is sitting in it",
+    manned.items.procs.fragment > 0 && gunKills > 0,
+    `${manned.items.procs.fragment} procs from ${gunKills} kills by the ${gun.name}`);
+
+  // ---- the on-hit chain, and the heal. Both use the same gate; what is worth
+  // checking separately is that they fire at all, since a proc that never fires
+  // reads as a weak item rather than as a broken one.
+  const chain = makeSim();
+  chain.economy.stacks.arc = 20; // well past the chance curve's knee, so it must fire
+  chain.economy.applyAll();
+  chain.trampler.walking = false;
+  chain.trampler.turning = false;
+  placeOnGroundAt(chain, 0, -30);
+  const a = chain.horde.spawn(CHEWER);
+  const b = chain.horde.spawn(CHEWER);
+  a.x = chain.player.position.x;
+  a.y = 0.8;
+  a.z = chain.player.position.z - 6;
+  b.x = a.x + 2;
+  b.y = 0.8;
+  b.z = a.z;
+  const bBefore = b.hp;
+  for (let i = 0; i < 12 && chain.items.procs.arc === 0; i++) {
+    aimAt(chain.player, new THREE.Vector3(a.x, a.y, a.z));
+    step(chain, 1);
+    aimAt(chain.player, new THREE.Vector3(a.x, a.y, a.z));
+    chain.weapon.fire();
+    if (!a.alive) break;
+  }
+  ok("the arc caster chains a hit onto a neighbour",
+    chain.items.procs.arc > 0 && b.hp < bBefore,
+    `${chain.items.procs.arc} arcs, neighbour ${bBefore} -> ${b.hp.toFixed(0)} hp`);
+
+  const heal = makeSim();
+  heal.economy.stacks.executioner = 1;
+  heal.economy.applyAll();
+  heal.player.hp = 50;
+  heal.horde.damage(heal.horde.spawn(CHEWER), 1e6, "player");
+  ok("and a kill heals with the executioner fitted, and is counted",
+    heal.player.hp === 50 + CFG.items.executioner && heal.items.procs.executioner === 1,
+    `hp 50 -> ${heal.player.hp}, ${heal.items.procs.executioner} procs`);
+
+  // ---- and it cannot overheal, or the item is a second health bar.
+  //
+  // The proc counter is asserted alongside the health, because the player starts at
+  // full and "hp === maxHp" is also what a completely inert item produces. Without
+  // the second half this passes whether or not anything fired.
+  const full = makeSim();
+  full.economy.stacks.executioner = 5;
+  full.economy.applyAll();
+  full.horde.damage(full.horde.spawn(CHEWER), 1e6, "player");
+  ok("but it never heals past full",
+    full.player.hp === full.player.maxHp && full.items.procs.executioner === 1,
+    `hp ${full.player.hp} / ${full.player.maxHp}, ${full.items.procs.executioner} procs`);
+}
+
+// ---------------------------------------------------------------------------
+// The shop is a re-rolled subset now, and that is the mechanism the whole update
+// rests on: eighteen items against six number keys means two runs see different
+// stock, which is the difference between a build and a shopping list. Two things
+// have to hold at once, and they pull against each other -- it must VARY, and it
+// must be REPRODUCIBLE, or invariant 21 is gone.
+console.log("\n95. The stock is seeded, varied, and weighted by rarity");
+{
+  const cat = CFG.economy.catalogue;
+  const sim = makeSim();
+
+  ok("the shop offers exactly as many slots as it has keys",
+    sim.economy.offers.length === CFG.economy.keys.length,
+    `${sim.economy.offers.length} offers, ${CFG.economy.keys.length} keys`);
+
+  // The bounded fortress track is dependable on purpose. A run should be able to
+  // plan on buying plating; it should not be able to plan on any one personal item.
+  const scrapIndices = cat.map((c, i) => (c.pool === "scrap" ? i : -1)).filter((i) => i >= 0);
+  ok("the fortress refits are always on sale, so the bounded track can be planned",
+    scrapIndices.every((i) => sim.economy.offers.includes(i)),
+    `${scrapIndices.length} scrap refits, all offered`);
+
+  ok("and no slot is wasted on a duplicate",
+    new Set(sim.economy.offers).size === sim.economy.offers.length,
+    `${new Set(sim.economy.offers).size} distinct`);
+
+  // Reproducible: same seed, same stock. Two fresh economies, and a reset.
+  const twin = makeSim();
+  ok("two runs from the same seed are offered the same stock",
+    twin.economy.offers.join(",") === sim.economy.offers.join(","),
+    `[${sim.economy.offers.join(",")}]`);
+
+  // Restocking is compared as a SET, not as a joined string. Order within `offers` is
+  // an artefact of the draw, so string inequality would also be satisfied by the same
+  // four items coming out in a different sequence — which is not a restock, and would
+  // read to a player as the shop not having changed at all.
+  const first = sim.economy.offers.slice();
+  const second = sim.economy.rollOffers().slice();
+  const sameSet = (a, b) =>
+    a.length === b.length && [...a].sort((x, y) => x - y).join(",") === [...b].sort((x, y) => x - y).join(",");
+  ok("but each landmark restocks, or there is no reason to travel",
+    !sameSet(first, second),
+    `[${first.join(",")}] -> [${second.join(",")}]`);
+
+  sim.economy.reset();
+  ok("and a restart rewinds the stock along with everything else",
+    sameSet(sim.economy.offers, first),
+    `[${sim.economy.offers.join(",")}]`);
+
+  // Composition. `weight` means share-of-offers, which is what choosing the tier
+  // before the item bought: with per-item weights the rares came out at 8% of the
+  // list, about one across a whole run, for the items the pool exists to deliver.
+  const rolls = 400;
+  const seen = { common: 0, uncommon: 0, rare: 0 };
+  const measure = makeSim().economy;
+  for (let i = 0; i < rolls; i++) {
+    for (const idx of measure.rollOffers()) {
+      const r = cat[idx].rarity;
+      if (r) seen[r]++;
+    }
+  }
+  const total = seen.common + seen.uncommon + seen.rare;
+  const share = (n) => n / total;
+  const tiers = CFG.economy.rarity;
+  const weightTotal = tiers.common.weight + tiers.uncommon.weight + tiers.rare.weight;
+  const want = (name) => tiers[name].weight / weightTotal;
+
+  ok("all three tiers actually appear in the stock",
+    seen.common > 0 && seen.uncommon > 0 && seen.rare > 0,
+    `common ${(share(seen.common) * 100).toFixed(0)}%,`
+    + ` uncommon ${(share(seen.uncommon) * 100).toFixed(0)}%,`
+    + ` rare ${(share(seen.rare) * 100).toFixed(0)}% over ${rolls} rolls`);
+
+  const drift = Object.keys(tiers)
+    .map((n) => ({ n, off: Math.abs(share(seen[n]) - want(n)) }))
+    .sort((x, y) => y.off - x.off)[0];
+  ok("and their shares match the configured weights, so the numbers mean something",
+    drift.off < 0.06,
+    `worst drift ${drift.n} ${(share(seen[drift.n]) * 100).toFixed(1)}%`
+    + ` vs ${(want(drift.n) * 100).toFixed(1)}% configured`);
+
+  // A rare has to cost more than a common at EVERY stack, not just the first. The
+  // tiers carry different growth rates as well as different base costs, so a lower
+  // growth on the rare tier could invert the ordering a few stacks in and the first
+  // stack alone would never show it.
+  const priceAt = (name, stacks) => {
+    const i = cat.findIndex((c) => c.rarity === name);
+    const id = cat[i].id;
+    const held = sim.economy.stacks[id];
+    sim.economy.stacks[id] = stacks;
+    const cost = sim.economy.costOf(i);
+    sim.economy.stacks[id] = held;
+    return cost;
+  };
+  const inverted = [];
+  for (let n = 0; n <= 5; n++) {
+    if (!(priceAt("rare", n) > priceAt("uncommon", n) && priceAt("uncommon", n) > priceAt("common", n))) {
+      inverted.push(n);
+    }
+  }
+  ok("rarity costs money as well as meaning something, at every stack",
+    inverted.length === 0,
+    inverted.length
+      ? `INVERTED at stacks ${inverted.join(", ")}`
+      : `stack 0: ${priceAt("common", 0)}/${priceAt("uncommon", 0)}/${priceAt("rare", 0)},`
+        + ` stack 5: ${priceAt("common", 5)}/${priceAt("uncommon", 5)}/${priceAt("rare", 5)}`);
+}
+
+// ---------------------------------------------------------------------------
+// The free pick. Test 79 covers where it sits in the run -- offered on a hold,
+// before the road, and never on the boss leg. What it does not cover is what the
+// pick is allowed to contain, and that is the part with a design rule behind it:
+// the crew's bounded track is meant to be paid for together, so handing out a hull
+// plate for nothing would be the one purse funding the other.
+console.log("\n96. The salvage pick is personal, free, and a real choice");
+{
+  const sim = makeSim();
+  const cat = CFG.economy.catalogue;
+
+  // Every draw the pool can produce, not just this run's, because a scrap item
+  // slipping in would depend on the seed and would show up as a bug months later.
+  const seenPools = new Set();
+  for (let i = 0; i < 200; i++) {
+    for (const idx of sim.economy.offerPick()) seenPools.add(cat[idx].pool);
+  }
+  ok("a pick is never a fortress refit, whatever the roll",
+    seenPools.size === 1 && seenPools.has("salvage"),
+    `pools drawn: ${[...seenPools].join(", ")}`);
+
+  const fresh = makeSim();
+  const offered = fresh.economy.offerPick();
+  ok("it offers as many as the config asks for, all different",
+    offered.length === CFG.economy.pickCount
+    && new Set(offered).size === offered.length,
+    `${offered.length} of ${CFG.economy.pickCount}, distinct`);
+
+  fresh.economy.salvage = 120;
+  fresh.economy.scrap = 90;
+  const takenId = cat[offered[1]].id;
+  const took = fresh.economy.takePick(1);
+  ok("taking one grants it outright, from neither purse",
+    !!took && took.cost === 0
+    && fresh.economy.stacks[takenId] === 1
+    && fresh.economy.salvage === 120 && fresh.economy.scrap === 90,
+    `${took?.name} at cost ${took?.cost}, salvage ${fresh.economy.salvage}, scrap ${fresh.economy.scrap}`);
+
+  ok("and the other two are gone, so the value of the pick is what you gave up",
+    fresh.economy.pendingPick.length === 0
+    && offered.filter((i) => i !== offered[1])
+      .every((i) => fresh.economy.stacks[cat[i].id] === 0),
+    "the rest cleared");
+
+  ok("a second take does nothing rather than granting a fourth item",
+    fresh.economy.takePick(0) === null && fresh.economy.purchases === 1,
+    `${fresh.economy.purchases} purchases`);
+
+  // A pick has to be the SAME acquisition as a purchase, not a cheaper imitation of
+  // one. VITALS is the case that proves it: its detail line says "healed", and for a
+  // while the top-up lived only in `buy()`, so taking it as a pick raised the ceiling
+  // and left health where it was while both the panel and the toast said otherwise.
+  // Driven through takePick with the pick list forced, because a seeded roll cannot be
+  // relied on to offer any particular item.
+  const vit = makeSim();
+  const vitalsIndex = CFG.economy.catalogue.findIndex((c) => c.id === "vitals");
+  vit.player.hp = 40;
+  const maxBefore = vit.player.maxHp;
+  vit.economy.pendingPick = [vitalsIndex];
+  const tookVitals = vit.economy.takePick(0);
+  ok("an item that raises the ceiling arrives FILLED when picked, exactly as when bought",
+    !!tookVitals
+    && vit.player.maxHp > maxBefore
+    && vit.player.hp === 40 + (vit.player.maxHp - maxBefore),
+    `max ${maxBefore} -> ${vit.player.maxHp}, hp 40 -> ${vit.player.hp}`);
+
+  // And the same item bought must land on the same numbers, or the two paths have
+  // drifted again in the other direction.
+  const bought = makeSim();
+  bought.player.hp = 40;
+  bought.economy.salvage = 1e6;
+  bought.economy.buy(vitalsIndex);
+  ok("and buying it lands on identical numbers",
+    bought.player.maxHp === vit.player.maxHp && bought.player.hp === vit.player.hp,
+    `bought ${bought.player.hp}/${bought.player.maxHp} vs picked ${vit.player.hp}/${vit.player.maxHp}`);
+
+  // Reproducible, like the shop: a pick is a stochastic reward and invariant 21
+  // covers every one of those without exception.
+  const twinA = makeSim().economy.offerPick().join(",");
+  const twinB = makeSim().economy.offerPick().join(",");
+  ok("two runs from the same seed are offered the same three",
+    twinA === twinB, `[${twinA}]`);
 }
 
 ok("no boarder ever floated off the deck footprint", !sawFloatingBoarder);

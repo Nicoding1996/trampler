@@ -948,6 +948,21 @@ export class Trampler {
     return v.applyMatrix4(this.matrixInverse);
   }
 
+  /**
+   * Is this world point inside the hull's footprint -- that is, in the shadow the
+   * deck cannot shoot into?
+   *
+   * One place, because this is the rule the pillar rests on. Emitter placement asks
+   * it, and conditional items that pay out "while you are under the hull" ask it,
+   * and those two answers drifting apart would mean a player standing somewhere the
+   * game considers under the hull for one purpose and not the other. Does not copy:
+   * pass a scratch vector you own.
+   */
+  coversPoint(v) {
+    this.worldToLocal(v);
+    return Math.abs(v.x) <= this.halfW && Math.abs(v.z) <= this.halfL;
+  }
+
   /** World point -> the local frame as it was before this frame's movement. */
   worldToPrevLocal(v) {
     return v.applyMatrix4(this.prevMatrixInverse);

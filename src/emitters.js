@@ -161,9 +161,7 @@ export class Emitters {
     }
 
     const t = this.trampler;
-    const local = _world.copy(player.position);
-    t.worldToLocal(local);
-    if (Math.abs(local.x) > t.halfW || Math.abs(local.z) > t.halfL) {
+    if (!t.coversPoint(_world.copy(player.position))) {
       this.blockReason = "MUST BE BENEATH THE HULL";
       return false;
     }
@@ -265,7 +263,10 @@ export class Emitters {
       if (!victim) continue;
 
       _target.set(victim.x, victim.y, victim.z);
-      this.horde.damage(victim, cfg.damage);
+      // Named as automation on purpose: item procs refuse to fire for this, so a
+      // rack of emitters cannot compound itself into holding the under-hull area
+      // with nobody down there. Invariant 2b.
+      this.horde.damage(victim, cfg.damage, "emitter");
       slot.charge -= 1;
       slot.cd = cfg.interval;
       this.#arc(_world, _target);

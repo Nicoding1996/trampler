@@ -92,7 +92,7 @@ Almost everything here is local and reversible, so act. Three things are not:
 
 ### Delegation
 
-`src/` is 24 files and the map is in `structure.md`, already in context. `npm run
+`src/` is 26 files and the map is in `structure.md`, already in context. `npm run
 audit` answers most structural questions faster than a search does, and the
 harness answers most behavioural ones. A subagent is worth it for a genuinely
 wide, independent investigation. For anything finishable in a handful of tool
@@ -102,7 +102,7 @@ the verification.
 ## Verification
 
 `verify.mjs` runs the real simulation modules in Node with no DOM and no
-renderer: 91 sections, 556 assertions. The failure modes here — drift, being
+renderer: 98 sections, 643 assertions. The failure modes here — drift, being
 yanked off a turning deck, an anchor that does not track the hull, an enemy
 shielded by geometry, an automated defence that quietly holds a position — are
 invisible to inspection and tedious to confirm by hand.
@@ -157,6 +157,11 @@ correctly. Only paths that genuinely resolve outside the root are worth assertin
 - **Reusing an output filename fails** with "the process cannot access the file"
   while a previous run still holds it. Use a fresh name, and delete the scratch
   files afterwards.
+- **`npm run diff` on a file that is still being written reports a false negative.**
+  It printed "NOT DETERMINISTIC: 239 unexplained differences" against two identical
+  runs, purely because the second file had reached 594 of its 832 lines. Confirm both
+  files end with the `N/N checks passed` line before believing the comparison —
+  `node tools/summarise.mjs` on each is the quick way.
 - **Grep `includePattern` only honours globs starting with `**/`.** `src/*.js` and
   brace lists like `{a.js,b.js}` silently match *nothing*, which reads as "clean"
   and is how unseeded `Math.random` calls went unnoticed through several searches.
@@ -174,6 +179,18 @@ Every one of these produced a green or red result that was wrong:
   got two roads with no modifiers at all, and asserted `1.00 >= 1.00`. A test of
   accumulation has to be *handed something to accumulate*. Always assert that the
   scenario actually happened before asserting its outcome.
+- **Asserting the ROLL rather than the thing.** Two tests hard-coded the shop's
+  contents — one looked for "RIFLE CALIBRATION" in the panel, the other pressed key
+  1 and expected `stacks.rifle === 1`. Both were correct only while the catalogue
+  was small enough to fit on the keys, and the moment the shop became a re-rolled
+  subset they were measuring the draw. Neither *claimed* to be about the draw: one
+  claimed the panel renders, the other claimed key routing works. Read what the
+  system is actually offering, then assert on that.
+- **A test that supplies the mechanism it is testing.** The proc gate is
+  `source === "player"`, and the tempting version of the check calls
+  `horde.damage(e, n, "emitter")` directly. That proves the gate works and says
+  nothing about whether `emitters.js` passes the string at all — which is the half
+  that can rot. Deploy the real emitter and let it kill something.
 - **Sampling an oscillating state at one instant.** "Is the chewer parked" and
   "is the gun overheated" both cycle. Measure over a window, or track whether the
   state was *ever* reached.
@@ -255,3 +272,22 @@ Never write a run's state into `CFG`. Upgrades, modules and road modifiers are a
 instance multipliers on the owning object, recomputed absolutely from their stack
 count. `structure.md` has the reasoning under "Upgrades and modules are instance
 multipliers".
+
+### Adding an item to the salvage table
+
+Four places, and test 91 fails loudly if you miss one:
+
+1. `CFG.economy.catalogue` — `id`, `name`, `detail` (one line a player can read
+   while a wave is inbound), `pool`, `max`, and a `rarity` tier. Do **not** set a
+   `cost`: the tier supplies cost and growth, and an explicit cost is reserved for
+   the two bounded scrap refits.
+2. `CFG.items.<id>` — the numbers, additive to the weapon's base 1 so "+0.30" reads
+   as +30%.
+3. Either `ITEM_EFFECTS` in `items.js`, if it is a function of stack count alone, or
+   `Items.update` / `#onKill` / `#onHit` if it depends on the world. Not both.
+4. Nothing in `hud.js`. The shop, the pick panel and the build readout are all driven
+   off the catalogue.
+
+Then ask the question invariant 2b-i exists for: **does this let one position do the
+other's job?** If it is a proc, it must gate on `source === "player"`, and test 77
+has to still report the fortress crippled at 131.1 s with the item fitted.

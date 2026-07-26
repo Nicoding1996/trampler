@@ -1,4 +1,6 @@
-import { CFG, ENEMY_TYPE_KEYS, hyperGain } from "./config.js";
+import { CFG, ENEMY_TYPE_KEYS } from "./config.js";
+import { makeRandom } from "./util.js";
+import { ITEM_EFFECTS } from "./items.js";
 import { PHASE } from "./waves.js";
 
 // The economy, and the reason it exists is Q.
@@ -34,42 +36,10 @@ import { PHASE } from "./waves.js";
 // a reset because someone added a purchase path and forgot the matching revert --
 // is invisible until two attempts at the same seeded wave disagree.
 
-/**
- * What each purchase actually does, as a function of how many are stacked.
- *
- * Kept here rather than in config.js because config holds tunable DATA; this is
- * behaviour, and a closure in a config file cannot be read at a glance next to
- * the number it modifies.
- */
-const EFFECTS = {
-  // Additive, and legible: three stacks is plainly +75% rather than a compounding
-  // number nobody can predict mid-fight.
-  rifle: (ctx, n) => { ctx.weapon.damageScale = 1 + 0.25 * n; },
-
-  vitals: (ctx, n) => { ctx.player.maxHp = CFG.combat.playerHp + 25 * n; },
-
-  // Hyperbolic, because it breaks at 100%: an unbounded fire rate eventually
-  // divides by zero, and long before that it stops being a gun and starts being
-  // a hose. Approaches +120% and never arrives.
-  trigger: (ctx, n) => {
-    const h = CFG.economy.hyper.trigger;
-    ctx.weapon.fireRateScale = 1 + hyperGain(n, h.cap, h.k);
-  },
-
-  // Also hyperbolic, and for a design reason rather than a numerical one: total
-  // immunity would remove the ground's cost, and the ground having a cost is half
-  // the pillar. At ten stacks you still take 22% of every hit.
-  weave: (ctx, n) => {
-    ctx.player.damageScale = 1 / (1 + CFG.economy.hyper.weave.k * n);
-  },
-
-  // Multiplicative, so stacking has diminishing returns and four stacks is 52%
-  // damage taken rather than 40%: plating must never trivialise the under-hull
-  // fight, because that fight is why anyone dismounts.
-  plating: (ctx, n) => { ctx.trampler.damageScale = 0.85 ** n; },
-
-  rig: (ctx, n) => { ctx.repair.rateScale = 1 + 0.30 * n; },
-};
+// What each purchase does now lives in src/items.js, next to the runtime for the
+// conditional and proc items that cannot be expressed as a function of stack count
+// alone. One home for "what an upgrade does", rather than the static half here and
+// the interesting half somewhere else.
 
 export class Economy {
   // How many resolved waves have already been paid for. Polled against the
@@ -77,7 +47,9 @@ export class Economy {
   // an economy exists at all.
   #resolvedSeen = 0;
 
-  constructor({ player, trampler, weapon, repair, horde, director, modules = null }) {
+  constructor({
+    player, trampler, weapon, repair, horde, director, modules = null, events = null,
+  }) {
     this.player = player;
     this.trampler = trampler;
     this.weapon = weapon;
@@ -85,11 +57,18 @@ export class Economy {
     this.horde = horde;
     this.director = director;
     this.modules = modules;
+    this.events = events;
 
-    // Every kill routes through Horde.damage, whatever fired the shot -- rifle,
-    // either deck gun, a shock emitter, or a foot coming down. Hooking it in one
-    // place means no income source can be forgotten when a new weapon is added.
-    horde.onKill = (e) => this.#onKill(e);
+    // Every kill routes through Horde's kill choke point, whatever fired the shot
+    // -- rifle, either deck gun, a shock emitter, or a foot coming down. Hooking it
+    // in one place means no income source can be forgotten when a new weapon is
+    // added.
+    //
+    // Subscribed rather than owning the callback outright, because items need the
+    // same moment and two mechanisms for one event is how they drift apart.
+    // Listeners are never removed on reset: the economy has to keep earning across
+    // a restart, and a reset that unhooked it would stop all income silently.
+    events?.onKill((e) => this.#onKill(e));
 
     this.reset();
   }
@@ -112,6 +91,22 @@ export class Economy {
     this.lastEvent = null;
     this.bonusPaid = 0; // how much the early-call gamble has actually returned
 
+    // Written by the SCAVENGER RIG, and reset here with everything else. Kept on
+    // the economy rather than passed around because this is the only place income
+    // is calculated.
+    this.salvageScale = 1;
+    this.weapon.armourPierce = 0;
+
+    // Re-seeded on reset for the same reason the horde and the director are: two
+    // attempts at the same run have to be offered the same shop, or the seeds buy
+    // nothing.
+    this.random = makeRandom(CFG.economy.seed);
+    this.rollOffers();
+
+    // The free pick offered for holding a siege. Empty means nothing is pending, and
+    // the run reads exactly that to know when the pick has been resolved.
+    this.pendingPick = [];
+
     // Restoring the baseline matters as much as applying the upgrades. A restart
     // that left the previous run's stats in place would silently make every
     // subsequent attempt easier, and the seeded fight exists precisely so two
@@ -131,7 +126,11 @@ export class Economy {
    */
   applyAll() {
     for (const item of CFG.economy.catalogue) {
-      EFFECTS[item.id](this, this.stacks[item.id] ?? 0);
+      // Only the STATIC half is applied from stack counts. Conditional and proc
+      // items have no entry here on purpose: they are rebuilt every frame by the
+      // items runtime from the world's current state, because "while beneath the
+      // hull" is not a function of how many you own.
+      ITEM_EFFECTS[item.id]?.(this, this.stacks[item.id] ?? 0);
     }
   }
 
@@ -147,7 +146,11 @@ export class Economy {
     // how a newly added enemy silently pays a chewer's rate, or nothing at all.
     const rate = CFG.economy[ENEMY_TYPE_KEYS[e.type]] ?? CFG.economy.chewer;
     const mult = this.bonus;
-    const salvage = rate.salvage * mult;
+    // salvageScale is the SCAVENGER RIG, and it deliberately touches the personal
+    // purse only. Scaling the shared pot from a personal item would let one player
+    // inflate the crew's budget, which is the exact coupling the split exists to
+    // prevent.
+    const salvage = rate.salvage * mult * this.salvageScale;
     const scrap = rate.scrap * mult;
 
     this.salvage += salvage;
@@ -198,12 +201,72 @@ export class Economy {
     return phase === PHASE.REST || phase === PHASE.PREP || phase === PHASE.HELD;
   }
 
+  /**
+   * Price and escalation for an item, from its rarity tier.
+   *
+   * An explicit `cost` on the item wins. That is not a loophole, it is how the two
+   * bounded scrap refits stay out of the rarity system: they are a capped, always
+   * available track with prices set against each other, not draws from a pool.
+   */
+  #priceOf(item) {
+    if (item.cost !== undefined) return item;
+    return CFG.economy.rarity[item.rarity] ?? CFG.economy.rarity.common;
+  }
+
+  /**
+   * Pick one catalogue index out of `pool`, tier first then item.
+   *
+   * Two stages rather than one weighted pass over every item, because the tiers hold
+   * different numbers of items and a per-item weight therefore cannot express "one
+   * offer in five should be rare". Measured with per-item weights of 6:3:1 the rares
+   * came out at 8% of offers -- roughly one across a whole run, for the items the
+   * pool exists to deliver. Choosing the tier first makes `weight` mean share.
+   *
+   * Mutates `pool`, returning the index it removed, or -1 if there was nothing left.
+   */
+  #drawFrom(pool) {
+    if (pool.length === 0) return -1;
+    const cat = CFG.economy.catalogue;
+    const tiers = CFG.economy.rarity;
+
+    // Only tiers that still have something in the pool can be chosen, so a tier
+    // running dry hands its share to the others rather than wasting a key slot.
+    const live = [];
+    let total = 0;
+    for (const name of Object.keys(tiers)) {
+      if (!pool.some((i) => cat[i].rarity === name)) continue;
+      live.push(name);
+      total += tiers[name].weight;
+    }
+    if (live.length === 0) return pool.splice(0, 1)[0];
+
+    let roll = this.random() * total;
+    let chosen = live[live.length - 1]; // fallback covers float drift on the last step
+    for (const name of live) {
+      roll -= tiers[name].weight;
+      if (roll <= 0) {
+        chosen = name;
+        break;
+      }
+    }
+
+    // Uniform within the tier: rarity is the axis that is meant to matter, and a
+    // second weighting inside it would be a balance lever nobody could reason about.
+    const candidates = [];
+    for (let i = 0; i < pool.length; i++) {
+      if (cat[pool[i]].rarity === chosen) candidates.push(i);
+    }
+    const at = candidates[(this.random() * candidates.length) | 0];
+    return pool.splice(at, 1)[0];
+  }
+
   costOf(index) {
     const item = CFG.economy.catalogue[index];
     if (!item) return Infinity;
     // Each stack costs more than the last, so unbounded stacking still has a
     // natural brake without needing an arbitrary cap.
-    return Math.round(item.cost * item.growth ** this.stacks[item.id]);
+    const p = this.#priceOf(item);
+    return Math.round(p.cost * p.growth ** this.stacks[item.id]);
   }
 
   soldOut(index) {
@@ -243,17 +306,35 @@ export class Economy {
     this.purchases++;
     this.blockedReason = "";
 
+    const beforeMaxHp = this.player.maxHp;
     this.applyAll();
-
-    // Anything that should pay off the instant it is bought rather than at the
-    // next natural opportunity happens here, outside applyAll, because applyAll
-    // also runs on reset and healing on reset would be wrong.
-    if (item.id === "vitals") {
-      this.player.hp = Math.min(this.player.maxHp, this.player.hp + 25);
-    }
+    this.#onAcquired(beforeMaxHp);
 
     this.lastBought = { name: item.name, detail: item.detail, stacks: this.stacks[item.id], cost };
     return this.lastBought;
+  }
+
+  /**
+   * Effects that have to pay off the instant an item is acquired, rather than at the
+   * next natural opportunity.
+   *
+   * Deliberately NOT inside `applyAll`, for the reason applyAll exists: it also runs
+   * on reset, and healing on a reset would be wrong.
+   *
+   * It lives in one method because there are now TWO acquisition paths -- buying and
+   * taking a free pick -- and the pick skipped this for a while, so VITALS raised
+   * your ceiling and left your health where it was while the panel and the toast
+   * both said "healed". A defect nothing failed on, because neither the pick tests
+   * nor the shop tests read health.
+   *
+   * Written as the max-health DELTA rather than as an `id === "vitals"` branch, so
+   * it needs no per-item knowledge and cannot drift from the effect that produced
+   * it. Any future item that raises the ceiling arrives filled, the same way the
+   * reactor casing module already does.
+   */
+  #onAcquired(beforeMaxHp) {
+    const gained = this.player.maxHp - beforeMaxHp;
+    if (gained > 0) this.player.hp = Math.min(this.player.maxHp, this.player.hp + gained);
   }
 
   // ------------------------------------------------------------------ modules
@@ -317,17 +398,175 @@ export class Economy {
 
   /** What the refit panel needs to draw the list. */
   get entries() {
-    return CFG.economy.catalogue.map((item, i) => ({
-      key: CFG.economy.keys[i],
+    return this.offers.map((catIndex, keyIndex) => {
+      const item = CFG.economy.catalogue[catIndex];
+      return {
+        key: CFG.economy.keys[keyIndex],
+        index: catIndex,
+        name: item.name,
+        detail: item.detail,
+        pool: item.pool,
+        stacks: this.stacks[item.id],
+        max: item.max,
+        cost: this.costOf(catIndex),
+        soldOut: this.soldOut(catIndex),
+        affordable: this.canBuy(catIndex),
+      };
+    });
+  }
+
+  /**
+   * Everything the crew is actually carrying, for the build readout.
+   *
+   * Needed separately from `entries` because the shop deliberately shows a SUBSET:
+   * four of sixteen personal items per landmark. Anything taken from a salvage pick,
+   * or bought two landmarks ago and since rotated out of the stock, would otherwise
+   * be invisible for the rest of the run -- and a build nobody can read is a build
+   * nobody plays around. That matters more here than it did with four numeric
+   * refits, because half the pool now only pays under a condition.
+   *
+   * Catalogue order rather than purchase order, so the list does not reshuffle
+   * itself between two glances at it.
+   */
+  get carried() {
+    const out = [];
+    for (const item of CFG.economy.catalogue) {
+      const stacks = this.stacks[item.id] ?? 0;
+      if (stacks > 0) {
+        out.push({
+          id: item.id,
+          name: item.name,
+          rarity: item.rarity,
+          pool: item.pool,
+          stacks,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Re-roll what the shop is currently selling.
+   *
+   * The catalogue outgrew the keyboard, and that is the point rather than a problem
+   * to work around: eighteen items and six number keys means the shop has to show a
+   * SUBSET, and a subset that changes is what makes two runs build differently.
+   * Before this, every run bought the same four multipliers in the same order and
+   * the only thing that varied across a whole playthrough was which road you took.
+   *
+   * The two scrap refits are always offered. That asymmetry is deliberate and it is
+   * the same principle the modules follow: the bounded fortress track is dependable,
+   * so you can plan around it, and the unbounded personal track is what varies.
+   *
+   * Seeded from its own stream, so a run replays identically -- and rolled from the
+   * FULL catalogue every time rather than by mutating a pool, so the offer list can
+   * never drift into a state that depends on how many times it has been rolled.
+   */
+  rollOffers() {
+    const cat = CFG.economy.catalogue;
+    const always = [];
+    const pool = [];
+    for (let i = 0; i < cat.length; i++) {
+      if (cat[i].pool === "scrap") always.push(i);
+      else pool.push(i);
+    }
+
+    const room = Math.max(0, CFG.economy.keys.length - always.length);
+    const picked = [];
+    // Weighted draw without replacement.
+    //
+    // Weighted, so a shop of four slots usually shows mostly floor with something
+    // interesting in it. A uniform draw over eighteen items offered exotics as often
+    // as a damage stack, which sounds generous and is not: the expensive items would
+    // fill the list, most of them unaffordable, and the plain reliable option a
+    // struggling run actually needs would frequently not be for sale at all.
+    //
+    // Without replacement, because the same item on two keys wastes a slot and reads
+    // as a bug rather than as luck.
+    for (let i = 0; i < room && pool.length > 0; i++) {
+      const drawn = this.#drawFrom(pool);
+      if (drawn < 0) break;
+      picked.push(drawn);
+    }
+
+    this.offers = [...picked, ...always];
+    return this.offers;
+  }
+
+  /**
+   * Draw the free pick offered for holding a siege.
+   *
+   * Free, and that is the point rather than generosity: being handed something is a
+   * different beat from buying it, and it is the only acquisition in the game that
+   * does not compete with the fortress for money. It also widens exposure to the
+   * pool -- four shop slots a landmark shows a run sixteen offers across a whole
+   * biome, and three more draws here lifts that by three quarters.
+   *
+   * Salvage items only. A free hull plate would be the crew's bounded track handed
+   * out for nothing, and that track is meant to be paid for together.
+   */
+  offerPick() {
+    const cat = CFG.economy.catalogue;
+    const pool = [];
+    for (let i = 0; i < cat.length; i++) {
+      if (cat[i].pool === "salvage") pool.push(i);
+    }
+
+    this.pendingPick = [];
+    for (let i = 0; i < CFG.economy.pickCount && pool.length > 0; i++) {
+      const drawn = this.#drawFrom(pool);
+      if (drawn < 0) break;
+      this.pendingPick.push(drawn);
+    }
+    return this.pendingPick;
+  }
+
+  /**
+   * What the pick panel needs to draw itself.
+   *
+   * `index` is a CATALOGUE index, like everywhere else that publishes one. Note that
+   * `takePick` below is the one method whose argument is a SLOT instead, which is why
+   * its parameter is named `slot` rather than `index`.
+   */
+  get pickEntries() {
+    return this.pendingPick.map((catIndex) => {
+      const item = CFG.economy.catalogue[catIndex];
+      return {
+        index: catIndex,
+        name: item.name,
+        detail: item.detail,
+        rarity: item.rarity,
+        stacks: this.stacks[item.id],
+      };
+    });
+  }
+
+  /**
+   * Take one of the offered picks. Clears the rest: this is a choice, not a
+   * shopping list, and the whole value of it is what you give up.
+   *
+   * @param slot which of the three on offer, NOT a catalogue index. Named to say so,
+   *        because it is the only method here that takes a position.
+   */
+  takePick(slot) {
+    const catIndex = this.pendingPick[slot];
+    if (catIndex === undefined) return null;
+    const item = CFG.economy.catalogue[catIndex];
+
+    this.stacks[item.id]++;
+    this.purchases++;
+    const beforeMaxHp = this.player.maxHp;
+    this.applyAll();
+    this.#onAcquired(beforeMaxHp);
+    this.pendingPick = [];
+
+    this.lastBought = {
       name: item.name,
-      detail: item.detail,
-      pool: item.pool,
+      detail: `${item.detail} · salvaged`,
       stacks: this.stacks[item.id],
-      max: item.max,
-      cost: this.costOf(i),
-      soldOut: this.soldOut(i),
-      affordable: this.canBuy(i),
-    }));
+      cost: 0,
+    };
+    return this.lastBought;
   }
 
   /** What the refit bay needs, with affordability folded in. */
@@ -365,7 +604,12 @@ export class Economy {
     for (let i = 0; i < keys.length; i++) {
       if (!input.pressed(keys[i])) continue;
 
-      const bought = this.buy(i);
+      // Key position maps through the offer list to a CATALOGUE index. Purchases
+      // stay addressed by catalogue index everywhere else, so nothing that looks an
+      // item up has to care what the shop happens to be selling this landmark.
+      const catIndex = this.offers[i];
+      if (catIndex === undefined) continue;
+      const bought = this.buy(catIndex);
       // A refusal has to say WHY. A key that silently does nothing reads as broken
       // rather than as "you cannot afford that yet".
       this.lastEvent = bought
@@ -389,26 +633,45 @@ export class Economy {
 }
 
 /**
- * Decide which of the three things competing for the number keys owns them this
+ * Decide which of the four things competing for the number keys owns them this
  * frame, and run exactly that one.
  *
- * The refit panel wants 1-6, the refit bay wants 1-6, and a road choice wants 1-2.
- * Two consumers of one key set is a bug waiting for the frame both are visible --
- * you press 2 to take a road and also buy a rifle stack with the same press.
+ * The refit panel wants 1-6, the refit bay wants 1-6, a road choice wants 1-2, and
+ * a pending salvage pick wants 1-3. Two consumers of one key set is a bug waiting
+ * for the frame both are visible -- you press 2 to take a road and also buy a rifle
+ * stack with the same press.
  *
  * This lives here rather than in main.js so it can be tested. It was in the frame
  * loop, where nothing could reach it: the harness cannot import main.js, so the
- * one rule that keeps three UI states from fighting over one key set was the only
+ * one rule that keeps these UI states from fighting over one key set was the only
  * piece of wiring in the project with no coverage at all.
  *
  * Side effects on the HUD and the world stay with the caller. This returns a
  * descriptor and touches nothing it does not own.
  *
- * @param bayOpen whether the refit bay is up. Priority order is road choice, then
- *        bay, then panel -- a road choice outranks both because the run is blocked
- *        on it.
+ * PRECEDENCE, most urgent first: salvage pick, road choice, refit bay, refit panel.
+ * The ordering is by how stuck the crew is without it. A pick blocks the road behind
+ * it; a road blocks the whole run; the bay and the panel are both things you can
+ * simply walk away from. The pick and the road are never live at the same time --
+ * the run resolves one into the other -- so that pair is ordered for safety rather
+ * than because it can happen.
+ *
+ * @param bayOpen whether the refit bay is up.
  */
 export function routePurchaseInput({ economy, run, bayOpen, input, dt }) {
+  // Highest precedence, because it is the only one of these states the crew cannot
+  // leave by doing something else: the shop can be ignored and the bay can be shut,
+  // but a pending pick blocks the road choice behind it until it is taken.
+  if (run?.picking) {
+    economy.update(dt, null);
+    for (let i = 0; i < economy.pendingPick.length; i++) {
+      if (!input.pressed(CFG.economy.keys[i])) continue;
+      const took = economy.takePick(i);
+      if (took) return { owner: "pick", took };
+    }
+    return { owner: "pick", took: null };
+  }
+
   if (run?.choosing) {
     // Income still has to be paid while the crew is deciding; only key handling
     // is handed over.

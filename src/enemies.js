@@ -119,6 +119,11 @@ export class Horde {
     // unaware that a mixer or a particle system exists.
     this.killCount = 0;
 
+    // The event bus, for the one thing a counter cannot carry: which enemy died.
+    // Assigned by the owner rather than required, so a Horde can be built purely
+    // to measure the scene graph.
+    this.events = null;
+
     // Instance multipliers, owned by the run and by fortress modules. Never
     // written into CFG: a run's modifiers leaking into global config would
     // poison every later test in the same process, and make two attempts at the
@@ -834,13 +839,27 @@ export class Horde {
    * funnels through this method, so a newly added weapon cannot accidentally
    * ignore armour and quietly make the bulwark pointless.
    */
-  damage(e, amount) {
+  /**
+   * `source` says WHO killed it, and it exists to protect invariant 2b.
+   *
+   * Item procs -- on-kill chains, on-hit arcs -- may only fire for kills the player
+   * caused. Without this, a shock emitter killing something under the hull would
+   * trigger a fragmentation proc that kills two more, which is automation holding
+   * a position unattended: exactly the failure the emitters were deliberately made
+   * weak and finite to avoid. Income is paid for every kill regardless; only procs
+   * are gated.
+   *
+   * Optional, so the ~200 existing `damage(e, amount)` calls in the harness are
+   * unaffected and simply proc nothing, which is the correct behaviour for a test
+   * that is measuring something else.
+   */
+  damage(e, amount, source = null, pierce = 0) {
     if (!e.alive) return false;
     const cfg = enemyCfg(e.type);
-    e.hp -= afterArmour(amount, cfg.armour);
+    e.hp -= afterArmour(amount, cfg.armour, pierce);
     e.flash = CFG.combat.weapon.hitFlash;
     if (e.hp > 0) return false;
-    this.#kill(e, true);
+    this.#kill(e, true, source);
     return true;
   }
 
@@ -848,7 +867,7 @@ export class Horde {
    * Remove an enemy. `paid` decides whether the economy hears about it: a sapper
    * that completes its charge is not a kill anybody earned.
    */
-  #kill(e, paid) {
+  #kill(e, paid, source = null) {
     e.alive = false;
     e.reactorSlot = false;
     e.latched = false;
@@ -861,9 +880,16 @@ export class Horde {
     if (!paid) return;
     this.killCount++;
     // Single choke point for every kill in the game, whatever fired the shot --
-    // rifle, either deck gun, a shock emitter, a foot. The economy hooks here so
-    // a new damage source cannot silently pay nothing.
-    this.onKill?.(e);
+    // rifle, either deck gun, a shock emitter, a foot. The economy and every
+    // on-kill item hook here, so a new damage source cannot silently pay nothing
+    // and cannot silently fail to trigger a build.
+    //
+    // `source` rides along so item procs can refuse to fire for automated kills.
+    // The economy ignores it: income is earned however something died.
+    //
+    // Optional, because tools/scene-cost.mjs builds a Horde purely to count draw
+    // calls and has no business owning an event bus.
+    this.events?.emitKill(e, source);
   }
 
   /**

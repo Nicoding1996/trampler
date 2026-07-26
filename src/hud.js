@@ -45,6 +45,8 @@ export class Hud {
       post: id("r-post"),
       exposure: id("r-exposure"),
 
+      procs: id("r-procs"),
+
       barHp: id("b-hp"),
       barReactor: id("b-reactor"),
       barHeat: id("b-heat"),
@@ -78,6 +80,7 @@ export class Hud {
     this.shop = document.getElementById("shop");
     this.shopItems = document.getElementById("shop-items");
     this.shopBonus = document.getElementById("shop-bonus");
+    this.shopBuild = document.getElementById("shop-build");
     this.shopSalvage = document.getElementById("r-salvage");
     this.shopScrap = document.getElementById("r-scrap");
     this.shopSignature = "";
@@ -93,6 +96,15 @@ export class Hud {
     this.routeHead = document.getElementById("route-head");
     this.routeItems = document.getElementById("route-items");
     this.routeSignature = "";
+
+    this.pick = document.getElementById("pick");
+    this.pickHead = document.getElementById("pick-head");
+    this.pickItems = document.getElementById("pick-items");
+    this.pickSignature = "";
+
+    this.buffs = document.getElementById("buffs");
+    this.buffGain = document.getElementById("buff-gain");
+    this.buffWhy = document.getElementById("buff-why");
 
     // Full-frame feedback. Both are elements rather than post-processing passes
     // because both are UI: they say something about the player's state, not about
@@ -113,19 +125,34 @@ export class Hud {
    * 60 Hz, which made the loss banner visibly flicker when that mistake was made
    * there.
    */
-  #shopPanel(economy) {
+  #shopPanel(economy, run) {
     if (!economy) return;
 
-    // The bay borrows the same keys, so the two panels are mutually exclusive.
-    // Showing both would put two readings of "press 3" on screen at once.
-    const open = economy.open && !this.bayOpen;
+    // The bay and a pending salvage pick both borrow the same keys, so all three
+    // panels are mutually exclusive. Showing two would put two readings of "press 3"
+    // on screen at once — and worse than unreadable, it would be a lie: the router
+    // gives the keys to the pick, so a press aimed at a refit spends the free pick
+    // instead. The panel that does not own the keys has to be the one that goes away.
+    const open = economy.open && !this.bayOpen && !run?.picking;
     cls(this.shop, open ? "panel show" : "panel");
     if (!open) return;
 
     const entries = economy.entries;
+    // Two things in this signature are easy to leave out and both go stale silently.
+    //
+    // `e.index` — WHICH items are on offer. Without it a re-roll that happened to
+    // leave the prices and stacks alone would not redraw, and the panel would list
+    // last landmark's stock. It only worked before because every road pays scrap on
+    // arrival, so the purse moved in the same frame as the re-roll. That is a
+    // coincidence of the road table, not a property of the shop.
+    //
+    // `purchases` — for the carried list below rather than the offer list: a salvage
+    // pick grants an item that may not be on sale here at all, so nothing else would
+    // move and the build readout would sit one item out of date.
     const signature = [
-      Math.floor(economy.salvage), Math.floor(economy.scrap),
-      ...entries.map((e) => `${e.stacks}:${e.cost}:${e.affordable ? 1 : 0}:${e.soldOut ? 1 : 0}`),
+      Math.floor(economy.salvage), Math.floor(economy.scrap), economy.purchases,
+      ...entries.map((e) =>
+        `${e.index}:${e.stacks}:${e.cost}:${e.affordable ? 1 : 0}:${e.soldOut ? 1 : 0}`),
     ].join("|");
     if (signature === this.shopSignature) return;
     this.shopSignature = signature;
@@ -167,6 +194,17 @@ export class Hud {
       ? `EARLY CALL · +${Math.round((economy.bonus - 1) * 100)}% THIS WAVE`
       : "";
     if (this.shopBonus.textContent !== bonus) this.shopBonus.textContent = bonus;
+
+    // The build readout. Names and stack counts only -- the effects are on the offer
+    // list above when an item is on sale, and eighteen lines of description here
+    // would bury the four rows the player is actually choosing between.
+    const carried = economy.carried;
+    this.shopBuild.innerHTML = carried.length === 0
+      ? `<span class="none">carrying nothing yet — salvage buys the list above</span>`
+      : `<span class="none">carrying</span> `
+        + carried
+          .map((c) => `<span class="carried">${c.name}${c.stacks > 1 ? ` x${c.stacks}` : ""}</span>`)
+          .join(" · ");
   }
 
   /** The refit bay: three sockets and the module list. */
@@ -200,6 +238,55 @@ export class Hud {
     }).join("");
 
     this.bayScrap.textContent = String(Math.floor(economy?.scrap ?? 0));
+  }
+
+  /**
+   * The free salvage pick, offered for holding a siege and resolved before the road.
+   *
+   * Driven off `economy.pendingPick` rather than off the run's phase, so the panel
+   * cannot be up with nothing in it: the one thing it must never do is ask for a
+   * keypress that does nothing.
+   */
+  #pickPanel(run, economy) {
+    const offers = economy?.pickEntries ?? [];
+    const open = !!run?.picking && offers.length > 0;
+    cls(this.pick, open ? "panel show" : "panel");
+    if (!open) return;
+
+    const signature = offers.map((e) => e.index).join(",");
+    if (signature === this.pickSignature) return;
+    this.pickSignature = signature;
+
+    this.pickHead.textContent = `SALVAGE — TAKE ONE OF ${offers.length}`;
+    this.pickItems.innerHTML = offers.map((e, i) => `<div class="it">`
+      + `<div class="rn"><span class="key">${i + 1}</span> ${e.name}</div>`
+      + `<div class="rd">${e.detail}</div>`
+      + `<div class="rr ${e.rarity}">${e.rarity}</div>`
+      + (e.stacks > 0 ? `<div class="rs">you carry ${e.stacks}</div>` : "")
+      + `</div>`).join("");
+  }
+
+  /**
+   * The live conditional bonus: how much extra damage the rifle is doing right now,
+   * and which items are the reason.
+   *
+   * This is the other half of the build readout, and it is a separate thing on
+   * purpose. The refit panel answers "what have I got", between waves, when you are
+   * choosing. This answers "why is my damage different this second", during a fight,
+   * which is the only question a conditional item raises — "+30% beneath the hull"
+   * with no feedback is indistinguishable from an item that does nothing, and the two
+   * items that pay for MOVING between deck and ground are the last things in the pool
+   * that should be invisible.
+   *
+   * Up only while something is actually live, like the prompt and the telegraph, so
+   * it is not a panel and does not join the count of things always on screen.
+   */
+  #buffStrip(items) {
+    const live = !!items && items.bonus > 0 && items.reasons.length > 0;
+    cls(this.buffs, live ? "show" : "");
+    if (!live) return;
+    set(this.buffGain, `+${Math.round(items.bonus * 100)}%`);
+    set(this.buffWhy, items.reasons.join(" · "));
   }
 
   /** Road choice at a landmark. Only up while the run is actually asking. */
@@ -309,11 +396,13 @@ export class Hud {
   update(ctx) {
     const {
       player, trampler, grapple, horde, director, weapon, repair, emitters,
-      economy, modules, run, gun, fps, renderer, post, dt = 0,
+      economy, modules, run, items, events, gun, fps, renderer, post, dt = 0,
     } = ctx;
-    this.#shopPanel(economy);
+    this.#shopPanel(economy, run);
     this.#bayPanel(economy, modules);
+    this.#pickPanel(run, economy);
     this.#routePanel(run);
+    this.#buffStrip(items);
 
     // ---- movement readout
     const world = player.worldVelocity(_v);
@@ -342,6 +431,26 @@ export class Hud {
     // there is no way to tell that from a broken texture path.
     set(this.el.assets, Look.status, Look.ready ? "on" : "off");
     set(this.el.burrowed, String(horde.burrowed ?? 0), (horde.burrowed ?? 0) > 0 ? "bad" : "");
+
+    // Proc counters. Instrumentation, deliberately: "has that item ever fired" is a
+    // tuning question, and a chance-based effect is exactly the kind of thing that
+    // can be wired up wrong and still look plausible in play.
+    //
+    // The chain depth is here too, because a splash that kills re-enters its own
+    // listener and the interesting question about a proc build is not how often it
+    // fires but how far it cascades. `x4!` means the cap is biting, which is a
+    // balance signal rather than a fault — the cap exists so that case is bounded
+    // instead of a blown stack.
+    if (items) {
+      const p = items.procs;
+      const total = p.fragment + p.arc + p.executioner;
+      const chain = events ? ` · x${events.deepest}${events.suppressed > 0 ? "!" : ""}` : "";
+      set(
+        this.el.procs,
+        `${p.fragment} frag · ${p.arc} arc · ${p.executioner} exec${chain}`,
+        total > 0 ? "on" : "",
+      );
+    }
 
     // Render cost, which is what a low frame rate is actually about. Draw calls are
     // the number that mattered: the first build ran ~1410 a frame against 55k
@@ -418,7 +527,9 @@ export class Hud {
     // then the gun you are standing at, then the repair under your hands. Standing
     // at a mount and standing at a repair point are never the same place, so those
     // two cannot both be true, but a road choice can overlap either.
-    if (run?.choosing) {
+    if (run?.picking && economy?.pendingPick?.length) {
+      this.#prompt(`1-${economy.pendingPick.length}`, "TAKE ONE", 1);
+    } else if (run?.choosing) {
       this.#prompt("1-2", "CHOOSE A ROAD", 1);
     } else if (gun?.mounted) {
       this.#prompt(
@@ -483,7 +594,7 @@ export class Hud {
         paceCls = "bad";
         break;
       case PHASE.HELD:
-        pace = run?.choosing ? "choose a road" : "siege held";
+        pace = run?.picking ? "take salvage" : run?.choosing ? "choose a road" : "siege held";
         paceCls = "on";
         break;
       default:

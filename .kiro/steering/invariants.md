@@ -34,6 +34,27 @@ failure is silent: nothing looks broken, the player simply stops having a reason
 go down there and half the pillar quietly dies.
 → tests 48, 66, 77
 
+**2b-i. NO ITEM MAY AUTOMATE A JOB THE PLAYER HAS TO BE PRESENT FOR.**
+The salvage table is eighteen items and several of them are on-kill effects. A
+splash-on-kill and a rack of shock emitters are each individually fine; together,
+ungated, an emitter kills a chewer, the splash kills two more, and each of those
+splashes again — automation compounding itself with nobody within a hundred metres.
+That failure would arrive through an item nobody thinks of as defensive.
+
+The gate is `source === "player"` on every proc, and a manned deck gun counts as the
+player because somebody is sitting in it. Measured: the whole salvage table three
+stacks deep, on top of four hull plates, three repair rigs, three modules and five
+emitters, still leaves the fortress crippled at **131.1 s with nobody aboard** —
+identical to the number before the item layer existed — with **0 procs across 23
+unattended kills**.
+
+The same rule rules items out at design time: an auto-repair drone, a deployable
+turret, anything that reaches under the hull from the deck. All ordinary roguelike
+items, and each one deletes the reason to oscillate. The categories that exist
+instead pay you for BEING somewhere or for MOVING between the two positions, which
+pushes the other way.
+→ tests 77, 94
+
 **2c. THE FORTRESS DOES NOT FIGHT FOR YOU. The feet deal no enemy damage.**
 This is the newest invariant and it was learned by breaking it. A leg stomp that
 dealt 30 damage — *below* a chewer's 50 hp, so incapable of killing anything alone,
@@ -186,6 +207,43 @@ you can rearrange between waves is not a commitment, and without commitment the
 choice is a preference you can revisit for free. There is deliberately no `unfit`.
 → test 76
 
+**22d. The personal track is a POOL, and the shop shows a subset of it.** Eighteen
+items against six number keys, so a landmark offers four personal slots drawn from
+sixteen. That constraint is the mechanism, not a limitation worked around: before
+it, every run bought the same four multipliers in the same order and the only thing
+that varied across a whole playthrough was which road you took.
+
+The two scrap refits are **always** offered. That asymmetry is 22 restated — the
+bounded fortress track has to be dependable enough to plan a run around, and the
+unbounded personal track is the half that varies.
+
+Rarity supplies cost and growth; items declare only a tier. Hand-set prices were 32
+unrelated numbers and nothing kept a proc priced above a flat damage stack. And the
+draw picks a **tier first, then uniformly within it**, because per-item weights
+cannot express "one offer in five should be rare" when the tiers hold different
+numbers of items: measured at 6:3:1 per item, rares came out at 8% of offers, about
+one across a whole run, for the items the pool exists to deliver. Now 51/29/20
+against 50/30/20 configured. Fixing it the other way would have required rare items
+to carry a *higher* number than uncommons in order to appear *less* often — a config
+that lies to the next reader.
+→ tests 91, 95
+
+**22e. Every item in the catalogue must actually do something.** Eighteen entries
+maintained by hand, and the failure mode is an item that is priced, listed, buyable
+and wired to nothing. Nothing throws; the player spends 95 salvage and the game does
+not change, which gets filed as "that item feels weak" rather than "that item does
+not exist". Every id must have a static effect or be read by the runtime, and every
+rarity tier must be populated or its weight is a dead letter.
+→ test 91
+
+**22f. Holding a siege pays a free pick of three, and the pick is personal.** Being
+handed something is a different beat from buying it, and it is the only acquisition
+that does not compete with the fortress for money. Salvage items only — a free hull
+plate would be one purse funding the other, which is 22 broken from the reward side.
+Taking one clears the rest, because the whole value of a pick is what you gave up.
+The boss leg pays nothing: an item you can never spend is a menu, not a reward.
+→ tests 79, 96
+
 **23. Buying happens between waves only.** Spending mid-fight would let a player
 purchase their way out of trouble and would drain the tension the siege is built
 on. It also gives the preparation window a second job.
@@ -203,7 +261,14 @@ journey.** Effects are recomputed absolutely from stack counts, so `applyAll()` 
 zero stacks *is* the reset and there is no separate revert path to forget. Leaving
 state in place would make every subsequent attempt quietly easier and destroy the
 point of the seeded fight.
-→ tests 65, 76, 82
+
+The conditional half of the item pool follows the same rule by a second route: it is
+cleared and rebuilt from current conditions every frame, so a reset is the next
+frame finding no stacks to read. Nine fields are affected and test 92 reads all nine
+in one place — an effect that starts writing somewhere new shows up there as an
+unreverted value rather than as two runs disagreeing later, which is the hardest
+failure in this project to trace back to a cause.
+→ tests 65, 76, 82, 92
 
 **26. Calling a wave early must pay.** Q existed for a long time with nothing to be
 greedy for: the cost was losing a 12 s preparation window and the reward was
@@ -313,23 +378,30 @@ through velocity and let the integrator carry it.**
 stochastic choice draws from a seeded stream, never `Math.random`, and every seed
 lives in `config.js`: spawn bearing, spawn radius, leg choice, climb-route choice
 and the shove's degenerate direction (`CFG.enemies.seed`), wave bearing and the
-composition shuffle (`CFG.waves.seed`), road offers (`CFG.run.seed`), weapon cone
-spread (`CFG.combat.weapon.seed`), rock and ruin scatter and the horizon
-(`CFG.world.seed`), fortress greebling and the viewmodel's detail (local seeds).
+composition shuffle (`CFG.waves.seed`), road offers (`CFG.run.seed`), the shop's
+stock and the salvage pick (`CFG.economy.seed`), item proc chances
+(`CFG.items.seed`), weapon cone spread (`CFG.combat.weapon.seed`), rock and ruin
+scatter and the horizon (`CFG.world.seed`), fortress greebling and the viewmodel's
+detail (local seeds).
 
-Restarting has to rewind five things or the seeds buy nothing: `horde.clear()`
+Restarting has to rewind six things or the seeds buy nothing: `horde.clear()`
 re-seeds, `director.reset()` re-seeds, `run.reset()` re-seeds and returns to the
-first landmark, `economy.reset()` reverts every upgrade and strips every hardpoint,
-and `trampler.resetPose()` puts the fortress back on its start heading — spawn
-bearings are computed from that heading, so a restart mid-patrol is measurably a
-different fight from the same seed.
+first landmark, `economy.reset()` reverts every upgrade, strips every hardpoint and
+re-rolls the shop from a re-seeded stream, `items.reset()` re-seeds the proc stream
+and clears every timed buff, and `trampler.resetPose()` puts the fortress back on
+its start heading — spawn bearings are computed from that heading, so a restart
+mid-patrol is measurably a different fight from the same seed.
+
+A proc chance is exactly the kind of thing that looks harmless on `Math.random` and
+is not: two attempts at the same seeded wave would diverge on whether an arc fired,
+which is the one property the seeds exist to protect.
 
 Two full runs of the suite differ **only** in the wall-clock perf reading.
 
 Never reintroduce unseeded randomness into a simulation module. Note that
 searching for it is easy to get wrong: four of the five original cases hid behind
 grep patterns that silently matched nothing.
-→ tests 57, 79, 81, 82
+→ tests 57, 79, 81, 82, 95, 96
 
 ## Presentation
 
@@ -339,13 +411,22 @@ enforces it by reading `index.html` as text: every id `hud.js` reaches for must
 exist, no two always-visible panels may share a screen anchor, at most two may be
 up while playing, and any panel that is not always up must be referenced from
 `hud.js` or it is dead markup.
+
+Two things follow from this, and the item pool tested both. **A readout the player
+acts on between waves belongs on the panel that is already up then** — what you are
+carrying is a footer on the refit list, not a panel of its own, and there is no new
+key for it. **A readout about the current second is transient, not a panel** — the
+live conditional bonus is up only while a condition is actually being met, like the
+prompt and the telegraph, and so it never joins the count. The temptation both times
+was one more always-on box.
 → test 67
 
-**28. The number keys have exactly one owner per frame.** The refit panel, the
-refit bay and a road choice all want 1-6. `routePurchaseInput` picks one in priority
-order — road, bay, panel — and hands `null` to the others, so a single press can
-never buy a refit *and* take a road. Income is paid whoever owns the keys, because
-income is not key-driven.
+**28. The number keys have exactly one owner per frame.** The refit panel, the refit
+bay, a road choice and a pending salvage pick all want 1-6. `routePurchaseInput`
+picks one in priority order — **pick, road, bay, panel**, ordered by how stuck the
+crew is without it — and hands `null` to the others, so a single press can never buy
+a refit *and* take a road. Income is paid whoever owns the keys, because income is
+not key-driven.
 
 A rule that matters belongs in a module, not in the frame loop. This one lived in
 `main.js`, which the harness cannot import, and was therefore the only piece of

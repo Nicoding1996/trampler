@@ -9,15 +9,29 @@ import { makeRandom } from "./util.js";
 // later fight to spend them in, and a boss only means something if you arrive at
 // it carrying whatever you chose to build.
 //
-// Structure:
+// Structure. Four phases, and that is the whole machine:
 //
-//   TRAVEL   -> a road has been chosen, the fortress is walking. Buying is open.
-//   SIEGE    -> the director runs a normal siege at the landmark.
-//   CHOOSING -> the siege is HELD; two roads are offered and the crew picks one.
+//   SIEGE    -> the director runs a siege at the landmark.
+//   PICKING  -> the siege is HELD; a free pick of three items is offered.
+//   CHOOSING -> the pick is taken; two roads are offered and the crew picks one.
 //   DONE     -> the biome is cleared.
 //
-// The choice IS the travel. There is no walking minigame, because the interesting
-// part of "which way do we go" is the trade, not the walking.
+// PICKING and CHOOSING are SEQUENTIAL, never simultaneous. Two menus on one screen
+// at the same moment is unreadable, and the number keys already had three contenders
+// before the pick existed, which is why test 86 exists at all.
+//
+// There is deliberately NO travel phase, and this list used to claim one. The
+// choice IS the travel: there is no walking minigame, because the interesting part
+// of "which way do we go" is the trade, not the walking. The window a travel phase
+// would have provided already exists as the director's own rest phase, which is
+// when buying is open anyway -- so a fourth state would have duplicated it while
+// looking, to anyone reading the header, like a feature that had been built.
+//
+// It was in fact declared, documented here, and never assigned or read by anything.
+// Removed rather than wired: a state machine that describes more states than it has
+// is worse than a small one, because the next person to touch it plans around a
+// phase that does not exist. The inverse is just as bad and this header briefly had
+// it — PICKING was added to the enum while the list above still said three.
 //
 // One deliberate constraint: nothing here advances on a timer. A finished siege
 // sits in HELD until a human presses a key. Partly design -- finishing something
@@ -26,13 +40,19 @@ import { makeRandom } from "./util.js";
 // invalidated by the run structure quietly starting the next one.
 
 export const RUN = {
-  TRAVEL: "travel",
   SIEGE: "siege",
+  // Holding a siege pays a free item BEFORE the road choice, not alongside it.
+  // Sequential rather than simultaneous for two reasons: two menus on one screen at
+  // the same moment is unreadable, and the number keys already have three
+  // contenders (refit panel, refit bay, road) which is why test 86 exists at all. A
+  // fourth simultaneous owner is exactly the bug that test was written to catch.
+  PICKING: "picking",
   CHOOSING: "choosing",
   DONE: "done",
 };
 
 export class Run {
+  /** @param economy pays arrival bonuses and owns the salvage pick offered on a hold. */
   constructor(director, horde, economy = null, seed = CFG.run.seed) {
     this.director = director;
     this.horde = horde;
@@ -114,12 +134,30 @@ export class Run {
   update() {
     if (this.phase === RUN.SIEGE && this.director.held) {
       if (this.isBossLeg) {
+        // The boss leg pays nothing: the run is over, and an item you can never
+        // spend is a menu rather than a reward.
         this.phase = RUN.DONE;
       } else {
-        this.phase = RUN.CHOOSING;
-        this.#offerRoads();
+        // Seeing off a siege earns a pick. This is the reward beat the shop cannot
+        // provide -- buying something is not the same feeling as being handed it --
+        // and it widens how much of the pool a run actually sees, since four shop
+        // slots a landmark only ever exposes a fraction of it.
+        this.phase = RUN.PICKING;
+        this.economy?.offerPick();
       }
     }
+
+    // The pick resolves into the road choice. Held here rather than inside
+    // `takePick` so the run owns its own phase order, and so a pick that somehow
+    // fails to resolve cannot strand the run in a state with no way out.
+    if (this.phase === RUN.PICKING && !this.economy?.pendingPick?.length) {
+      this.phase = RUN.CHOOSING;
+      this.#offerRoads();
+    }
+  }
+
+  get picking() {
+    return this.phase === RUN.PICKING;
   }
 
   #offerRoads() {
@@ -173,6 +211,11 @@ export class Run {
     if (this.economy) {
       this.economy.grant(road.salvage, road.scrap, `ARRIVED: ${road.name}`);
       if (road.module) this.economy.grantModuleCredit();
+      // A new landmark restocks the shop. This is the other half of what makes a
+      // build vary: the pool is larger than the keyboard, so what is on sale changes
+      // as you travel, and a plan made at the first landmark cannot simply be
+      // repeated at the third.
+      this.economy.rollOffers();
     }
 
     this.lastArrival = {

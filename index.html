@@ -192,6 +192,18 @@
   .purse { display: flex; justify-content: space-between; gap: 10px; }
   .purse .v { font-variant-numeric: tabular-nums; color: var(--accent); }
   #shop .bonus { color: var(--warn); font-size: 10px; letter-spacing: 0.1em; margin-top: 7px; }
+  /* What you are carrying, on the refit panel rather than on screen.
+     The list above only shows four of sixteen personal items, so an item taken at a
+     landmark and since rotated out of the stock would otherwise vanish from the game
+     entirely. It belongs here rather than in a panel of its own because this is the
+     moment you act on it: deciding what to buy next is the only time the question
+     "what have I already got" has an answer that changes anything. */
+  #shop .build {
+    margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--panel-edge);
+    font-size: 10px; line-height: 1.6; color: var(--ink-dim);
+  }
+  #shop .build .carried { color: var(--ink); }
+  #shop .build .none { opacity: 0.55; }
 
   /* ---- refit bay: the bounded build layer. Tab. ----
      A separate screen rather than more rows on the refit panel, because the two
@@ -236,6 +248,63 @@
   #route .road .rd { font-size: 10px; color: var(--ink-dim); margin: 4px 0 6px; }
   #route .road .rc { font-size: 10px; color: var(--bad); }
   #route .road .rp { font-size: 10px; color: var(--accent); }
+
+  /* ---- salvage pick: the reward for holding a siege. Same geometry as the route
+     panel because it occupies the same moment in the run, one step earlier, and
+     two differently-shaped panels in sequence would read as two unrelated screens. */
+  #pick {
+    left: 50%; bottom: 210px; transform: translateX(-50%);
+    width: min(680px, 94vw); display: none; text-align: left;
+  }
+  #pick.show { display: block; }
+  #pick .head {
+    font-size: 15px; letter-spacing: 0.14em; color: var(--accent);
+    text-align: center; margin-bottom: 10px;
+  }
+  #pick .items { display: flex; gap: 12px; }
+  #pick .it {
+    flex: 1; padding: 10px 12px; border: 1px solid var(--panel-edge);
+    border-radius: 2px; background: rgba(0,0,0,0.3);
+  }
+  #pick .it .rn { letter-spacing: 0.08em; color: var(--ink); }
+  #pick .it .rd { font-size: 10px; color: var(--ink-dim); margin: 4px 0 6px; }
+  /* Rarity is colour-coded, because the whole reason to hesitate over a pick is
+     knowing which of the three is the scarce one. */
+  #pick .it .rr { font-size: 10px; letter-spacing: 0.12em; }
+  #pick .it .rr.common { color: var(--ink-dim); }
+  #pick .it .rr.uncommon { color: var(--accent); }
+  #pick .it .rr.rare { color: var(--warn); }
+  #pick .it .rs { font-size: 10px; color: var(--ink-dim); }
+
+  /* ---- live conditional damage ----
+     Half the salvage table pays only in a particular place, or for a few seconds
+     after a transition. A condition the player cannot see is a condition they cannot
+     learn: "+30% beneath the hull" with no feedback is indistinguishable from an item
+     that does nothing, and the two items that pay for MOVING between deck and ground
+     are the most on-theme things in the pool, so they are the last ones that should
+     be invisible.
+
+     Deliberately not a `.panel`: like the prompt and the telegraph, it exists only
+     while it has something to say, so it costs nothing on screen the rest of the
+     time. Bottom right is the only free corner. It shares the right-hand side with
+     the refit panel, which is up between waves — usually not at the same time as
+     this, though "usually" is doing real work in that sentence: standing under the
+     hull during a rest with the understudy fitted puts both up at once. They do not
+     overlap (the shop is anchored top-right) and the pairing is harmless, but it is
+     not the clean time-share an earlier version of this comment claimed. */
+  #buffs {
+    position: fixed; right: 14px; bottom: 16px; z-index: 8;
+    pointer-events: none; text-align: right; display: none;
+  }
+  #buffs.show { display: block; }
+  #buffs .gain {
+    font-size: 22px; letter-spacing: 0.05em; color: var(--accent);
+    font-variant-numeric: tabular-nums; text-shadow: 0 2px 12px rgba(0,0,0,0.9);
+  }
+  #buffs .why {
+    font-size: 10px; letter-spacing: 0.16em; color: var(--ink-dim);
+    text-shadow: 0 2px 8px rgba(0,0,0,0.9);
+  }
 
   /* ---- wave telegraph ---- */
   #telegraph {
@@ -378,6 +447,10 @@
     <div class="row"><span class="k">threat ramp</span><span class="v" id="r-threat">x1.00</span></div>
     <div class="row"><span class="k">kills / deaths</span><span class="v" id="r-kd">0 / 0</span></div>
     <div class="row"><span class="k">burrowed</span><span class="v" id="r-burrowed">0</span></div>
+    <!-- How often the proc items have actually fired. This is instrumentation, not
+         UI: it answers "is that item working", which is a question for whoever is
+         tuning the pool, and it belongs nowhere a player has to look. -->
+    <div class="row"><span class="k">procs</span><span class="v" id="r-procs">-</span></div>
     <hr />
     <div class="title">Render cost</div>
     <div class="row"><span class="k">fps</span><span class="v" id="r-fps">0</span></div>
@@ -488,6 +561,7 @@
     <hr>
     <div id="shop-items"></div>
     <div class="bonus" id="shop-bonus"></div>
+    <div class="build" id="shop-build"></div>
   </div>
 
   <div id="bay" class="panel">
@@ -502,9 +576,19 @@
     </div>
   </div>
 
+  <div id="pick" class="panel">
+    <div class="head" id="pick-head">SALVAGE — TAKE ONE</div>
+    <div class="items" id="pick-items"></div>
+  </div>
+
   <div id="route" class="panel">
     <div class="head" id="route-head">CHOOSE THE ROAD</div>
     <div class="roads" id="route-items"></div>
+  </div>
+
+  <div id="buffs">
+    <div class="gain" id="buff-gain">+0%</div>
+    <div class="why" id="buff-why"></div>
   </div>
 
   <div id="telegraph">

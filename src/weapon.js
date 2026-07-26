@@ -41,6 +41,16 @@ export class Weapon {
     // into the next attempt at the same seeded wave.
     this.damageScale = 1;
     this.fireRateScale = 1;
+    // Additive, conditional, and rewritten from current conditions every frame by
+    // the item runtime. Zero when nothing applies.
+    this.damageBonus = 0;
+    // Flat armour ignored per shot, from SABOT ROUNDS. Zero by default, so the
+    // bulwark keeps making the rifle the wrong tool until a run decides otherwise.
+    this.armourPierce = 0;
+
+    // Assigned by whoever owns the bus, not taken as a constructor argument, so
+    // tools/scene-cost.mjs can build a Weapon to count draw calls without one.
+    this.events = null;
 
     // Cone spread is seeded, like every other stochastic part of the sim. At
     // 0.007 rad it scatters a shot by ~0.2 m at 30 m, which was enough to make a
@@ -162,7 +172,23 @@ export class Weapon {
       // damageScale is where personal upgrades land. Applied here rather than by
       // editing CFG, so a run's upgrades cannot leak into global config -- and it
       // covers the rifle and both deck guns, since every shot routes through here.
-      if (this.horde.damage(hit.enemy, profile.damage * this.damageScale)) this.kills++;
+      // damageBonus is the CONDITIONAL half, recomputed from scratch every frame by
+      // the item runtime: "while beneath the hull", "for three seconds after
+      // boarding", "while the reactor is failing". It is kept separate from
+      // damageScale rather than folded into it because damageScale is derived
+      // absolutely from stack counts, and a timed effect writing into it would
+      // either be lost on the next recompute or accumulate forever.
+      const dealt = profile.damage * (this.damageScale + this.damageBonus);
+      // "player" because both the rifle and the manned deck guns come through here,
+      // and a manned gun is the crew aiming. Only automation is excluded.
+      //
+      // armourPierce is SABOT ROUNDS. Applied here rather than inside the item,
+      // because armour is resolved in one place on purpose -- see Horde.damage.
+      if (this.horde.damage(hit.enemy, dealt, "player", this.armourPierce)) this.kills++;
+      // After the damage, so an on-hit item sees the enemy in the state the shot
+      // left it in -- including dead, which is what lets "on hit" and "on kill"
+      // items stack on the same shot rather than racing each other.
+      this.events?.emitHit(hit.enemy, dealt);
     } else if (solid.length > 0) {
       this.blockedByHull++;
     }

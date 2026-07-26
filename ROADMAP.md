@@ -5,7 +5,7 @@ Design context is in `.kiro/steering/`. Read `product.md` first, then
 
 ```
 npm start      # http://localhost:5173
-npm run verify  # 91 sections, 556 checks, headless
+npm run verify  # 98 sections, 643 checks, headless
 npm run audit   # static checks the harness structurally cannot make
 npm run cost    # draw calls, triangles, shadow casters, lights — no renderer needed
 npm run imports # every import specifier resolves
@@ -33,10 +33,124 @@ Everything that was on this roadmap below Tier 3 is built and measured.
 | Tier 2 Leg stomp, more enemy types, enemy/deck collision, crosshair | done |
 | Tier 2 Audio | done — synthesised, no files |
 | Tier 2 An automated deck turret | **still deliberately shelved**, see below |
+| Update 1 The Salvage Table — build variety | done |
+| Update 2 The Roster — enemy variety | next |
 | Tier 3 Networked players on a moving platform | untouched, and needs an engine spike |
 
-556 headless checks pass. Two consecutive full runs differ in exactly one line:
+643 headless checks pass. Two consecutive full runs differ in exactly one line:
 the wall-clock performance reading.
+
+## What is actually missing, and the three updates that fix it
+
+Everything on this document below Tier 3 is built. That is not the same as the game
+being finished, and the gap is worth naming precisely rather than reaching for the
+next system.
+
+**There is a complete roguelike skeleton here with exactly one of everything.**
+What varies between two runs:
+
+| | Variety | after Update 1 |
+|---|---|---|
+| Weapons | 1 rifle, never changes | unchanged |
+| Personal upgrades | 4, all numeric multipliers, always offered, same prices, same order | **16 in a pool, 3 rarity tiers, 4 offered per landmark, plus a free pick of 3** |
+| Fortress | 2 refits + 6 modules, always offered | unchanged, deliberately — the bounded track is the dependable one |
+| Enemies | 6 types, on a fixed introduction schedule | unchanged — Update 2 |
+| Boss | 1 | unchanged — Update 3 |
+| Roads | 6 in the table, 2 offered per landmark | unchanged |
+| Biome | 1 | unchanged — Update 3 |
+
+The road choice *was* the **only** thing in the game that differed run to run.
+Everything else was identical every time. So the next phase is not a new mechanic; it
+is populating the systems that already exist until two runs diverge — starting with
+the thinnest one, which was the unbounded track.
+
+The updates are deliberately sequenced one variable at a time. Shipping items and
+enemies together would make the playtest unattributable, which is the same mistake
+the wave-4 reactor fix avoided by trying one candidate instead of three.
+
+### Update 1 — The Salvage Table (build variety) — DONE
+
+Four numeric multipliers is not a build. Risk of Rain's identity is *qualitative*
+items that change how you play, and that is what was asked for on day one.
+
+Shipped: 18 items in `CFG.economy.catalogue`, three rarity tiers carrying cost and
+growth, a shop that re-rolls four personal slots per landmark, a free pick of three
+for holding a siege, a two-channel event bus for procs, and 56 new checks. Suite 558
+→ 643. `product.md` has the categories and why each one exists; `invariants.md` has
+22d-f and 2b-i.
+
+Seven things are worth carrying forward from doing it:
+
+- **The catalogue outgrowing the keyboard is the mechanism, not a problem.** The
+  crash that forced the shop to become a subset was `hud.js` reading
+  `e.key.replace` on entry 7 of 18 against six configured keys. A fixed shop cannot
+  hold a pool, and a subset that changes is the entire reason two runs build
+  differently.
+- **Per-item rarity weights cannot express tier share.** Measured at 6:3:1 per item,
+  rares came out at 8% of offers — about one across a whole run, for the items the
+  pool exists to deliver. The tiers hold different numbers of items, so the fix is to
+  pick the **tier** first and then uniformly within it. Fixing it the other way would
+  have needed rare items to carry a *higher* number than uncommons in order to appear
+  *less* often, which is a config that lies.
+- **Conditional effects need their own field.** `weapon.damageScale` is derived
+  absolutely from stack counts, so a timed write into it is either erased by the next
+  recompute or accumulates forever. `weapon.damageBonus` is cleared and rebuilt every
+  frame instead. Two fields, one discipline.
+- **A proc bus needs a depth cap.** An on-kill item that deals damage re-enters its
+  own listener; two reasonable items compose into a blown stack. Cap 4, with
+  `try/finally` so a throwing item cannot wedge the bus for the rest of the run.
+- **The build readout is two different readouts.** What you carry belongs on the
+  refit panel, which is already up when you act on it. What is live *this second*
+  belongs on screen during a fight, and only while it is live. One always-on panel
+  showing both would have been panel accumulation again.
+- **Two existing tests were asserting the roll rather than the thing they claimed.**
+  Both passed only while the catalogue was small enough to fit on the keys. That is a
+  new entry in `tech.md`'s list of tests that lie.
+- **A green suite hid five real defects, and a review pass found them.** All five were
+  invisible to the harness for the same structural reason: each sat in a *second* path
+  through something the tests exercised once. VITALS healed when bought and not when
+  picked, because there were two acquisition paths and the tests read the purse rather
+  than health. Dying paid the boarding buff, because `respawnOnDeck` is both the death
+  path and the spawn path — and the test for boarding used it. The restart test claimed
+  to mirror `main.js` and had stopped doing so, leaving the item seed's rewind
+  unasserted. The shop panel stayed up during the pick advertising six keys the router
+  had already handed away. And the manned-gun proc check supplied the very string it
+  was testing for. The lesson is narrower than "review your work": **when a change adds
+  a second way to reach an existing effect, the test that covered the first way is now
+  covering half of what it claims.**
+
+**The rule that kept this from wrecking the game.** Every item was checked against
+one question: *does it let one position do the other's job?* An auto-repair drone, a
+deployable turret, anything that reaches under the hull from the deck — each is a
+perfectly ordinary roguelike item and each one deletes the reason to oscillate.
+Invariant 2b-i is the enforced form, and the measurement is that the whole table
+three stacks deep changes unattended time-to-crippled by **nothing at all**: 131.1 s
+before the item layer existed, 131.1 s with it, and 0 procs across 23 unattended
+kills.
+
+### Update 2 — The Roster (enemy variety) ← next
+
+- **A ranged enemy.** The one genuinely missing role: all six current types deal
+  contact damage, so nothing punishes standing in the open, nothing makes cover
+  matter, and nothing can threaten a manned station at all. That last point is a
+  direct answer to the open question about whether a gun feels powerful or trapped —
+  at present nothing can reach you there.
+- **Elite affixes.** The cheapest variety multiplier available: armoured, swift,
+  volatile, shielded, applied to the six existing AIs. Reads as a much larger roster
+  for a fraction of the work and plugs into the existing wave schedule.
+
+### Update 3 — The Second Biome (content volume)
+
+A second road table and a second boss. Held until 1 and 2 prove out, because volume
+before variety means building more of something that might not be fun yet.
+
+Parked, and not forgotten: the netcode spike and the engine decision. The one
+question that spike must answer first is now known — the harness runs a fixed
+`DT = 1/60` while the game runs `dt = Math.min(frameMs / 1000, 1/30)`, so two
+machines at different frame rates already diverge before a network is involved.
+Everything else here is unusually well suited to rollback: seeded RNG throughout,
+hull-local storage, pooled enemies with no `Object3D` per entity, one hitscan path.
+The variable timestep is the single structural blocker.
 
 ## The performance and brightness pass
 
@@ -245,10 +359,12 @@ turns three chained climbs into a route to the crow's nest, which invariant 3
 forbids.
 
 Invariant 2b re-checked with everything defensive bought at once — four hull
-plates, three repair rigs, an emitter rack, floodlights, baffles, and five
-emitters deployed. The fortress is still crippled unattended, at 131.1 s against
-90.2 s with refits alone. It buys time. It does not hold.
-→ tests 76, 77
+plates, three repair rigs, an emitter rack, floodlights, baffles, five emitters
+deployed, **and three stacks of every one of the sixteen personal items**. The
+fortress is still crippled unattended, at 131.1 s against 90.2 s with refits alone.
+Adding the whole salvage table moved that number by zero, and fired zero procs across
+23 unattended kills. It buys time. It does not hold.
+→ tests 76, 77, 94
 
 ## The art
 
@@ -292,6 +408,18 @@ controls.
 - Re-test **G** (free-surface grapple vs hardpoints only) and **M** (release feel)
   now that mantling exists.
 - The sapper's six seconds: enough to react to, or a coin flip?
+- **Does a conditional item read as a reason to move, or as a tax on standing
+  still?** The transition pair is the whole thesis of the categories — one item pays
+  for boarding, another for dropping off — and three seconds may be too short to
+  notice at all.
+- **Is four shop slots enough exposure to the pool across a biome?** Sixteen offers
+  plus three picks a landmark. If a run regularly ends without having seen anything
+  interesting, `CFG.economy.pickCount` is cheaper to raise than the key count.
+- **Does the rarity feel like rarity?** Measured at 51/29/20 with about three rare
+  offers a run. Whether that reads as "the good stuff shows up sometimes" or as "the
+  good stuff never shows up" is not something the harness can answer.
+- **Is `+75% UNDER HULL · LAST STAND` legible mid-fight, or noise in the corner?**
+  The buff strip is the only feedback that a conditional item is doing anything.
 
 ## Tier 2 — what is left in it
 

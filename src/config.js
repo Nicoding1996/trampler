@@ -1114,6 +1114,56 @@ export const CFG = {
     // only existed for placing emitters.
     keys: ["Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6"],
 
+    // The shop sells a SUBSET of the catalogue, re-rolled at each landmark, and this
+    // seeds which. Six keys against eighteen items is what forces it, and forcing it
+    // is the feature: a fixed shop meant every run bought the same things in the
+    // same order, so nothing about a build differed between playthroughs.
+    seed: 515151,
+
+    // How many items are offered as the free pick for holding a siege. Three is the
+    // number that makes it a decision: two is a coin toss and four is a list you
+    // read rather than a choice you feel.
+    pickCount: 3,
+
+    // Rarity, and it sets BOTH the price and how often an item is offered.
+    //
+    // Every personal item used to carry its own hand-set cost and growth: thirty-six
+    // numbers with no relationship to each other, which is fine for six items and
+    // rots at eighteen. Nothing kept a proc priced above a flat damage stack except
+    // whichever number happened to get typed, and adding a nineteenth item meant
+    // re-deriving the whole table to work out where it sat.
+    //
+    // Now an item declares a TIER and inherits both. Three tiers of three numbers
+    // replaces the table, the trade "one strong item or two ordinary ones" is legible
+    // because it is the same trade every time, and a new item only has to answer one
+    // question: how good is it?
+    //
+    // `weight` is the tier's SHARE OF OFFERS, not a per-item weight, and the draw
+    // picks a tier first and then an item within it.
+    //
+    // That distinction is the whole reason this is worth a comment. Per-item weights
+    // cannot express what a designer actually wants here, because the tiers have
+    // different populations -- currently five commons, seven uncommons, four rares,
+    // and test 91 asserts none of them is empty rather than pinning the split.
+    // Weighting each item 6:3:1 measured out at 55/37/8, which is about 1.3 rare
+    // offers across a whole four-landmark run -- and the rares are the procs, the
+    // reason this pool exists at all. Most runs would never have seen one.
+    //
+    // Fixing it by raising the per-item rare weight would have required rare items to
+    // carry a HIGHER number than uncommon ones to appear less often, which is a config
+    // that lies to whoever reads it next. Picking the tier first makes the number mean
+    // what it says.
+    //
+    // Against the roughly 260 salvage a five-wave siege pays, a common first stack is
+    // a quarter of a siege and a rare one is most of one. An item may still override
+    // cost and growth explicitly -- the two bounded scrap refits do, because they are
+    // a different track with caps and fixed prices.
+    rarity: {
+      common: { cost: 45, growth: 1.50, weight: 5 },
+      uncommon: { cost: 65, growth: 1.55, weight: 3 },
+      rare: { cost: 95, growth: 1.60, weight: 2 },
+    },
+
     // Personal items come first so the keys read top to bottom in one group, then
     // the fortress refits. Order is presentation only -- everything that looks an
     // item up does it by id, never by index, precisely so this list can be
@@ -1133,19 +1183,102 @@ export const CFG = {
       // exactly this reason.
       {
         id: "rifle", name: "RIFLE CALIBRATION", detail: "+25% weapon damage",
-        pool: "salvage", cost: 45, growth: 1.55, max: Infinity,
+        pool: "salvage", rarity: "common", max: Infinity,
       },
       {
         id: "vitals", name: "VITALS", detail: "+25 max health, healed",
-        pool: "salvage", cost: 40, growth: 1.5, max: Infinity,
+        pool: "salvage", rarity: "common", max: Infinity,
       },
       {
         id: "trigger", name: "TRIGGER GROUP", detail: "faster fire, diminishing",
-        pool: "salvage", cost: 50, growth: 1.5, max: Infinity,
+        pool: "salvage", rarity: "common", max: Infinity,
       },
       {
         id: "weave", name: "KINETIC WEAVE", detail: "take less damage, diminishing",
-        pool: "salvage", cost: 55, growth: 1.5, max: Infinity,
+        pool: "salvage", rarity: "common", max: Infinity,
+      },
+
+      // ---- personal: income and tooling ----
+      //
+      // Both of these change a DECISION rather than a number. Scavenger is worth
+      // more the earlier it is taken and nothing at all on the last landmark, so
+      // when you buy it matters as much as whether. Sabot changes which weapon
+      // answers armour, which is the closest thing in the pool to a new verb.
+      {
+        id: "scavenger", name: "SCAVENGER RIG", detail: "+15% salvage from kills",
+        pool: "salvage", rarity: "common", max: Infinity,
+      },
+      // Rare because it retires a problem rather than easing one: it is the only
+      // item that changes which weapon is correct.
+      {
+        id: "sabot", name: "SABOT ROUNDS", detail: "shots pierce 8 armour",
+        pool: "salvage", rarity: "rare", max: Infinity,
+      },
+
+      // ---- personal: conditional on WHERE you are ----
+      //
+      // These exist to push against the failure mode the whole prototype watches
+      // for, which is one position dominating. Paying for the dangerous half means
+      // a build can want to be down there.
+      {
+        id: "understudy", name: "UNDERSTUDY PLATES", detail: "+30% damage beneath the hull",
+        pool: "salvage", rarity: "uncommon", max: Infinity,
+      },
+      {
+        id: "harness", name: "GUNNER'S HARNESS", detail: "+25% damage while manning a gun",
+        pool: "salvage", rarity: "uncommon", max: Infinity,
+      },
+
+      // ---- personal: conditional on the run going BADLY ----
+      //
+      // A losing fight should be worth continuing rather than worth restarting.
+      {
+        id: "redline", name: "REDLINE GOVERNOR", detail: "+35% damage while the reactor is failing",
+        pool: "salvage", rarity: "uncommon", max: Infinity,
+      },
+      {
+        id: "laststand", name: "LAST STAND", detail: "+40% damage below 40% health",
+        pool: "salvage", rarity: "uncommon", max: Infinity,
+      },
+
+      // ---- personal: conditional on MOVING ----
+      //
+      // The two most on-theme items in the pool. One pays for getting aboard, one
+      // for dropping off, so a build carrying both is paid for oscillating between
+      // deck and ground -- the pillar, restated as an upgrade.
+      {
+        id: "spurs", name: "BOARDING SPURS", detail: "+40% damage for 3s after boarding",
+        pool: "salvage", rarity: "uncommon", max: Infinity,
+      },
+      {
+        id: "dropHarness", name: "DROP HARNESS", detail: "+40% damage for 3s after dismounting",
+        pool: "salvage", rarity: "uncommon", max: Infinity,
+      },
+      {
+        id: "welder", name: "WELDER'S DIVIDEND", detail: "+30% damage for 5s after a repair",
+        pool: "salvage", rarity: "uncommon", max: Infinity,
+      },
+
+      // ---- personal: procs ----
+      //
+      // Every one gates on the kill or hit having been caused by the crew. A proc
+      // that fired for a shock emitter's kill would be automation compounding
+      // itself with nobody present, which is invariant 2b failing quietly.
+      // All rare. Procs are the items that make a build feel like a build, and they
+      // are the ones that compound with everything else in the pool -- a proc plus
+      // fire rate plus damage is multiplicative in effect even though each is
+      // additive on paper. Frequent procs would flatten the whole table.
+      {
+        id: "fragment", name: "FRAGMENTING ROUNDS", detail: "kills spray 14 damage nearby",
+        pool: "salvage", rarity: "rare", max: Infinity,
+      },
+      {
+        id: "arc", name: "ARC CONDUCTOR", detail: "hits may chain half damage to another",
+        pool: "salvage", rarity: "rare", max: Infinity,
+      },
+      {
+        id: "executioner", name: "EXECUTIONER'S CUT", detail: "+6 health on every kill",
+        pool: "salvage", rarity: "rare", max: Infinity,
       },
 
       // ---- fortress, bounded, paid for in scrap ----
@@ -1175,6 +1308,61 @@ export const CFG = {
       trigger: { cap: 1.2, k: 0.35 },
       weave: { k: 0.35 },
     },
+  },
+
+  // ---------------------------------------------------------------------------
+  // Item tuning. The effects themselves are in src/items.js, because behaviour is
+  // not data; these are the numbers those closures read.
+  //
+  // Every conditional gain below is ADDITIVE to the weapon's base multiplier of 1,
+  // so "+0.30" is plainly +30% and three stacks is +90%. Legibility matters more
+  // here than anywhere else in the config: a player has to be able to guess what an
+  // item does from one line of text while a wave is inbound.
+  items: {
+    // Seeded, so a proc chance cannot make two attempts at the same wave diverge.
+    seed: 777001,
+
+    // --- economy
+    scavenger: 0.15,      // +15% salvage per kill, per stack
+
+    // --- armour
+    //
+    // Flat pierce against the bulwark's flat 20 armour. Two stacks makes the rifle
+    // genuinely viable against armour, which is the point: it is an item that
+    // changes which tool is correct, not how hard it hits. The floor inside
+    // afterArmour still applies, so this can never invert into bonus damage.
+    sabot: 8,
+
+    // --- position
+    understudy: 0.30,     // while beneath the hull footprint
+    harness: 0.25,        // while manning a deck gun
+
+    // --- risk. Paying for the state you would rather not be in is what makes a
+    // losing fight worth continuing instead of worth restarting.
+    redline: { below: 0.5, gain: 0.35 },    // reactor under half
+    laststand: { below: 0.4, gain: 0.40 },  // your own health under 40%
+
+    // --- transition. The two most on-theme items in the pool: one pays for getting
+    // aboard, the other for dropping off. A build carrying both is paid for
+    // oscillating, which is the pillar restated as an upgrade.
+    spurs: { seconds: 3.0, gain: 0.40 },
+    dropHarness: { seconds: 3.0, gain: 0.40 },
+
+    // --- job-linked
+    welder: { seconds: 5.0, gain: 0.30 },
+
+    // --- procs. All three gate on the kill having been caused by the crew, so a
+    // shock emitter cannot chain them and hold a position unattended.
+    //
+    // maxTargets bounds the cost as well as the power: this walks the pool on every
+    // kill, and a wave of 45 with several dying a frame should not turn into a
+    // quadratic sweep.
+    fragment: { damage: 14, radius: 4.5, maxTargets: 6 },
+    // Chance is hyperbolic in stacks, so ten stacks is a high chance and never a
+    // certainty, and one roll per hit rather than one per stack -- otherwise
+    // stacking multiplies the number of arcs per shot rather than the odds of one.
+    arc: { chanceCap: 0.75, chanceK: 0.5, range: 9, share: 0.5 },
+    executioner: 6,       // health restored per kill, per stack
   },
 
   // ---------------------------------------------------------------------------
@@ -1358,6 +1546,22 @@ export const CFG = {
     muzzleStandoff: 0.65,
   },
 
+  // The event bus that item procs hang off. One number, because the bus itself is
+  // two arrays and a depth counter.
+  events: {
+    // How deep a proc chain may go before it is cut off.
+    //
+    // An item that deals damage on kill can kill something, which fires the same
+    // listener again. Two reasonable items combine into unbounded recursion and a
+    // blown stack, which is a crash rather than a balance problem. Capped rather
+    // than forbidden because a chain of two or three IS the appeal of proc items;
+    // it is only the unbounded case that has to be impossible.
+    //
+    // 4 is deep enough that a chain reaction reads as one, and shallow enough that
+    // the worst case is 4 nested loops over a handful of listeners.
+    maxProcDepth: 4,
+  },
+
   debug: {
     speedStep: 0.5,
     minSpeed: 0,
@@ -1418,9 +1622,10 @@ export const enemyCfg = (type) => CFG.enemies[ENEMY_TYPE_KEYS[type]];
  * half. A percentage would scale both identically and the bulwark would just be
  * a health bar.
  */
-export function afterArmour(raw, armour) {
-  if (armour <= 0) return raw;
-  return Math.max(raw - armour, raw * CFG.enemies.minDamageFraction);
+export function afterArmour(raw, armour, pierce = 0) {
+  const left = Math.max(0, armour - pierce);
+  if (left <= 0) return raw;
+  return Math.max(raw - left, raw * CFG.enemies.minDamageFraction);
 }
 
 /** Hyperbolic stack curve: approaches `cap` as stacks rise, never reaches it. */

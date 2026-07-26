@@ -36,6 +36,15 @@ export class Repair {
     this.restored = 0;     // legs brought back from dead, for the HUD
     this.rateScale = 1;    // multiplier owned by the economy's repair rig
 
+    // Repairs finished: a leg or the reactor taken all the way back to full.
+    //
+    // A counter rather than an event, because at most one repair can complete in a
+    // frame, so nothing is lost by polling it. `restored` is a different moment and
+    // both are worth having: that one counts legs brought back from DEAD, which is
+    // the recovery the HUD cares about, while this one counts work finished, which
+    // is what a job-linked item should pay out for.
+    this.completions = 0;
+
     this.#buildMarkers();
   }
 
@@ -156,9 +165,13 @@ export class Repair {
     const rate = (this.threatened ? r.contestedRate : 1) * this.rateScale;
 
     if (tgt.kind === "leg") {
+      const wasFull = t.legHp[tgt.index] >= CFG.trampler.legHp;
       if (t.repairLeg(tgt.index, r.legRate * rate * dt)) this.restored++;
+      if (!wasFull && t.legHp[tgt.index] >= CFG.trampler.legHp) this.completions++;
     } else {
+      const wasFull = t.reactorHp >= t.maxReactorHp;
       t.repairReactor(r.reactorRate * rate * dt);
+      if (!wasFull && t.reactorHp >= t.maxReactorHp) this.completions++;
     }
   }
 }

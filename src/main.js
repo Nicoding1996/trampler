@@ -16,6 +16,8 @@ import { Repair } from "./repair.js";
 import { DeckGun, handleStationInput } from "./deckgun.js";
 import { Emitters } from "./emitters.js";
 import { Economy, routePurchaseInput } from "./economy.js";
+import { Events } from "./events.js";
+import { Items } from "./items.js";
 import { Modules } from "./modules.js";
 import { Run } from "./run.js";
 import { Hud } from "./hud.js";
@@ -53,14 +55,36 @@ function boot() {
   const guns = CFG.deckGun.mounts.map((m) => new DeckGun(scene, trampler, m));
   const emitters = new Emitters(scene, trampler, horde);
 
+  // The bus the kill and hit moments publish to. Created before anything that
+  // subscribes, and attached to the publishers by assignment so the simulation
+  // modules do not have to take it as a constructor argument they may not want --
+  // tools/scene-cost.mjs builds a Horde and a Weapon with no bus at all.
+  //
+  // Listener order is registration order, which is construction order, which is
+  // fixed. That is what keeps a build deterministic when several items react to the
+  // same kill.
+  const events = new Events();
+  horde.events = events;
+  weapon.events = events;
+
   // Modules before Economy: the economy owns the purse that buys them and calls
   // modules.reset() from its own reset. Economy before Run: the run pays arrival
   // bonuses into it. Constructed in dependency order so nothing has to be patched
   // together afterwards.
   const modules = new Modules({ trampler, horde, emitters, guns });
   const economy = new Economy({
-    player, trampler, weapon, repair, horde, director, modules,
+    player, trampler, weapon, repair, horde, director, modules, events,
   });
+  // After the economy, because it reads stack counts from it. Subscribes to the bus
+  // for its procs and rebuilds the conditional damage bonus every frame.
+  const items = new Items({
+    economy, player, trampler, weapon, horde, repair, events,
+  });
+  // Note the dependency runs one way only: Items reads the economy's stack counts,
+  // and the economy has no idea Items exists. There was a back-reference here for a
+  // while and nothing ever read it -- the shop, the pick panel and the build readout
+  // are all driven off the catalogue and `stacks`, so the economy never needs to ask
+  // the runtime anything.
   const run = new Run(director, horde, economy);
 
   // Whichever mount the HUD should be talking about: the manned one, else the
@@ -122,6 +146,13 @@ function boot() {
       g.overheated = false;
     }
     player.respawnOnDeck();
+    // LAST, and after the respawn on purpose. It re-seeds the proc stream and clears
+    // every timed buff, so a restarted run rolls the same chances in the same order --
+    // but it also snapshots whether the player is aboard, and running it before the
+    // respawn snapshotted "on the ground" and then saw the respawn as a boarding
+    // transition, arming three seconds of free damage at the start of every restart
+    // that happened from the ground.
+    items.reset();
     hud.closeBay();
     hud.hideBanner();
     lossTimer = 0;
@@ -202,13 +233,18 @@ function boot() {
    */
   function handlePurchasing(dt) {
     if (input.pressed(CFG.fortress.toggleKey)) hud.toggleBay();
-    // A road choice is a decision the run is blocked on, so the bay gets out of
-    // the way rather than sitting underneath it.
-    if (run.choosing) hud.closeBay();
+    // A pick or a road choice is a decision the run is blocked on, so the bay gets
+    // out of the way rather than sitting underneath it.
+    if (run.choosing || run.picking) hud.closeBay();
 
     const routed = routePurchaseInput({
       economy, run, bayOpen: hud.bayOpen, input, dt,
     });
+
+    if (routed.took) {
+      const t = routed.took;
+      toast(`SALVAGED — ${t.name}<small>${t.detail} · now x${t.stacks}</small>`, 3);
+    }
 
     if (routed.arrival) {
       const a = routed.arrival;
@@ -243,7 +279,7 @@ function boot() {
 
   const ctx = {
     player, trampler, grapple, horde, director, weapon, repair, emitters, economy,
-    modules, run, guns, input, world, renderer, post,
+    modules, run, items, events, guns, input, world, renderer, post,
     gun: null, fps: 0, dt: 0,
   };
 
@@ -295,6 +331,10 @@ function boot() {
       } else if (toastTimer > 0) {
         toastTimer -= dt;
         hud.showBanner(toastHtml);
+      } else if (run.picking) {
+        // The pick panel says what to do; a banner over it would cover the three
+        // things being chosen between.
+        hud.hideBanner();
       } else if (run.choosing) {
         // Deliberately blank. The route panel and the contextual prompt both say
         // what to do, and a banner would sit on top of the roads being chosen
@@ -319,6 +359,20 @@ function boot() {
     for (const g of guns) g.update(dt, input, player, weapon);
     repair.update(dt, input);
     emitters.update(dt, input, player);
+    // After repair and the player, so the conditional bonuses are rebuilt from the
+    // position and the health this frame actually ENDED with, and before the horde
+    // reads anything.
+    //
+    // Note what that costs, because an earlier version of this comment claimed the
+    // opposite: `weapon.update` fires above, so a shot this frame resolves against
+    // LAST frame's conditions. That is a deliberate trade rather than an oversight.
+    // Rebuilding before the player moves would read the position they started the
+    // frame in, which is wrong in the same way but harder to reason about, and every
+    // condition in the pool either persists for many frames (under the hull, on a
+    // station, low health) or runs on a three-to-five second timer, where a single
+    // frame at the start is given back at the end. The HUD is not affected at all --
+    // `hud.update` runs after this, so the buff strip is always current.
+    items.update(dt);
     // After the director, so a wave resolved this frame pays this frame.
     handlePurchasing(dt);
     if (economy.lastEvent) {
