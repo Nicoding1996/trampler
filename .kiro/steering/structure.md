@@ -86,7 +86,9 @@ special-case code.
 Applies to: player position and velocity while aboard, grapple anchors, mantle
 start/destination, enemy climb routes, boarders standing on the deck, latched
 attackers riding a leg, leg repair points, gun mounts and their traverse arcs,
-deployed shock emitters, module sockets, foot positions for the stomp.
+deployed shock emitters, module sockets, foot positions for the stomp, and the refit
+terminal's interaction point — stored world-space it would be four metres astern within a
+second and the shop would open and close as the fortress walked out from under it.
 
 If something needs to stay put relative to the fortress, parent its mesh to
 `trampler.group` and store its position in local space. Anything anchored in
@@ -259,11 +261,18 @@ added three more:
   occlusion clip that keeps chewers safe under the hull.
 - `items.bonus` / `items.reasons` — the live conditional damage and why.
 - `run.modifiers` / `run.roadsTaken` — what the roads have cost so far.
-- `economy.open` / `economy.pickOpen` — whether this is a moment to read a shop or a
-  three-item menu in. Both the panels and the number-key router read the same getters,
-  which is the point: a HUD that decided for itself when to show the pick would be a
-  second safety rule, and two nearly-identical safety rules drift until the shop and the
-  pick disagree about whether the moment is safe.
+- `economy.atTerminal` / `browsing` / `open` / `safeMoment` / `pickOpen` / `closedReason` —
+  the shop's whole state, decided in the module and merely drawn. Both the panels and the
+  number-key router read the same getters, which is the point: a HUD that decided for
+  itself when to show the pick would be a second safety rule, and two nearly-identical
+  safety rules drift until the shop and the pick disagree about whether the moment is safe.
+
+  The layering is worth stating because it is easy to collapse. `safeMoment` is the shared
+  safety half — no wave out, nothing within 6 m. `open` adds `atTerminal`; `pickOpen` does
+  not, because buying happens at a console and a pick is handed to you. `browsing` is
+  `atTerminal` alone, which is what makes the panel readable before it is usable.
+  `closedReason` exists so a refusal names the clause that refused rather than a generic
+  "not now" that sends the player to fix the wrong thing.
 
 Note the ORDER lesson buried in the aim scan. `shootFrom` clips on geometry first,
 because the clip decides where the tracer ends. The scan must do the opposite — walk
@@ -343,6 +352,12 @@ The pick's claim is gated on `economy.pickOpen`, not on the offer existing. A pi
 *waits* for a safe window, and a claim it cannot act on is worse than no claim: the keys
 would be owned by something that refuses them and unavailable to the shop or the bay for
 as long as the pick sat there. **An owner that can refuse must not claim.**
+
+The refit panel is the exception that proves the rule, and it is deliberate: it is *up*
+whenever you are at the terminal but only *acts* when a purchase is legal, so it does hold
+the keys while refusing them. That is fine because it is the lowest-priority owner — there
+is nothing behind it to starve — and because it says so on its own title bar. Anything with
+a consumer behind it must not.
 
 The precedence is ordered by how stuck the crew is without it. A pending pick
 blocks the road behind it; a road blocks the whole run; the bay and the panel are

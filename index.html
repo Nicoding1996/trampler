@@ -203,6 +203,14 @@
      overlay in a game whose owner has already complained about overlapping tabs. */
   #shop { right: 14px; top: 14px; width: 344px; display: none; font-size: 13px; }
   #shop.show { display: block; }
+  /* Browsing but not buying: at the terminal while a wave is out, or with something
+     stood next to you. Prices and stock stay perfectly readable — that is the whole
+     point of being able to read it early — while the LIST is dimmed and the key caps go
+     grey, so "these numbers are true" and "these keys are dead" are two different
+     statements the panel can make at once. The title says which. */
+  #shop.locked .title { color: var(--warn); }
+  #shop.locked #shop-items { opacity: 0.62; }
+  #shop.locked #shop-items .key { color: #6b7280; }
   .item { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
   .item + .item { margin-top: 6px; }
   .key {
@@ -655,8 +663,13 @@
     <div class="bar"><span id="p-bar"></span></div>
   </div>
 
+  <!-- The title is written from code because it carries STATE now, not just a label.
+       The panel is up whenever you are at the refit terminal, including mid-wave, so it
+       has to say whether the keys currently do anything and why not: "REFIT — READY", or
+       "BROWSING — NOT WHILE A WAVE IS OUT". A panel headed REFIT that silently swallows
+       every keypress is worse than one that is absent. -->
   <div id="shop" class="panel">
-    <div class="title">refit &mdash; between waves only</div>
+    <div class="title" id="shop-title">refit &mdash; at the terminal</div>
     <div class="purse"><span class="k">salvage (yours)</span><span class="v" id="r-salvage">0</span></div>
     <div class="purse"><span class="k">scrap (crew)</span><span class="v" id="r-scrap">0</span></div>
     <hr>

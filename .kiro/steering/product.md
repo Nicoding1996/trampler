@@ -279,15 +279,22 @@ crosshair names what it is on and whether its armour is in the way, the shop onl
 when you are genuinely safe, picks arrive often enough to learn from, and a road says
 what it cost as well as what it paid.
 
-Update 1.6 fixed where all of that is *drawn*, and one rule that was written backwards.
-Four things were anchored to the bottom centre of the screen, three of them transient,
-and they covered the health and reactor bars at exactly the moments those matter. Vitals
-moved to the empty bottom-left corner and lost every row shown elsewhere; both purses
-were added, since they had only ever been visible during the third of a siege when the
-shop was up. And the buy window now asks whether anything is close to *you* rather than
-whether the fortress is tidy — a rule you satisfy by stepping back, where the old one
-could only be satisfied by finishing the fight. The salvage pick waits for the same
-window, so a three-item menu no longer opens over a fight.
+Update 1.6 fixed where all of that is *drawn*. Four things were anchored to the bottom
+centre of the screen, three of them transient, and they covered the health and reactor bars
+at exactly the moments those matter. Vitals moved to the empty bottom-left corner and lost
+every row shown elsewhere; both purses were added, since they had only ever been visible
+during the third of a siege when the shop was up.
+
+Update 1.7 made **buying a place**. There is a refit terminal on the deck now, and the shop
+is where it is. Three versions of a timing rule had all failed the same way — the panel
+appeared at you, on a clock you could not see, during a "rest" that legally permits eight
+live enemies — and the fix was to stop asking *when* and start asking *where*. It is the
+depression-clamp lesson again: geometry enforces "you cannot buy your way out of trouble"
+better than a phase check, because the console is on the deck and the fight is underneath
+it. Reading was split from buying at the same time, so the panel is legible whenever you
+stand there and the window itself is one keypress rather than ten seconds of frantic
+comparison. The guaranteed window doubled, and — unlike the number it replaced — it is a
+floor every player gets rather than a ceiling only a good one sees.
 
 **The pillar is confirmed.** A solo playtest reported the intended rhythm —
 picking off the approach from a gun, dropping down to fight and repair under the

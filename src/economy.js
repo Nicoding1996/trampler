@@ -1,8 +1,15 @@
+import * as THREE from "three";
 import { CFG, ENEMY_TYPE_KEYS } from "./config.js";
 import { makeRandom } from "./util.js";
 import { ITEM_EFFECTS } from "./items.js";
 import { PHASE } from "./waves.js";
 import { isSubmerged } from "./enemies.js";
+
+// Module-level scratch for the terminal range check, which runs several times a frame.
+// Deliberately NOT shared with anything the harness uses: `_probe` in verify.mjs was
+// once borrowed by a test and by step()'s own invariant checks at the same time, and
+// tech.md keeps that as a standing warning.
+const _term = new THREE.Vector3();
 
 // The economy, and the reason it exists is Q.
 //
@@ -197,61 +204,141 @@ export class Economy {
   // ------------------------------------------------------------------ buying
 
   /**
-   * Buying is a between-waves act, never a way to spend out of trouble — and
-   * "between waves" has to mean a moment the crew can actually READ a shop in.
+   * Are you standing at the refit terminal?
    *
-   * This was three phases wide and a playtester described the result exactly: "in the
-   * middle of the wave I am fighting, so I just spam buy items out of panic." They
-   * were right, and the numbers are worse than the complaint. The old window was the
-   * 10 s rest, which permits up to `holdUntilCleared` — EIGHT — enemies still alive,
-   * plus the 12 s preparation window, which exists to announce an incoming wave with a
-   * named bearing. So you could be told a wave was inbound, be fighting eight things,
-   * and be shown a six-item shop, all at once, on a countdown.
+   * This is the whole shape of the shop now, and it took three attempts to get here.
+   * The history is worth keeping because each version failed differently:
    *
-   * Two things are wrong with that and they are the same thing said twice:
+   *   V1 was three phases wide — rest, prep, and the wave itself — and a playtester
+   *   described the result exactly: "in the middle of the wave I am fighting, so I just
+   *   spam buy items out of panic."
    *
-   * PREP is not spare time. Invariant 19b says what it is for — the window that makes
-   * deploying an emitter a decision and gives the guns a reason to be manned at a
-   * specific moment. A shop competing for it does not add an option, it takes the
-   * preparation away.
+   *   V2 narrowed it to a rest with the fortress clear. Measured badly: zero cost to a
+   *   competent player, up to a third of the window for a struggling one, and varying
+   *   64% to 97% across two passes on the SAME seeds. It locked out precisely the
+   *   player who needed it, for a reason they could not see.
    *
-   * And a rest with eight hostiles in it is not a rest. `director.calm` is the
-   * PACING threshold and is deliberately generous, because reinforcements should not
-   * wait for a spotless field. Safety is a different question, and it is asked here
-   * about the OPERATIVE rather than about the fortress: is anything close enough to
-   * you, right now, that reading a shop is a bad idea.
+   *   V3 asked about the operative instead — nothing within 6 m of you. Better, because
+   *   you could satisfy it by moving. But the playtest that followed said the thing all
+   *   three versions had in common: "it shows up a short time and sometimes it shows up
+   *   while I am fighting."
    *
-   * That second clause was originally "nothing beneath the hull and nothing on the
-   * deck", and it was wrong in a way worth recording, because it sounded better than
-   * it measured. Two things:
+   * That is the actual fault, and no threshold fixes it. The shop was PUSH — it
+   * appeared at you, on a clock you cannot see, and left on its own. `holdUntilCleared`
+   * is EIGHT, so a wave counts as resolved and the rest begins with eight enemies still
+   * alive; a proximity test only ever promised that none of them was on top of you.
    *
-   *   It cost a competent player exactly ZERO seconds and a struggling one up to a
-   *   third of their window. The player who most needs to buy something was the only
-   *   one it locked out, which is precisely backwards.
+   * So it is a PLACE. You walk to a console on the deck. That is the depression-clamp
+   * lesson applied to the economy: the gun was clamped to -12° to stop it shooting under
+   * the hull, and the 3 m hull slab already did that, so the number came out and the
+   * rule became something a player can see. Here, "you cannot buy your way out of
+   * trouble" stops being a phase check and becomes geometry — the terminal is on the
+   * deck, so you cannot use it while fighting chewers underneath, because you are not
+   * there. Invariant 23's first clause, enforced by where things are.
    *
-   *   And the amount varied unpredictably between runs — two measured passes over the
-   *   same seeds gave 64% and 97% of the rest available — because it depended on which
-   *   enemies happened to be where. "Something is under the hull somewhere on a 26 m
-   *   chassis" is not a state a player can see or fix in a second, so a refusal read
-   *   as arbitrary. A playtester reported exactly that: they could not use the shop and
-   *   could not tell why.
+   * And it gives shopping a cost made of the pillar's own material. Being at the console
+   * is being on the deck, not under the hull, and not at a gun. That is a real trade
+   * rather than a free action that happened to be on a timer.
    *
-   * `threatRange` is the same 6 m the contested-repair rule already owns, and reusing
-   * it is deliberate: the two rules are asking the same question — is the operative
-   * under enough pressure that this job should not be going well — so they should not
-   * drift apart. The point of the change is that this is a rule you satisfy by MOVING.
-   * Step back and the shop opens; the old one only opened when the fight was finished.
+   * Note there is deliberately no key to "open" it. Proximity is the whole interaction:
+   * a mode you enter is a mode you can forget you are in, and the number keys are
+   * already the transaction.
+   */
+  get atTerminal() {
+    const t = this.trampler;
+    if (!t?.terminalLocal || !this.player) return false;
+    const p = t.terminalWorld(_term);
+    const r = CFG.economy.terminalRange;
+    return p.distanceToSquared(this.player.position) <= r * r;
+  }
+
+  /**
+   * Can the panel be READ? Standing at the terminal is the only condition.
    *
-   * The window that remains is a rest or a hold with nothing on top of you, and HELD
-   * has no timer at all — so the unhurried moment to spend a siege's earnings is right
-   * after holding one. That is where the money came from.
+   * Reading and buying are separate questions now, and splitting them is the fix for
+   * "it shows up a short time". Twelve seconds was never short because twelve seconds
+   * is short — it was short because the player was spending it *reading* six items with
+   * two lines each, cold, for the first time. The panel only ever existed while a
+   * purchase was legal, so there was no earlier moment to have read it in.
    *
-   * Measured: about 52 s of shopping per five-wave siege, in windows of roughly 12 s.
+   * So: browse whenever you stand here, including mid-wave, at the cost of standing
+   * still on the deck while a wave is out. Decide at leisure, then buy in one keypress
+   * when the wave ends. Same principle as contested repair saying CONTESTED rather than
+   * refusing — tell the player the trade instead of showing them nothing.
+   */
+  get browsing() {
+    return this.atTerminal;
+  }
+
+  /**
+   * Is a purchase legal right now?
+   *
+   * Three clauses, and each one is doing a different job:
+   *
+   *   AT THE TERMINAL — the spatial rule above. This is the one carrying "no spending
+   *   your way out of trouble", and it carries it visibly.
+   *
+   *   NO WAVE ACTIVELY OUT — rest, prep or a held siege, but not SPAWNING or ENGAGED.
+   *   This is what makes "sometimes it shows up while I am fighting" impossible rather
+   *   than merely unlikely: during a live wave the panel is readable and the keys are
+   *   dead, so there is nothing to be tempted by and nothing to panic-press.
+   *
+   *   NOTHING ON TOP OF YOU — the 6 m check from V3, kept. It almost never bites now,
+   *   because you are on the deck at a console between waves. When it does bite, a
+   *   boarder is standing next to you, which is a refusal the player can both see and
+   *   act on. That was the whole property V3 was reaching for.
+   *
+   * PREP IS BACK IN, AND THAT IS A DELIBERATE REVERSAL. Invariant 19b says the
+   * preparation window exists to make deploying an emitter a decision, and V2 excluded
+   * the shop from it on the grounds that a competing panel takes the preparation away.
+   * That argument was about a shop that appears ON ITS OWN. A terminal you have to walk
+   * to takes nothing: choosing to spend your prep window at the console instead of
+   * placing an emitter is exactly the kind of trade 19b wants to exist. The window
+   * roughly doubles — 10 s of rest plus 12 s of prep per wave — and none of it overlaps
+   * a live wave, which is the opposite of the trade V1 made.
    */
   get open() {
+    return this.atTerminal && this.safeMoment;
+  }
+
+  /**
+   * Is this a moment the crew can read something in at all?
+   *
+   * The two clauses that are about SAFETY rather than about place, factored out because
+   * two things need them and only one of those two should also need the terminal.
+   *
+   * The shop is a transaction and the pick is a gift. Making you walk to a console to
+   * spend money is the point — it is what gives buying a cost made of the pillar's own
+   * material. Making you walk to a console to collect a reward you already earned is
+   * just a tax on being handed something, and it would undo invariant 22f's whole
+   * argument that being given an item is a different beat from buying one.
+   *
+   * So `open` is `atTerminal && safeMoment`, and `pickOpen` is `pending && safeMoment`.
+   * One shared safety rule, one extra clause where it belongs. The alternative — two
+   * near-identical safety conditions — is the thing this file has already been burned by
+   * once: rules that mean roughly the same thing drift until the shop and the pick
+   * disagree about whether this second is safe, and that is unexplainable to a player.
+   */
+  get safeMoment() {
     const phase = this.director?.phase;
-    if (phase !== PHASE.REST && phase !== PHASE.HELD) return false;
+    if (phase === PHASE.SPAWNING || phase === PHASE.ENGAGED) return false;
     return !this.#crowded();
+  }
+
+  /**
+   * Why buying is refused, as something the player can act on.
+   *
+   * Three distinct answers rather than one, because "NOT BETWEEN WAVES" was being shown
+   * for every cause including causes that had nothing to do with waves. A refusal that
+   * misdescribes itself is worse than a silent one: it sends the player to fix the wrong
+   * thing. Each of these names a different action — go there, wait, or deal with that.
+   */
+  get closedReason() {
+    if (!this.atTerminal) return "NOT AT THE REFIT TERMINAL";
+    const phase = this.director?.phase;
+    if (phase === PHASE.SPAWNING || phase === PHASE.ENGAGED) return "NOT WHILE A WAVE IS OUT";
+    if (this.#crowded()) return "HOSTILES TOO CLOSE";
+    return "";
   }
 
   /** Is anything close enough to the operative to make reading a menu a bad idea? */
@@ -361,7 +448,7 @@ export class Economy {
     if (!item) return null;
 
     if (!this.open) {
-      this.blockedReason = "NOT BETWEEN WAVES";
+      this.blockedReason = this.closedReason;
       return null;
     }
     if (this.soldOut(index)) {
@@ -435,7 +522,7 @@ export class Economy {
     if (!this.modules) return null;
 
     if (!this.open) {
-      this.blockedReason = "NOT BETWEEN WAVES";
+      this.blockedReason = this.closedReason;
       return null;
     }
     if (!this.modules.canFit(index)) {
@@ -623,10 +710,15 @@ export class Economy {
    * health bars. The complaint about the shop was "I just spam buy items out of panic",
    * and the pick had the identical problem with none of the shop's protection.
    *
-   * So it waits for the same window the shop does, and deliberately the SAME getter
-   * rather than a second rule that means roughly the same thing: two nearly-identical
-   * safety conditions drift, and then the shop and the pick disagree about whether
-   * this moment is safe, which is unexplainable to a player.
+   * So it waits for the same SAFETY window the shop does, through the same getter rather
+   * than a second rule that means roughly the same thing: two nearly-identical safety
+   * conditions drift, and then the shop and the pick disagree about whether this moment
+   * is safe, which is unexplainable to a player.
+   *
+   * It does NOT wait for the shop's other clause. Buying happens at a terminal on the
+   * deck; a pick is handed to you wherever you are standing. Requiring a walk to collect
+   * a reward you already earned would undo 22f's argument that being given something is
+   * a different beat from buying it.
    *
    * PAUSING was the alternative and it is rejected. Co-op is the primary experience
    * and you cannot stop a horde game for one player's menu — Risk of Rain 2 and Deep
@@ -635,7 +727,7 @@ export class Economy {
    * cannot be stranded at the end of a biome.
    */
   get pickOpen() {
-    return this.pendingPick.length > 0 && this.open;
+    return this.pendingPick.length > 0 && this.safeMoment;
   }
 
   /**

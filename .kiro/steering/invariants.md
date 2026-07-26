@@ -313,12 +313,15 @@ can never spend is a menu, not a reward. The boss leg pays no pick for *holding*
 the cadence does pay during the boss siege, because there is still a titan to spend it
 on.
 
-**And the pick waits for the same window the shop does**, through the same getter rather
-than a second rule that means roughly the same thing. The pick panel is a 680 px menu of
-three items on the bottom-centre anchor and it used to appear the instant a pick was
-earned — which is the instant a wave resolves, frequently with the remains of that wave
+**And the pick waits for the same SAFETY window the shop does**, through the same getter
+rather than a second rule that means roughly the same thing. The pick panel is a 680 px
+menu of three items on the bottom-centre anchor and it used to appear the instant a pick
+was earned — which is the instant a wave resolves, frequently with the remains of that wave
 still on you. That is the shop's "I just spam buy items out of panic" with none of the
 shop's protection.
+
+It does **not** wait for the shop's place clause. See 23c: buying happens at a terminal,
+and a pick is handed to you wherever you are standing.
 
 Three things make the wait free rather than a punishment. The offer is **banked, never
 withdrawn**, so nothing is lost by not being ready. The keys are **not owned by it while
@@ -337,54 +340,128 @@ hold's payer was overwriting it. The cadence's payer already guarded against tha
 hold's did not.
 → tests 79, 96, 99
 
-**23. Buying happens between waves only, and "between waves" has to mean a moment you
-can actually READ a shop in.** Spending mid-fight would let a player purchase their way
-out of trouble and would drain the tension the siege is built on.
+**23. BUYING IS A PLACE, and between waves.** Spending mid-fight would let a player
+purchase their way out of trouble and would drain the tension the siege is built on.
 
-The second clause is the one a playtest added, and the numbers were worse than the
-complaint. The window used to be the rest *plus the preparation window*, and the rest
-permits `holdUntilCleared` — eight — enemies still alive. So a player could be fighting
-eight things, be told a named wave was inbound, and be shown a six-item shop, all at
-once, on a countdown. They panic-bought, which was the correct response.
+There is a refit terminal on the deck, starboard amidships, and the shop is where it is.
+Three clauses, each doing a different job:
 
-It is now the rest or a held siege, **and nothing alive within `repair.threatRange` of
-the OPERATIVE**. Three deliberate choices in that:
+- **At the terminal**, within `economy.terminalRange`. This is the clause that carries
+  "no spending your way out of trouble", and it carries it *visibly*.
+- **No wave actively out** — rest, prep or a held siege, but never SPAWNING or ENGAGED.
+- **Nothing within `repair.threatRange` of the operative.** Reused from the contested
+  repair rule rather than given its own number, because the two ask the same question and
+  two nearly-identical thresholds drift apart.
 
-- The preparation window is excluded because 19b already says what it is for. A shop
-  competing for it does not add an option, it takes the preparation away.
-- The safety test is NOT `director.calm`. That is the pacing threshold and is generous
-  on purpose, because reinforcements should not wait for a spotless field. Stragglers at
-  60 m are not a reason to keep your wallet shut.
-- And it asks about the **player**, not about the fortress. It reuses the 6 m the
-  contested-repair rule already owns, because the two are asking the same question — is
-  the operative under enough pressure that this job should not be going well — and two
-  nearly-identical safety thresholds drift apart.
+It took three tries to get here and the failures are the useful part:
 
-The second clause was first written as "nothing beneath the hull and nothing on the
-deck", which sounded better than it measured, and the measurement is the part worth
-keeping. **It cost a competent player exactly zero seconds and a struggling one up to a
-third of their window** — the player who most needs to buy something was the only one it
-locked out. It also varied unpredictably: two passes over the *same seeds* left 64% and
-97% of the rest available, because it depended on where the horde happened to be. A
-playtester could not use the shop and could not tell why, which is the real fault. "Some
-enemy is under the hull somewhere on a 26 m chassis" is not a state a player can see or
-fix in a second.
+- **V1** was rest + prep + the wave itself. "In the middle of the wave I am fighting, so I
+  just spam buy items out of panic."
+- **V2** was a rest with the fortress clear. Measured badly: **zero cost to a competent
+  player and up to a third of the window for a struggling one** — precisely backwards for a
+  rule meant to protect the player who is losing — varying 64% to 97% across two passes on
+  the *same seeds*, because it depended on where the horde happened to be. "Some enemy is
+  under the hull somewhere on a 26 m chassis" is not a state anyone can see or fix.
+- **V3** asked about the operative instead, at 6 m. Better, because you could satisfy it by
+  moving. But the next playtest reported the thing all three had in common: "it shows up a
+  short time and sometimes it shows up while I am fighting."
 
-The property the rule now has is that **you satisfy it by moving**. Step back and the
-shop opens. The fortress version could only be satisfied by finishing the fight, which
-is the same as saying it was not a rule the player could act on.
+That last report is the real fault, and no threshold fixes it. The shop was **push** — it
+appeared at you, on a clock you cannot see, and left on its own. `holdUntilCleared` is
+EIGHT, so a wave counts as resolved and the rest begins with eight enemies still alive; a
+proximity test only ever promised that none of them was on top of you.
 
-Measured before being trusted, because a window that reads well and never fires would be
-worse than the panic: about 52 s of shoppable time across a 152 s five-wave siege, in
-windows of roughly 12 s. A held siege has no timer, so the unhurried moment to spend a
-siege's earnings is right after holding one — which is where the money came from.
+A place fixes it, and it is the **depression-clamp lesson** applied to the economy. The gun
+was clamped to -12° to stop it shooting under the hull; the 3 m hull slab already did that,
+so the number came out and the rule became something a player can see. Here, "you cannot
+buy your way out of trouble" stops being a phase check and becomes geometry: the console is
+1.1 m above a deck 7.5 m above the sand, so nothing standing underneath is within 3 m of
+it, and the ground physically cannot shop. The config knob does not need to say "and you
+must be aboard" — the arithmetic already does, and a test asserts it rather than trusting
+two numbers in different files to stay in the right relationship.
 
-Note what that 52 s is: a **ceiling**, taken with a scripted defender that clears the
-field. For a safety rule the interesting number is the *floor* — what the struggling
-player gets — and that is exactly the number the first version got wrong while its
-ceiling looked fine. See the same trap from the other direction in `product.md` under
-the oracle defender.
-→ test 63
+It also gives buying a cost made of the pillar's own material: being at the console is
+being on the deck, not under the hull, and not at a gun.
+
+**WHERE it goes is the hard part, and it took four attempts.** A 26 × 16 m deck already
+carrying a mast, a reactor, two gun sponsons, three crates, an engine block and eight
+boarding-route exits has almost no free space, and each rejection was a real constraint
+discovered:
+
+| position | why it was wrong |
+|---|---|
+| (-5.6, 2.1) port amidships | 2.37 m from the deck spawn, **inside** the interaction radius, so the panel was up the instant the player appeared — the push behaviour it exists to remove |
+| (5.6, 2.1) starboard amidships | **1.5 m from a boarding route exit**, reactor corner 3.2 m off. The proximity clause would have fired permanently, and hardest for whoever was losing the boarding fight — V2's failure in a new costume |
+| (0, -4.1) centreline, forward of the mast | clears every route by 6.9 m and broke two movement tests instantly. Test 2's own comment says why: *"local z = -4 is the one lane clear of the mast, the crates, the bow step and the engine block"* |
+| **(4.05, 2.1, -7.65) bow bridge, outboard** | correct |
+
+The bridge works because it is a raised platform that **already exists**, so nothing new
+obstructs the deck floor at all — and hugging the outboard edge leaves a 1.0 m walkway
+inboard, so the route up the centreline step to the bow gun is untouched. It is also the
+most legible spot on the ship: raised, facing the deck, visible from most of the hull, which
+matters when it is the only way to buy anything.
+
+**And the proximity measurement is about the REACTOR, not the boarding routes.** A climber
+transiting a route passes within 6 m for a second or two and walks on, which is legible and
+harmless. A boarder *attacking the reactor* stops and stays, and that is what would keep the
+shop shut. The bridge is 10.8 m from the reactor's surface — the place attackers actually
+stand, per invariant 9. The comment that once defended the amidships position claimed "6.3 m
+from the reactor, deliberately marginal", and it was measuring to the reactor's **centre**,
+which nothing ever occupies, and had never looked at the climb routes at all.
+
+**PREP IS BACK IN, AND THAT IS A DELIBERATE REVERSAL OF V2.** 19b says the preparation
+window exists to make deploying an emitter a decision, and V2 excluded the shop on the
+grounds that a competing panel takes the preparation away. That argument was about a shop
+that appears *on its own*. A console you walk to takes nothing — choosing to spend prep at
+the terminal instead of placing an emitter is exactly the trade 19b wants to exist.
+
+**MEASURED AS A FLOOR THIS TIME, NOT A CEILING.** `minRest` is a guaranteed breather after
+every resolved wave and `prepTime` is a fixed timer; neither shortens because the fight is
+going badly. So the window is **22 s per wave and 110 s across a five-wave siege,
+guaranteed to every player regardless of skill** — against V2's 52 s that only a competent
+player ever saw. A held siege still has no timer at all, so the unhurried moment to spend a
+siege's earnings is right after holding one, which is where the money came from.
+
+**And WHICH clause refuses is measured too, because that is the whole question.** Camped at
+the console for a 400 s stretch with a deliberately weak defender — boarders let through,
+peak 3 riding the deck, the siege stalling at wave 4 — the split is **310 s refused by a
+live wave against 1.8 s by proximity, 0.6% of all refusals**. Six windows, about 15 s each.
+
+Two things fall out of that and both are the point. The refusal a player experiences is
+always "wait for the wave", which is predictable and legible. And **struggling does not
+shorten the window, it reduces the number of windows** — each one is still the full 22 s,
+because both phases are timers. That is the opposite of V2, where doing badly ate the window
+itself.
+
+Note the assertion does NOT claim proximity never fires. An earlier version did, and failed:
+a boarder does occasionally walk past the bridge. It claims proximity stays a rounding error
+next to the phase clause, which is a measurement rather than a hope.
+
+**23b. BROWSING AND BUYING ARE DIFFERENT QUESTIONS.** The panel is up whenever you are at
+the terminal, including mid-wave; only the keys wait. This is the fix for "it shows up a
+short time", and the diagnosis is that twelve seconds was never short because twelve
+seconds is short — it was short because the panel existed *only* while a purchase was
+legal, so the player spent the whole window reading six items of two lines each, cold, with
+no earlier moment in which to have read them. Reading and deciding now happen before the
+window; the window itself is one keypress.
+
+Browsing mid-wave costs standing still on the deck while a wave is out, which is a real
+price. And the panel must **say** which state it is in — title, dimmed list, grey key caps —
+because a panel headed REFIT that silently swallows every keypress is worse than one that
+is absent. Same principle as contested repair reporting CONTESTED rather than refusing:
+tell the player the trade.
+
+A refusal also names *which* clause refused — `NOT AT THE REFIT TERMINAL`, `NOT WHILE A
+WAVE IS OUT`, `HOSTILES TOO CLOSE`. One generic "NOT BETWEEN WAVES" was being shown for
+causes that had nothing to do with waves, and a refusal that misdescribes itself sends the
+player to fix the wrong thing.
+
+**23c. THE PICK IS NOT GATED ON THE PLACE, ONLY ON THE SAFETY.** `open` is
+`atTerminal && safeMoment`; `pickOpen` is `pending && safeMoment`. One shared safety
+getter, and the extra clause only where it belongs. Making you walk to a console to spend
+money is the point; making you walk to one to collect a reward you already earned would
+undo 22f's argument that being handed something is a different beat from buying it.
+→ test 63, test 84 for the locked panel, test 96 for the pick's half
 
 **24. Every kill pays, whatever killed it.** The hook is on `Horde.damage`, the one
 choke point all damage routes through, so a newly added weapon cannot silently pay
@@ -474,7 +551,12 @@ invisible.
 Galactic gives 15-20 s before a swarm so players can set defences; that window is
 what makes deployable emitters a decision rather than an afterthought. Calling a
 wave early with Q bypasses both the hold and the telegraph.
-→ tests 16, 51, 56
+
+The prep window is now also shoppable, and that reversal is recorded in 23. The rule this
+clause actually protects is "prep must be spent on a DECISION", and a shop that appears on
+its own competes with that while a console you walk to becomes one more thing to spend it
+on. What would still break 19b is a panel that arrives uninvited during prep.
+→ tests 16, 51, 56, 63
 
 **19c. Pacing is adaptive, so "buying time" is not measurable in wall-clock
 terms.** Killing enemies faster lowers pressure, which brings the next wave

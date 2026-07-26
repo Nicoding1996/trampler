@@ -1214,9 +1214,25 @@ export const CFG = {
 
     // Buying is a BETWEEN-WAVES act. Allowing it mid-fight would let players spend
     // their way out of trouble and would drain the tension the whole siege is
-    // built on. It also gives the preparation window a second job -- until now it
-    // only existed for placing emitters.
+    // built on.
     keys: ["Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6"],
+
+    // How close you have to stand to the refit terminal for it to be yours.
+    //
+    // Buying is now a PLACE as well as a time, and this is the radius of that place.
+    // 3.0 m rather than the repair rule's reach, because these are different jobs: a
+    // repair point is a spot you must occupy under fire, and a console is something you
+    // stand in front of and read. Generous enough that you do not have to hunt for a
+    // pixel, small enough that you cannot do it from the far side of the mast.
+    //
+    // Note what this number does NOT need to say: "and you must be aboard". The
+    // terminal sits 1.1 m above the deck and the ground is 7.5 m below it, so nothing
+    // within 3 m of it is standing on sand. The geometry already says it, the same way
+    // the hull slab already said "no shooting beneath yourself" and made the gun's
+    // depression clamp redundant. Test 100 asserts the ground really is out of reach,
+    // because a rule enforced by arithmetic nobody re-checks is a rule waiting to break
+    // when a number moves.
+    terminalRange: 3.0,
 
     // The shop sells a SUBSET of the catalogue, re-rolled at each landmark, and this
     // seeds which. Six keys against eighteen items is what forces it, and forcing it

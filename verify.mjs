@@ -17,7 +17,7 @@ import { Trampler } from "./src/trampler.js";
 import { Player } from "./src/player.js";
 import { Grapple } from "./src/grapple.js";
 import {
-  Horde, CHEWER, CLIMBER, BULWARK, BURROWER, SAPPER, TITAN, ENEMY_STATE,
+  Horde, CHEWER, CLIMBER, BULWARK, BURROWER, SAPPER, TITAN, ENEMY_STATE, isSubmerged,
 } from "./src/enemies.js";
 import { Director, PHASE } from "./src/waves.js";
 import { Weapon } from "./src/weapon.js";
@@ -1012,6 +1012,63 @@ function placeOnDeckLocal(sim, lx, ly, lz, faceX, faceZ) {
   sim.player.yaw = Math.atan2(-dir.x, -dir.z);
   sim.player.pitch = 0;
   step(sim, 20);
+}
+
+/**
+ * Arrange exactly the state the buy gate wants: the operative at the refit terminal, in
+ * a rest, with nothing near them.
+ *
+ * This exists because Update 1.7 made buying conditional on a PLACE, and a great many
+ * tests buy something as scaffolding rather than as their subject -- test 78 wants twelve
+ * stacks of an item so it can check a hyperbolic curve, and it does not care in the least
+ * where the operative is standing. Nine sections started failing at once.
+ *
+ * ARRANGED, NOT SIMULATED, which is the lesson tech.md already carries from the last time
+ * this gate tightened. The first repair back then added a `horde.clear()` and a `step()`,
+ * and the step let the director walk REST -> PREP and shut the window again, while also
+ * adding a frame of elapsed time to a test whose subject was an exact replay. Set the
+ * phase and the position directly; do not try to play your way into legality.
+ *
+ * Note it does NOT touch the purses. A test that wants to buy still has to afford it,
+ * because "can you pay for this" is a real question this must not answer for anybody.
+ */
+function shopReady(sim) {
+  // ONLY the position. It deliberately does not touch the director, and that is a
+  // correction rather than an omission: the first version also pinned
+  // `phase = REST, timer = 1e6` to guarantee legality, and it silently broke test 66 --
+  // a pinned rest never advances, so no wave ever spawned, nothing attacked the legs,
+  // and "automation held the line" fired as an invariant-2b failure that had nothing to
+  // do with automation. A helper that arranges more than it needs to becomes a second,
+  // invisible author of every test that calls it.
+  //
+  // Not touching it is also sufficient. A fresh sim opens in REST with `firstDelay` on
+  // the clock, and the only phases that refuse a purchase are SPAWNING and ENGAGED, so
+  // any test that buys near the start of a sim is already legal on the phase clause.
+  const t = sim.trampler;
+  placeOnDeckLocal(sim, t.terminalLocal.x, 1.2, t.terminalLocal.z, 0, -1);
+  return sim;
+}
+
+/**
+ * The same arrangement with NO elapsed time at all.
+ *
+ * `placeOnDeckLocal` runs 20 settling frames so the operative is genuinely standing on
+ * the deck rather than hovering at a computed point, which is right nearly everywhere and
+ * wrong in exactly one place: test 82's subject is an exact replay, and its comments
+ * already record that a single frame between the horde clear and the purchase both let the
+ * director walk REST -> PREP and added elapsed time to the thing being measured.
+ *
+ * So this writes the position and the base outright. Nothing here needs settling, because
+ * nothing here is being asked to move.
+ */
+function shopReadyNoStep(sim) {
+  const t = sim.trampler;
+  sim.player.position.copy(
+    t.localToWorld(new THREE.Vector3(t.terminalLocal.x, 1.2, t.terminalLocal.z)));
+  sim.player.base = t;
+  sim.player.velocity.set(0, 0, 0);
+  sim.player.cancelMantle();
+  return sim;
 }
 
 /** Jump at a ledge and report whether we ended up standing on top of it. */
@@ -2744,6 +2801,10 @@ console.log("\n62. Refits apply, escalate in price, and respect their bounds");
 
   economy.salvage = 100000;
   economy.scrap = 100000;
+  // Buying is a place as well as a time now. This section's subject is what a refit
+  // DOES, so the gate is scaffolding here and gets arranged rather than exercised;
+  // test 63 owns the gate itself.
+  shopReady(sim);
 
   const baseDamage = weapon.damageScale;
   const firstCost = economy.costOf(idx.rifle);
@@ -2792,101 +2853,207 @@ console.log("\n62. Refits apply, escalate in price, and respect their bounds");
 }
 
 // ---------------------------------------------------------------------------
-console.log("\n63. Buying is a between-waves act only");
+console.log("\n63. Buying happens at a PLACE, and between waves");
 {
   const sim = makeSim();
-  const { economy, director } = sim;
+  const { economy, director, trampler } = sim;
   sim.waves = true;
   economy.salvage = 100000;
   economy.scrap = 100000;
 
-  ok("the shop is open during the opening rest", economy.open,
-    `phase ${director.phase}`);
+  // ---- the terminal is somewhere, and the deck spawn is NOT it.
+  //
+  // This check exists because the first placement failed it. The console sat 2.37 m from
+  // the deck spawn, inside the 3 m radius, so the panel was up the instant the player
+  // appeared -- which is precisely the push behaviour the terminal exists to remove. A
+  // shop you spawn inside is a shop that came to you.
+  const spawnToTerminal = trampler.localToWorld(new THREE.Vector3(-4.5, 1.2, 0))
+    .distanceTo(trampler.terminalWorld(new THREE.Vector3()));
+  ok("the terminal is a real trip from where you spawn, not somewhere you start",
+    spawnToTerminal > CFG.economy.terminalRange,
+    `${spawnToTerminal.toFixed(1)} m across the deck vs a ${CFG.economy.terminalRange} m radius`);
 
-  // Run until a wave is actually on the field.
+  // ---- AND IT IS NOT PARKED WHERE BOARDERS STOP.
+  //
+  // The proximity clause closes the shop when something is within `repair.threatRange` of
+  // the operative, so where the console sits decides whether that clause fires
+  // occasionally or permanently. A permanent version would be invariant 23's V2 failure in
+  // a new costume: a lockout that scales with how badly the boarding fight is going is
+  // aimed squarely at whoever needs the shop most.
+  //
+  // THE REACTOR IS THE MEASUREMENT, not the climb routes. A climber transiting a route
+  // passes within 6 m for a second or two and then walks on, which is legible and
+  // harmless. A boarder ATTACKING THE REACTOR stops and stays, and that is what would keep
+  // the shop shut. So the assertion is about the reactor's surface — the place attackers
+  // actually stand, per invariant 9 — rather than about its centre. The comment defending
+  // an earlier placement said "6.3 m from the reactor, deliberately marginal" and was
+  // measuring to the centre, which nothing ever occupies.
+  const term = trampler.terminalWorld(new THREE.Vector3());
+  const reach = CFG.repair.threatRange;
+  const reactorSurface = trampler.reactorSurfaceWorld(term, new THREE.Vector3());
+  ok("the console is well clear of the reactor, which is where boarders stop and stay",
+    term.distanceTo(reactorSurface) > reach * 1.5,
+    `${term.distanceTo(reactorSurface).toFixed(1)} m to the reactor surface,`
+    + ` against a ${reach} m proximity threshold`);
+
+  // Recorded rather than required, because transit is not a lockout. It is worth PRINTING
+  // so the next person moving this thing can see what they are walking into: the run that
+  // rejected the starboard-amidships spot showed 1.50 m here.
+  const exits = trampler.climbRoutes.map(
+    (r) => term.distanceTo(trampler.localToWorld(r.end.clone())));
+  ok("there are boarding routes to be measured against (test is not vacuous)",
+    trampler.climbRoutes.length >= 8, `${trampler.climbRoutes.length} boarding routes`);
+  ok("and it is not sitting on top of a boarding route exit either",
+    Math.min(...exits) > CFG.economy.terminalRange,
+    `nearest of ${exits.length} exits is ${Math.min(...exits).toFixed(1)} m`
+    + ` (a rejected placement measured 1.5 m here)`);
+
+  // A gun seat must not be inside the console's own radius, or manning the gun would open
+  // the shop and "spend the telegraph on the gun or on the shop" stops being a choice.
+  for (const m of CFG.deckGun.mounts) {
+    const op = trampler.localToWorld(new THREE.Vector3(...m.operatorLocal));
+    ok(`${m.name}'s seat is outside the console's radius, so you cannot be at both`,
+      term.distanceTo(op) > CFG.economy.terminalRange,
+      `${term.distanceTo(op).toFixed(1)} m from the ${m.name} seat`
+      + ` vs a ${CFG.economy.terminalRange} m radius`);
+  }
+
+  // ---- and the GROUND cannot reach it. This is the clause carrying invariant 23's
+  // "no spending your way out of trouble", and it is carried by geometry rather than by
+  // a phase check: the console is 1.1 m above a deck that is 7.5 m above the sand, so
+  // nothing standing underneath is within 3 m of it. Asserted rather than assumed,
+  // because that is arithmetic between two numbers in different files, and the config
+  // comment for `terminalRange` makes a promise about it.
+  placeOnGroundAt(sim, 0, 0);
+  step(sim, 2);
+  ok("standing under the hull cannot reach the terminal, so the ground cannot shop",
+    !economy.atTerminal && !economy.open,
+    `${trampler.terminalWorld(new THREE.Vector3()).distanceTo(sim.player.position).toFixed(1)} m`
+    + ` from the console, atTerminal ${economy.atTerminal}`);
+  ok("and the refusal names the reason, which is a place rather than a time",
+    economy.buy(0) === null && economy.blockedReason === "NOT AT THE REFIT TERMINAL",
+    `"${economy.blockedReason}"`);
+
+  // ---- standing at it during the opening rest is the whole happy path.
+  placeOnDeckLocal(sim, trampler.terminalLocal.x, 1.2, trampler.terminalLocal.z, 0, -1);
+  step(sim, 2);
+  ok("walking to it during a rest opens the shop", economy.atTerminal && economy.open,
+    `phase ${director.phase}, atTerminal ${economy.atTerminal}`);
+
+  // Run until a wave is actually on the field, holding the player at the console the
+  // whole time. The player is deliberately NOT moved away: the question is whether the
+  // phase clause bites on its own, and letting them wander would let the place clause
+  // answer for it.
   let sawSpawning = false;
   let boughtWhileEngaged = null;
   let openWhileFighting = true;
+  let readableWhileFighting = false;
   step(sim, 60 * 90, () => {
+    placeOnDeckLocal(sim, trampler.terminalLocal.x, 1.2, trampler.terminalLocal.z, 0, -1);
     if (director.phase === PHASE.SPAWNING || director.phase === PHASE.ENGAGED) {
       sawSpawning = true;
       if (economy.open) openWhileFighting = false;
+      if (economy.browsing) readableWhileFighting = true;
       if (boughtWhileEngaged === null) boughtWhileEngaged = economy.buy(0);
     }
   });
 
   ok("a wave did arrive (test is not vacuous)", sawSpawning);
-  ok("the shop closes once a wave is out", openWhileFighting);
+  ok("standing at the console while a wave is out does NOT let you buy", openWhileFighting);
   ok("and buying mid-wave is refused", boughtWhileEngaged === null);
-  ok("with a reason given", economy.blockedReason === "NOT BETWEEN WAVES",
-    economy.blockedReason);
+  ok("with a reason that says which of the three clauses refused",
+    economy.blockedReason === "NOT WHILE A WAVE IS OUT", economy.blockedReason);
 
-  // ---- and "between waves" has to mean a moment you can READ a shop in.
+  // ---- but it is still READABLE, and that is the fix for "it shows up a short time".
   //
-  // A playtester panic-bought and said why: "in the middle of the wave I am fighting."
-  // They were right. The window used to be REST + PREP, and REST permits
-  // holdUntilCleared -- eight -- enemies still alive, while PREP is the telegraphed
-  // warning that a named wave is inbound. Eight hostiles, an incoming-wave banner, and
-  // a six-item shop, on a countdown.
+  // Twelve seconds was never short because twelve seconds is short. It was short because
+  // the panel only ever existed while a purchase was legal, so the player spent the
+  // window READING six items with two lines each, cold. Browsing mid-wave costs standing
+  // still on the deck while a wave is out, which is a real price, and it means the
+  // window itself is spent deciding rather than reading.
+  ok("but it IS readable while a wave is out, so the window is spent deciding not reading",
+    readableWhileFighting,
+    `browsing ${economy.browsing}, open ${economy.open} -- read now, buy when it lands`);
+
+  // ---- THE TELEGRAPH WINDOW IS SHOPPING TIME AGAIN, AND THAT IS A REVERSAL.
+  //
+  // The previous version asserted the opposite, and it was right to at the time: a shop
+  // that appears ON ITS OWN during the preparation window competes with 19b's whole
+  // purpose, which is the moment deploying an emitter becomes a decision. It does not
+  // add an option, it takes the preparation away.
+  //
+  // A console you have to WALK TO takes nothing. Choosing to spend your prep window at
+  // the terminal instead of placing an emitter is exactly the kind of trade 19b wants to
+  // exist, and it doubles the window -- 10 s of rest plus 12 s of prep -- without any of
+  // it overlapping a live wave. That is the opposite of the trade the first version made.
   const w = makeSim();
   w.trampler.walking = false;
   w.trampler.turning = false;
   w.economy.salvage = 100000;
+  const atConsole = () => placeOnDeckLocal(
+    w, w.trampler.terminalLocal.x, 1.2, w.trampler.terminalLocal.z, 0, -1);
 
-  // The preparation window is for PREPARING. Invariant 19b is explicit about what it
-  // buys -- the moment deploying an emitter becomes a decision -- and a shop competing
-  // for it does not add an option, it takes the preparation away.
+  atConsole();
   w.director.phase = PHASE.PREP;
   w.director.timer = CFG.waves.prepTime;
   step(w, 1);
-  ok("the telegraph window is not shopping time, because it is preparation time",
-    !w.economy.open, `phase ${w.director.phase}, open ${w.economy.open}`);
+  atConsole();
+  w.director.phase = PHASE.PREP;
+  w.director.timer = CFG.waves.prepTime;
+  ok("the telegraph window IS shopping time now, because you had to walk there for it",
+    w.economy.open, `phase ${w.director.phase}, open ${w.economy.open}`);
 
   // A rest with something in your face is not a rest. Note this is deliberately NOT
   // director.calm: that is the PACING threshold and is generous on purpose, because
   // reinforcements should not wait for a spotless field.
   //
-  // It is also deliberately not asked about the FORTRESS any more. The first version of
-  // this rule was "nothing beneath the hull and nothing on the deck", and it measured
-  // badly: zero cost to a competent player, up to a third of the window for a
-  // struggling one, and varying unpredictably between runs (64% and 97% of the rest
-  // available across two passes on the same seeds) because it depended on where the
-  // horde happened to be. A playtester could not use the shop and could not tell why,
-  // which is the real fault: "something is under the hull somewhere on a 26 m chassis"
-  // is not a state you can see or fix in a second.
+  // It is also deliberately not asked about the FORTRESS. That version measured badly:
+  // zero cost to a competent player, up to a third of the window for a struggling one,
+  // and varying unpredictably between runs (64% and 97% of the rest available across two
+  // passes on the same seeds) because it depended on where the horde happened to be. A
+  // playtester could not use the shop and could not tell why, which is the real fault.
   //
-  // Now it asks about the OPERATIVE, at the same 6 m the contested-repair rule uses.
-  // The property that matters is that it is a rule you satisfy by MOVING.
+  // It asks about the OPERATIVE, at the same 6 m the contested-repair rule uses. On the
+  // deck at a console between waves this almost never bites -- and when it does, a
+  // boarder is standing next to you, which is a refusal you can see and shoot.
   w.director.phase = PHASE.REST;
   w.director.timer = CFG.waves.minRest;
-  placeOnGroundAt(w, 0, -30);
-  w.director.phase = PHASE.REST;
-  w.director.timer = CFG.waves.minRest;
+  atConsole();
   step(w, 2);
-  ok("a rest with nobody on top of you IS shopping time (test is not vacuous)",
+  atConsole();
+  w.director.phase = PHASE.REST;
+  w.director.timer = CFG.waves.minRest;
+  ok("a rest at the console with nobody on top of you IS shopping time (not vacuous)",
     w.economy.open, `${w.horde.liveCount} alive, open ${w.economy.open}`);
 
-  const near = w.horde.spawn(CHEWER);
+  // A boarder beside you at the console. This is the case that still matters, because it
+  // is the one that can actually happen now: the terminal sits 6.3 m from the reactor,
+  // which is where boarders go.
+  const near = w.horde.spawn(CLIMBER);
   near.x = w.player.position.x + 1.5;
   near.y = w.player.position.y;
   near.z = w.player.position.z;
-  step(w, 2);
-  ok("something in your face closes it, because that is what you should be dealing with",
-    !w.economy.open && w.economy.buy(0) === null,
+  near.onHull = true;
+  ok("a boarder beside you closes it, because that is what you should be dealing with",
+    !w.economy.open && w.economy.buy(0) === null
+    && w.economy.closedReason === "HOSTILES TOO CLOSE",
     `nearest ${Math.hypot(near.x - w.player.position.x, near.z - w.player.position.z).toFixed(1)} m,`
-    + ` open ${w.economy.open}, refused with "${w.economy.blockedReason}"`);
+    + ` refused with "${w.economy.blockedReason}"`);
 
-  // THE PROPERTY THE OLD RULE DID NOT HAVE: you can fix this yourself, immediately, by
-  // stepping away. The fortress version could only be satisfied by finishing the fight.
-  near.x = w.player.position.x + CFG.repair.threatRange * 3;
-  step(w, 2);
-  ok("and stepping away re-opens it, which the fortress version could never do",
+  // AND THE REFUSAL IS STILL FIXABLE BY YOU. Killing it, or stepping along the deck, both
+  // work -- unlike the fortress version, which could only be satisfied by ending the
+  // fight. Driven by moving the enemy rather than the player so the player stays in
+  // terminal range and the PLACE clause cannot answer for the proximity clause.
+  near.x = w.player.position.x + CFG.repair.threatRange * 2;
+  ok("and dealing with it re-opens it immediately",
     w.economy.open,
     `nearest now ${Math.hypot(near.x - w.player.position.x, near.z - w.player.position.z).toFixed(1)} m`
     + ` vs a ${CFG.repair.threatRange} m threshold`);
 
-  // Something chewing a leg on the far side of the hull is NOT your problem this second,
-  // and must not hold your wallet shut. This is the case the old rule got wrong.
+  // Something chewing a leg under the hull is NOT your problem while you are at the
+  // console, and must not hold your wallet shut. This is the case the fortress version
+  // got wrong, and the geometry now makes it impossible to get wrong: the ground is 8.6 m
+  // below the terminal, so nothing down there is ever inside 6 m of a shopper.
   w.horde.clear();
   const farLeg = w.horde.spawn(CHEWER);
   const spot = w.trampler.legAttackWorld(3, new THREE.Vector3());
@@ -2894,13 +3061,12 @@ console.log("\n63. Buying is a between-waves act only");
   farLeg.y = spot.y;
   farLeg.z = spot.z;
   step(w, 4);
-  ok("a chewer under the hull but nowhere near you registers (test is not vacuous)",
-    (w.horde.underHull ?? 0) > 0
-    && Math.hypot(farLeg.x - w.player.position.x, farLeg.z - w.player.position.z)
-      > CFG.repair.threatRange,
-    `${w.horde.underHull} under the hull,`
-    + ` ${Math.hypot(farLeg.x - w.player.position.x, farLeg.z - w.player.position.z).toFixed(1)} m away`);
-  ok("and no longer locks the shop -- the old rule's worst case, now fixed",
+  atConsole();
+  w.director.phase = PHASE.REST;
+  w.director.timer = CFG.waves.minRest;
+  ok("a chewer under the hull genuinely registers (test is not vacuous)",
+    (w.horde.underHull ?? 0) > 0, `${w.horde.underHull} under the hull`);
+  ok("and it does not lock the shop -- the fortress rule's worst case, now structural",
     w.economy.open, `open ${w.economy.open}`);
 
   // Stragglers out in the open are NOT a reason to keep your wallet shut either. The
@@ -2911,22 +3077,159 @@ console.log("\n63. Buying is a between-waves act only");
   distant.z = w.trampler.group.position.z;
   distant.y = 0.8;
   step(w, 2);
+  atConsole();
+  w.director.phase = PHASE.REST;
+  w.director.timer = CFG.waves.minRest;
   ok("nor does a hostile out at range, or one straggler would lock a whole siege",
     w.economy.open && (w.horde.liveCount ?? 0) > 0,
     `${w.horde.liveCount} alive, open ${w.economy.open}`);
 
-  // A burrower is underground and cannot touch you, so it must not hold the shop shut.
-  // Same exclusion the pacing pressure count makes, and for the same reason.
-  w.horde.clear();
-  const under = w.horde.spawn(BURROWER);
-  under.x = w.player.position.x + 1;
-  under.y = -CFG.enemies.burrower.height;
-  under.z = w.player.position.z;
-  step(w, 1);
-  ok("and a burrower beneath your feet does not, because it cannot reach you",
-    w.economy.open && (w.horde.burrowed ?? 0) > 0,
-    `${w.horde.burrowed} burrowed at ${Math.hypot(under.x - w.player.position.x, under.z - w.player.position.z).toFixed(1)} m,`
-    + ` open ${w.economy.open}`);
+  // ---- the terminal is hull-local, so it tracks a walking, turning fortress.
+  //
+  // Invariant 5, and it is not a formality here: a world-space console would be four
+  // metres astern within a second and the shop would open and close as the fortress
+  // walked out from under it. Asserted by letting the hull travel a long way with the
+  // player parked at the console in LOCAL space.
+  const moving = makeSim();
+  moving.economy.salvage = 100000;
+  moving.director.phase = PHASE.REST;
+  moving.director.timer = 1e6;
+  const startWorld = moving.trampler.terminalWorld(new THREE.Vector3()).clone();
+  let openEveryFrame = true;
+  for (let i = 0; i < 60 * 8; i++) {
+    placeOnDeckLocal(
+      moving, moving.trampler.terminalLocal.x, 1.2, moving.trampler.terminalLocal.z, 0, -1);
+    step(moving, 1);
+    moving.director.phase = PHASE.REST;
+    moving.director.timer = 1e6;
+    if (!moving.economy.atTerminal) openEveryFrame = false;
+  }
+  const travelled = moving.trampler.terminalWorld(new THREE.Vector3()).distanceTo(startWorld);
+  ok("the fortress really moved the console through the world (test is not vacuous)",
+    travelled > 20, `${travelled.toFixed(1)} m of world travel`);
+  ok("and the terminal stayed reachable throughout, because it is stored hull-local",
+    openEveryFrame, `atTerminal held for ${60 * 8} frames across ${travelled.toFixed(1)} m`);
+
+  // ---- AND ACROSS A REAL SIEGE, WITH BOARDERS ABOARD, THE PROXIMITY CLAUSE NEVER FIRES
+  // AT THE BRIDGE.
+  //
+  // This is measured rather than reasoned because I have now been wrong about it twice by
+  // reasoning. The question is which clause actually does the refusing when a player camps
+  // the console through a whole siege: if it is the phase clause, the rule is "wait for the
+  // wave to end", which is legible and is the design. If it is the proximity clause, the
+  // rule is "some enemy is near you", which is the thing invariant 23's V2 was rejected for.
+  //
+  // The defender here is deliberately NOT an oracle. One kill every 45 frames is a single
+  // rifle working steadily, which resolves waves without clearing them instantly. An
+  // oracle would empty the field and report a proximity clause that never fires because
+  // there is nothing left to fire it — the exact ceiling-for-a-floor mistake this file
+  // already carries a lesson about.
+  const live = makeSim();
+  live.waves = true;
+  live.economy.salvage = 1e6;
+  let openFrames = 0;
+  let phaseBlocked = 0;
+  let crowdBlocked = 0;
+  let windows = 0;
+  let wasOpen = false;
+  let peakAboard = 0;
+  let sawUnderHull = 0;
+
+  for (let i = 0; i < 60 * 400 && !live.director.held; i++) {
+    // Camped at the console for the whole siege, in hull-local terms.
+    shopReadyNoStep(live);
+    step(live, 1, () => {
+      if (i % 45 !== 0) return;
+      // NEVER shoot something mid-climb, so boarders actually arrive. Two earlier
+      // versions of this hook failed the vacuity check with `peakAboard === 0`: taking
+      // the oldest live enemy, and then taking the oldest non-aboard one, both picked
+      // climbers off on the way up. Nothing reached the deck, so "even with boarders
+      // aboard" was measuring a deck with no boarders on it.
+      //
+      // Ground threats otherwise, and aboard ones once a couple are riding. Letting two
+      // ride is the honest worst case for a rule about things being near the shopper: it
+      // models a crew that answers boarders eventually rather than instantly.
+      const aboard = live.horde.aboard ?? 0;
+      let best = null;
+      for (const e of live.horde.pool) {
+        if (!e.alive || isSubmerged(e)) continue;
+        if (aboard >= 2) {
+          if (!e.onHull) continue;
+        } else if (e.state !== ENEMY_STATE.HUNT_LEG) {
+          continue;
+        }
+        best = e;
+        break;
+      }
+      if (best) live.horde.damage(best, 1e6, "player");
+    });
+    // The fortress is kept walking, because an immobilised one halts the pacing outright
+    // (invariant 19) and the siege would stop progressing -- which would measure the
+    // director stalling rather than the shop's clauses.
+    live.trampler.repairAll();
+
+    peakAboard = Math.max(peakAboard, live.horde.aboard ?? 0);
+    sawUnderHull = Math.max(sawUnderHull, live.horde.underHull ?? 0);
+
+    const isOpen = live.economy.open;
+    if (isOpen) {
+      openFrames++;
+      if (!wasOpen) windows++;
+    } else if (live.director.phase === PHASE.SPAWNING || live.director.phase === PHASE.ENGAGED) {
+      phaseBlocked++;
+    } else {
+      crowdBlocked++;
+    }
+    wasOpen = isOpen;
+  }
+
+  const total = openFrames + phaseBlocked + crowdBlocked;
+  const blocked = phaseBlocked + crowdBlocked;
+  ok("boarders really did ride the deck while shopping was attempted (not vacuous)",
+    peakAboard > 0 && sawUnderHull > 0 && windows > 0,
+    `peak ${peakAboard} aboard, ${sawUnderHull} under the hull, wave ${live.director.wave}`
+    + ` after ${(total / 60).toFixed(0)} s`);
+  ok("the shop opened repeatedly, not once",
+    windows >= 3,
+    `${windows} separate windows over ${(total / 60).toFixed(0)} s,`
+    + ` ${(openFrames / 60).toFixed(0)} s open (${Math.round((openFrames / total) * 100)}%),`
+    + ` about ${(openFrames / 60 / windows).toFixed(0)} s each`);
+
+  // The claim asserted here is NOT "proximity never fires". It does fire -- measured at
+  // 1.8 s in 400 s, when a boarder happens to walk past the bridge -- and an earlier
+  // version of this check demanded zero and failed, which is the right outcome for a
+  // check that asserts a hope instead of a measurement.
+  //
+  // The property that matters is that the WAVE is what refuses, essentially always. If
+  // proximity ever became a material share of the blocked time, the console would be back
+  // in the traffic and the refusal would be back to something the player cannot predict.
+  ok("and the thing that refuses is the WAVE, with proximity a rounding error",
+    crowdBlocked < blocked * 0.05,
+    `${(phaseBlocked / 60).toFixed(0)} s blocked by a live wave vs`
+    + ` ${(crowdBlocked / 60).toFixed(1)} s by proximity`
+    + ` (${((crowdBlocked / blocked) * 100).toFixed(1)}% of refusals)`);
+
+  // ---- THE WINDOW, MEASURED AS A FLOOR RATHER THAN AS A CEILING.
+  //
+  // The previous version of this rule was reported as "52 s of shoppable time per
+  // five-wave siege", and that number was a ceiling taken with a scripted defender that
+  // clears the field. The clause being measured only ever bit when the field was NOT
+  // clear, so the probe was structurally incapable of reporting the thing that mattered.
+  // A competent player saw all 52 s and a struggling one saw a third less, which is
+  // exactly backwards for a rule meant to protect the player who is losing.
+  //
+  // The phase clause can be measured as a floor instead, and that is why it is worth
+  // having. `minRest` is a GUARANTEED breather after every resolved wave (19b) and
+  // `prepTime` is a FIXED telegraph timer — neither shortens because the fight is going
+  // badly, so this is time every player gets, not time a good player gets.
+  const perWave = CFG.waves.minRest + CFG.waves.prepTime;
+  ok("the guaranteed window per wave is both phases, and neither can be cut short",
+    perWave >= 20 && CFG.waves.minRest > 0 && CFG.waves.prepTime > 0,
+    `${CFG.waves.minRest} s rest + ${CFG.waves.prepTime} s prep = ${perWave} s per wave,`
+    + ` ${perWave * CFG.waves.siegeLength} s across a ${CFG.waves.siegeLength}-wave siege`);
+  ok("which is at least double the rest-only window it replaced",
+    perWave >= CFG.waves.minRest * 2,
+    `${perWave} s vs ${CFG.waves.minRest} s of rest alone`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2989,6 +3292,7 @@ console.log("\n65. A restart wipes the purses AND reverts every upgrade");
 
   economy.salvage = 100000;
   economy.scrap = 100000;
+  shopReady(sim);
   for (const id of ["rifle", "vitals", "plating", "rig"]) economy.buy(idx[id]);
 
   ok("upgrades were in place before the reset",
@@ -3023,6 +3327,7 @@ console.log("\n66. Even fully refitted, automation cannot hold the line alone");
   const idx = Object.fromEntries(CFG.economy.catalogue.map((c, i) => [c.id, i]));
 
   economy.scrap = 100000;
+  shopReady(sim);
   for (let i = 0; i < 20; i++) economy.buy(idx.plating);
   for (let i = 0; i < 20; i++) economy.buy(idx.rig);
   ok("the fortress is fully refitted (test is not vacuous)",
@@ -3219,6 +3524,31 @@ console.log("\n67. The HUD is wired to markup that exists, and panels do not pil
       sharers.length
         ? `${id}@${zone} IS COVERED BY ${sharers.map((s) => `${s}@${zoneOf(s)}`).join(", ")}`
         : `${id} owns ${zone} outright`);
+  }
+
+  // ---- and nothing edge-pinned may hang off the edge it is pinned to.
+  //
+  // Added because a playtest screenshot appeared to show the vitals panel's labels cut
+  // off on the left — "ATIVE", "ILES" — right after it was moved to that corner. It was
+  // the screen capture being cropped rather than the layout, but the class of bug is real
+  // and free to rule out: an edge offset of zero or less puts a bordered, clipped-corner
+  // panel flush against the frame, and a negative one hangs it off. Nothing in the CSS
+  // stops that being typed, and the harness cannot see a rendered pixel.
+  //
+  // Percentage offsets are skipped: `50%` is the centring idiom and is handled by the
+  // zone check above, and `top: 8%` is a proportion rather than a gap.
+  for (const id of boxIds) {
+    const body = ruleOf(id);
+    const bad = ["left", "right", "top", "bottom"]
+      .map((side) => {
+        const m = body.match(new RegExp(`(?:^|;|\\s)${side}:\\s*(-?[\\d.]+)px`));
+        return m ? { side, px: Number(m[1]) } : null;
+      })
+      .filter((v) => v && v.px < 8);
+    ok(`${id} sits clear of the frame edge it is pinned to`, bad.length === 0,
+      bad.length
+        ? `${bad.map((v) => `${v.side}: ${v.px}px`).join(", ")} — too close to clear the border`
+        : "inset");
   }
 }
 
@@ -3872,6 +4202,9 @@ console.log("\n76. Fortress modules are bounded, permanent, and fully revertible
 {
   const sim = makeSim();
   const { trampler, horde, emitters, guns, modules, economy } = sim;
+  // Fitting a module goes through buyModule, which is gated at the terminal like every
+  // other transaction. This section's subject is what the six modules DO.
+  shopReady(sim);
 
   ok("there are fewer sockets than modules, so fitting is a choice",
     modules.sockets.length < modules.catalogue.length,
@@ -3904,6 +4237,7 @@ console.log("\n76. Fortress modules are bounded, permanent, and fully revertible
   const fitOne = (id) => {
     const s = makeSim();
     s.economy.scrap = 100000;
+    shopReady(s); // its own sim, so it needs its own operative at its own console
     const i = s.modules.catalogue.findIndex((m) => m.id === id);
     return { s, fitted: s.economy.buyModule(i) };
   };
@@ -3994,6 +4328,10 @@ console.log("\n77. Fully refitted AND fully moduled, automation still cannot hol
 
   economy.scrap = 100000;
   economy.salvage = 100000;
+  // Arranged at the terminal to do the buying. The player is removed from the fight
+  // entirely further down, which is the whole point of the section -- so this has to
+  // happen first, and the removal has to happen after.
+  shopReady(sim);
 
   const refit = Object.fromEntries(CFG.economy.catalogue.map((c, i) => [c.id, i]));
   for (let i = 0; i < 20; i++) economy.buy(refit.plating);
@@ -4086,6 +4424,9 @@ console.log("\n78. Personal upgrades stack forever without ever breaking");
   const idx = Object.fromEntries(CFG.economy.catalogue.map((c, i) => [c.id, i]));
 
   economy.salvage = 1e9;
+  // Twelve stacks of an item, to check a hyperbolic curve. Where the operative happens
+  // to be standing could not matter less to that question, so the gate is arranged.
+  shopReady(sim);
 
   const personal = CFG.economy.catalogue.filter((c) => c.pool === "salvage");
   ok("there are several personal upgrades, not just damage", personal.length >= 4,
@@ -4097,6 +4438,7 @@ console.log("\n78. Personal upgrades stack forever without ever breaking");
   const rateAt = (n) => {
     const s = makeSim();
     s.economy.salvage = 1e9;
+    shopReady(s);
     for (let i = 0; i < n; i++) s.economy.buy(idx.trigger);
     return s.weapon.fireRateScale;
   };
@@ -4115,6 +4457,7 @@ console.log("\n78. Personal upgrades stack forever without ever breaking");
   const takenAt = (n) => {
     const s = makeSim();
     s.economy.salvage = 1e9;
+    shopReady(s);
     for (let i = 0; i < n; i++) s.economy.buy(idx.weave);
     return s.player.damageScale;
   };
@@ -4130,6 +4473,7 @@ console.log("\n78. Personal upgrades stack forever without ever breaking");
   // The hyperbolic resistance has to actually reach the player's health.
   const s = makeSim();
   s.economy.salvage = 1e9;
+  shopReady(s);
   for (let i = 0; i < 6; i++) s.economy.buy(idx.weave);
   s.player.spawnGrace = 0;
   const hpBefore = s.player.hp;
@@ -4152,6 +4496,7 @@ console.log("\n78. Personal upgrades stack forever without ever breaking");
   // Vitals must heal on purchase, or it is useless in the moment you buy it.
   const s2 = makeSim();
   s2.economy.salvage = 1e9;
+  shopReady(s2);
   s2.player.hp = 40;
   const maxBefore = s2.player.maxHp;
   s2.economy.buy(idx.vitals);
@@ -4660,6 +5005,9 @@ console.log("\n82. A full restart replays the same run, modules and roads includ
   // shutting the window again -- and would add an extra frame of elapsed time to a
   // test whose entire subject is an exact replay.
   sim.horde.clear();
+  // Buying is a place now, and this has to reach it without spending a frame. See
+  // `shopReadyNoStep` for why that matters here and nowhere else.
+  shopReadyNoStep(sim);
   sim.economy.buy(0);
   sim.economy.buyModule(0);
   sim.run.threatScale = 1.5;
@@ -4998,8 +5346,13 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     const failures = [];
     const push = (e) => { if (e) failures.push(e); };
 
-    // ---- resting, so the refit panel is open
-    push(drive("rest"));
+    // ---- resting AND standing at the refit terminal, so the refit panel is open.
+    //
+    // The console is the gate now, so the HUD's shop branch is unreachable without it.
+    // Re-applied inside the drive hook rather than once before it, because `drive` steps
+    // the real simulation and a walking deck would otherwise carry the operative out of
+    // range mid-check -- which is precisely the hull-local behaviour test 63 asserts.
+    push(drive("rest", 4, () => shopReadyNoStep(sim)));
     // Checks that the panel lists WHAT IS ON SALE, rather than looking for one
     // hard-coded item name. The shop sells a re-rolled subset of the catalogue now,
     // so "does it mention RIFLE CALIBRATION" was asserting the roll rather than the
@@ -5014,6 +5367,42 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     ok("and it is grouped by purse, which is the whole design",
       hud.shopItems.innerHTML.includes("personal")
       && hud.shopItems.innerHTML.includes("fortress"));
+    ok("and its title says the keys are live, rather than just naming the panel",
+      hud.shopTitle.textContent.includes("READY"),
+      `"${hud.shopTitle.textContent}" class "${hud.shop.className}"`);
+
+    // ---- BROWSING: at the console with a wave out. The panel stays up and readable and
+    // the keys are dead, which is the whole browse/buy split. Driven in its own sim so
+    // the main one's phase is not disturbed.
+    //
+    // This is the branch that must never be silent. A panel headed REFIT that swallows
+    // every keypress is worse than one that is absent, so the title and the `locked`
+    // class are both asserted, not merely the visibility.
+    const browse = makeSim();
+    const browseHud = new Hud();
+    browse.economy.salvage = 1e6;
+    browse.director.phase = PHASE.ENGAGED;
+    try {
+      for (let i = 0; i < 3; i++) {
+        shopReadyNoStep(browse);
+        browse.director.phase = PHASE.ENGAGED;
+        browseHud.update({
+          ...browse, guns: browse.guns, input: browse.input, gun: null, fps: 60, dt: DT,
+        });
+      }
+    } catch (err) {
+      failures.push(`browsing: ${err.message}`);
+    }
+    ok("at the console mid-wave the panel is READABLE but locked, and says which",
+      browseHud.shop.className.includes("show")
+      && browseHud.shop.className.includes("locked")
+      && browseHud.shopTitle.textContent.includes("NOT WHILE A WAVE IS OUT")
+      && browseHud.shopItems.innerHTML.length > 0,
+      `class "${browseHud.shop.className}", title "${browseHud.shopTitle.textContent}",`
+      + ` ${browseHud.shopItems.innerHTML.length} chars still listed`);
+    ok("and the prompt says the same thing, so it is legible without reading the panel",
+      browseHud.promptLabel.textContent.includes("LOCKED"),
+      `"${browseHud.promptLabel.textContent}"`);
 
     // ---- the build readout
     //
@@ -5033,6 +5422,7 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     );
     const offSale = CFG.economy.catalogue[offSaleIndex];
     buildSim.economy.salvage = 1e6;
+    shopReady(buildSim);
     const boughtOffSale = buildSim.economy.buy(offSaleIndex);
     try {
       buildHud.update({
@@ -5063,6 +5453,7 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
 
     // ---- a fitted module must show up in the socket strip
     sim.economy.scrap = 1e6;
+    shopReadyNoStep(sim);
     sim.economy.buyModule(0);
     hud.toggleBay();
     push(drive("bay with a module fitted"));
@@ -5646,6 +6037,10 @@ console.log("\n86. Exactly one panel owns the number keys per frame");
     const sim = makeSim();
     sim.economy.salvage = 1e6;
     sim.economy.scrap = 1e6;
+    // At the console, because the transaction the router hands off to is gated there.
+    // The subject of this section is WHICH consumer gets the press, not whether the
+    // purchase behind it is legal.
+    shopReady(sim);
     // Read what key 1 is actually selling before pressing it. The shop offers a
     // re-rolled subset now, so asserting "rifle" specifically was testing the roll
     // rather than the key routing this section is about.
@@ -5666,6 +6061,7 @@ console.log("\n86. Exactly one panel owns the number keys per frame");
     const sim = makeSim();
     sim.economy.salvage = 1e6;
     sim.economy.scrap = 1e6;
+    shopReady(sim);
     press(sim, CFG.fortress.keys[0]);
     const routed = routePurchaseInput({
       economy: sim.economy, run: sim.run, bayOpen: true, input: sim.input, dt: DT,
@@ -5733,6 +6129,7 @@ console.log("\n86. Exactly one panel owns the number keys per frame");
     const sim = makeSim();
     sim.economy.salvage = 1e6;
     sim.economy.scrap = 1e6;
+    shopReady(sim);
     const offered = CFG.economy.catalogue[sim.economy.offers[0]].id;
     press(sim, CFG.economy.keys[0]);
     routePurchaseInput({
@@ -5892,6 +6289,7 @@ console.log("\n88. The scene stays inside its draw-call budget");
   // Fitting the floodlight module must ATTACH lights, not un-dim ones that were
   // already costing per-pixel work.
   sim.economy.scrap = 1e6;
+  shopReady(sim);
   const flood = sim.modules.catalogue.findIndex((m) => m.id === "floodlights");
   sim.economy.buyModule(flood);
   let after = 0;
@@ -6218,6 +6616,10 @@ console.log("\n92. Every item effect reverts, because reset is the same code pat
   // second stack lands on top of the first.
   economy.salvage = 1e9;
   economy.scrap = 1e9;
+  // At the console to buy, then dropped under the hull below to make the conditional
+  // half write itself. Two positions, in that order, because the two halves of the item
+  // layer are asked about in two different places.
+  shopReady(sim);
   for (let round = 0; round < 3; round++) {
     for (let idx = 0; idx < CFG.economy.catalogue.length; idx++) economy.buy(idx);
   }
@@ -6915,6 +7317,7 @@ console.log("\n96. The salvage pick is personal, free, and a real choice");
   // And the same item bought must land on the same numbers, or the two paths have
   // drifted again in the other direction.
   const bought = makeSim();
+  shopReady(bought);
   bought.player.hp = 40;
   bought.economy.salvage = 1e6;
   bought.economy.buy(vitalsIndex);
@@ -6947,9 +7350,15 @@ console.log("\n96. The salvage pick is personal, free, and a real choice");
   gated.director.phase = PHASE.REST;
   gated.director.timer = CFG.waves.minRest;
   gated.economy.offerPick();
-  ok("a pick in a clear rest is takeable (test is not vacuous)",
-    gated.economy.pickOpen && gated.economy.open,
-    `pickOpen ${gated.economy.pickOpen}, ${gated.horde.liveCount} alive`);
+  // Note the player is on the GROUND here, and that is the point rather than an
+  // oversight. A pick is handed to you wherever you are standing; only buying happens at
+  // the terminal on the deck. Requiring a walk to the console to collect a reward already
+  // earned would undo 22f's argument that being given something is a different beat from
+  // buying it — so `pickOpen` shares the shop's SAFETY clause and not its place clause.
+  ok("a pick in a clear rest is takeable on the ground, because a pick is handed to you",
+    gated.economy.pickOpen && !gated.economy.atTerminal,
+    `pickOpen ${gated.economy.pickOpen}, atTerminal ${gated.economy.atTerminal},`
+    + ` ${gated.horde.liveCount} alive`);
 
   const onTop = gated.horde.spawn(CHEWER);
   onTop.x = gated.player.position.x + 1.5;
@@ -6957,9 +7366,9 @@ console.log("\n96. The salvage pick is personal, free, and a real choice");
   onTop.z = gated.player.position.z;
   step(gated, 2);
   const stillOffered = gated.economy.pendingPick.join(",");
-  ok("something in your face closes the pick, exactly as it closes the shop",
-    !gated.economy.pickOpen && gated.economy.pickOpen === gated.economy.open,
-    `pickOpen ${gated.economy.pickOpen}, shop open ${gated.economy.open}`);
+  ok("something in your face closes the pick, through the shop's own safety getter",
+    !gated.economy.pickOpen && !gated.economy.safeMoment,
+    `pickOpen ${gated.economy.pickOpen}, safeMoment ${gated.economy.safeMoment}`);
   ok("and pressing a key does not spend it -- the offer survives being refused",
     gated.economy.takePick(0) === null
     && gated.economy.pendingPick.join(",") === stillOffered

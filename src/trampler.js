@@ -159,6 +159,63 @@ export class Trampler {
       [box(-1.3, 0, -1.3, 1.3, 9, 1.3, "mast"), mastMat, 1.6],
       [box(-3.2, 8.6, -3.2, 3.2, 9.0, 3.2, "nest"), mastMat, 1.6],
 
+      // The refit terminal: where buying happens.
+      //
+      // A PLACE rather than a moment, and that is the whole point of it. The shop
+      // used to be a timing rule the player could not see -- it appeared on its own
+      // during a rest that legally permits eight live enemies, so it arrived while
+      // they were still shooting, and a playtester reported exactly that. Making it
+      // somewhere you walk to is the same move as the gun's depression clamp: the
+      // hull's 3 m slab already enforced "you cannot shoot beneath yourself", so the
+      // magic number came out and the rule became spatial and legible.
+      //
+      // It also gives shopping a real cost, of exactly the kind the pillar is made
+      // of: this is on the DECK, so buying something means not being under the hull.
+      // Invariant 23's "you cannot spend your way out of trouble" then falls out of
+      // geometry instead of a phase check -- you physically cannot buy while fighting
+      // chewers, because the terminal is not down there.
+      //
+      // ON THE BOW BRIDGE, outboard to starboard. This is the fourth position tried and
+      // every rejection taught something, so all four are recorded — a deck this small
+      // has almost no free space, and "somewhere on the deck" turned out to be a much
+      // harder constraint than it sounds.
+      //
+      //   (-5.6, 2.1) port amidships. 2.37 m from the deck spawn, INSIDE the 3 m
+      //   interaction radius, so the panel was up the instant the player appeared. That
+      //   is the push behaviour the console exists to remove.
+      //
+      //   (5.6, 2.1) starboard amidships. `#buildClimbPoints` puts boarding route exits
+      //   at local (+/-6.8, z) for z in {-9, -3, 3, 9}, and this was **1.5 m from the
+      //   starboard z=3 exit** — boarders arrive on top of the shopper — with the
+      //   reactor's near corner 3.2 m away. The comment defending it claimed "6.3 m from
+      //   the reactor, deliberately marginal", which measured to the reactor's CENTRE
+      //   rather than to anywhere a boarder stands, and never looked at the climb routes.
+      //
+      //   (0, -4.1) centreline forward of the mast. Clears every climb exit by 6.9 m and
+      //   the reactor by 7.4 m, and broke two movement tests instantly. Test 2's own
+      //   comment says why: "local z = -4 is the one lane clear of the mast, the crates,
+      //   the bow step and the engine block". The deck's clear lane is load-bearing for
+      //   the movement puzzle, and a collider across it is not a placement, it is a wall.
+      //
+      // The bridge is the answer, and it is the obvious one in hindsight: it is a raised
+      // platform that already exists, so nothing new obstructs the deck floor at all.
+      // Hugging the outboard edge leaves a 1.0 m walkway inboard of it, so the route up
+      // the centreline step and on to the bow gun's sponson is untouched.
+      //
+      //   10.8 m to the reactor's nearest corner — the only proximity that matters, since
+      //     that is where boarders STOP. A climber transiting a route is inside 6 m for a
+      //     second or two, which is legible and harmless; a boarder parked on the reactor
+      //     is what would lock the shop, and this is nowhere near it.
+      //   11.5 m from the deck spawn.
+      //   2.7 m clear of test 2's z = -4 lane.
+      //   4.3 m from the bow gun's seat, so you cannot be at both — close enough that the
+      //     bow is one coherent station, far enough that it is still a choice.
+      //
+      // Being on the bridge is also the most legible spot on the ship. It is raised and
+      // faces the deck, so the one thing you now need in order to buy anything is visible
+      // from most of the hull rather than tucked behind the mast.
+      [box(3.6, 1.0, -8.6, 4.5, 2.1, -6.7, "terminal"), mastMat, 1.0],
+
       // deck clutter for cover and short parkour
       [box(-6.0, 0, 5.0, -3.0, 1.5, 8.0, "crate"), crateMat, 1.1],
       [box(3.0, 0, 4.0, 5.6, 1.2, 7.0, "crate"), crateMat, 1.1],
@@ -181,6 +238,17 @@ export class Trampler {
         this.reactorMesh = mesh;
         this.reactorBox = b;
         this.reactorLocal = new THREE.Vector3(0, 1.2, 5); // centre, for AI targeting
+      }
+
+      if (b.tag === "terminal") {
+        this.terminalBox = b;
+        // Hull-local, like everything else anchored to the fortress, so it tracks a
+        // walking, turning deck with no special-case code. Stored at the console's
+        // FACE height rather than its centre, because the range check compares against
+        // the operative's own position and half a metre of vertical offset is half a
+        // metre of range spent on nothing.
+        this.terminalLocal = new THREE.Vector3(4.05, 2.1, -7.65);
+        this.terminalMesh = mesh;
       }
     }
 
@@ -270,6 +338,28 @@ export class Trampler {
       tileBoxUVs(strip, 0.5, 0.05, GAP * 2, 0.6);
       add(strip, hazard, side * (HALF_W - 0.28), 0.03, 0, false);
     }
+
+    // The refit terminal's screen, and the reason it is emissive rather than lit:
+    // lights are a budget of four and a PointLight at intensity zero costs a standard
+    // material exactly as much as one at full brightness. Glow that does not need to
+    // illuminate anything is emissive plus bloom, which is free.
+    //
+    // It has to be findable in the dark specifically because it is now the only way to
+    // buy anything. A console the player cannot locate is worse than the timing rule it
+    // replaced -- at least a panel that appears on its own is impossible to miss.
+    const screenMat = new THREE.MeshStandardMaterial({
+      color: 0x0d2a33, roughness: 0.35, metalness: 0.1,
+      emissive: 0x49d8ff, emissiveIntensity: 1.4,
+    });
+    // Set into the console's top face at 20 degrees, tilted INBOARD so the display faces
+    // the walkway you approach along rather than the railing. Rotated about Z rather than
+    // X because the cabinet runs fore-and-aft along the bridge's outboard edge.
+    const screen = add(new THREE.BoxGeometry(0.5, 1.6, 0.06), screenMat, 3.98, 2.02, -7.65, false);
+    screen.rotation.x = Math.PI / 2;
+    screen.rotation.y = -0.35;
+    this.terminalScreen = screen;
+    // A hooded surround, so the glow reads as coming out of something.
+    add(new THREE.BoxGeometry(0.5, 0.08, 1.8), mastMat, 3.84, 2.24, -7.65, false);
 
     // Slung cables from the mast head to bow and stern. Catenary, because a
     // straight line between two towers looks like a mistake.
@@ -916,6 +1006,11 @@ export class Trampler {
 
   reactorWorld(out = new THREE.Vector3()) {
     return this.localToWorld(out.copy(this.reactorLocal));
+  }
+
+  /** World position of the refit terminal, for the "are you standing at it" check. */
+  terminalWorld(out = new THREE.Vector3()) {
+    return this.localToWorld(out.copy(this.terminalLocal));
   }
 
   /**

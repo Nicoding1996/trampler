@@ -82,6 +82,7 @@ export class Hud {
     this.telegraphBar = document.getElementById("t-bar");
 
     this.shop = document.getElementById("shop");
+    this.shopTitle = document.getElementById("shop-title");
     this.shopItems = document.getElementById("shop-items");
     this.shopBonus = document.getElementById("shop-bonus");
     this.shopBuild = document.getElementById("shop-build");
@@ -147,9 +148,29 @@ export class Hud {
     // Keyed off the pick list rather than the run's phase, matching the router. A
     // pick handed out mid-siege leaves the phase at SIEGE, so a phase check here
     // would leave the shop up and lying about what its keys do.
-    const open = economy.open && !this.bayOpen && economy.pendingPick.length === 0;
-    cls(this.shop, open ? "panel show" : "panel");
-    if (!open) return;
+    // Driven by `browsing` — "are you standing at the terminal" — rather than by `open`,
+    // which additionally means "and a purchase is legal right now". That split is the
+    // point of Update 1.7. The panel used to exist ONLY while a purchase was legal, so
+    // the player spent the whole 10 s window reading six items with two lines each, cold,
+    // and reported it as "it shows up a short time". There was no earlier moment in which
+    // to have read it.
+    //
+    // Now: walk to the console and read at any time, including mid-wave, at the cost of
+    // standing still on the deck while a wave is out. The keys stay dead until the wave
+    // ends, and the panel says so. Same shape as contested repair reporting CONTESTED
+    // rather than refusing — tell the player the trade instead of showing them nothing.
+    const up = economy.browsing && !this.bayOpen && economy.pendingPick.length === 0;
+
+    // Whether the keys currently do anything, and why not.
+    const buyable = economy.open;
+    const why = economy.closedReason;
+
+    // Set outright BEFORE the signature early-out below, not inside it. Written inside,
+    // the class would be reapplied as plain "panel show" on every frame the signature
+    // matched, so `locked` would flicker off and stay off — the same class of bug as
+    // reading a clamped value inside a frame hook.
+    cls(this.shop, !up ? "panel" : buyable ? "panel show" : "panel show locked");
+    if (!up) return;
 
     const entries = economy.entries;
     // Two things in this signature are easy to leave out and both go stale silently.
@@ -165,11 +186,17 @@ export class Hud {
     // move and the build readout would sit one item out of date.
     const signature = [
       Math.floor(economy.salvage), Math.floor(economy.scrap), economy.purchases,
+      buyable ? 1 : 0, why,
       ...entries.map((e) =>
         `${e.index}:${e.stacks}:${e.cost}:${e.affordable ? 1 : 0}:${e.soldOut ? 1 : 0}`),
     ].join("|");
     if (signature === this.shopSignature) return;
     this.shopSignature = signature;
+
+    // The title carries the state, because it is the one line that is always read. A
+    // panel headed "REFIT" that silently ignores every keypress is the worst of the
+    // available options: it is a panel promising something it will not do.
+    this.shopTitle.textContent = buyable ? "REFIT — READY" : `BROWSING — ${why}`;
 
     this.shopSalvage.textContent = String(Math.floor(economy.salvage));
     this.shopScrap.textContent = String(Math.floor(economy.scrap));
@@ -652,6 +679,16 @@ export class Hud {
       // would mean the player earned something and simply never found out, which is
       // the same illegibility this whole update is about rather than a fix for it.
       this.#prompt("1-3", "SALVAGE BANKED — TAKE IT WHEN CLEAR", 1);
+    } else if (economy?.browsing) {
+      // Standing at the refit terminal. Below the repair and the fuse warning because
+      // shopping is never the urgent thing, and there is no key to press to "open" it —
+      // the prompt names the keys that buy, or says why they are dead.
+      this.#prompt(
+        "1-6",
+        economy.open ? "REFIT TERMINAL" : `REFIT LOCKED · ${economy.closedReason}`,
+        1,
+        economy.open ? "working" : "contested",
+      );
     } else if (this.prompt.className !== "") {
       cls(this.prompt, "");
     }

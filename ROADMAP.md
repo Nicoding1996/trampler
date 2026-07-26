@@ -5,7 +5,7 @@ Design context is in `.kiro/steering/`. Read `product.md` first, then
 
 ```
 npm start      # http://localhost:5173
-npm run verify  # 101 sections, 715 checks, headless
+npm run verify  # 101 sections, 744 checks, headless
 npm run audit   # static checks the harness structurally cannot make
 npm run cost    # draw calls, triangles, shadow casters, lights — no renderer needed
 npm run imports # every import specifier resolves
@@ -36,10 +36,11 @@ Everything that was on this roadmap below Tier 3 is built and measured.
 | Update 1 The Salvage Table — build variety | done |
 | Update 1.5 Legibility — make it all readable | done |
 | Update 1.6 HUD layout and the buy window | done |
+| Update 1.7 The refit terminal — buying becomes a place | done |
 | Update 2 The Roster — enemy variety | next, after a playtest |
 | Tier 3 Networked players on a moving platform | untouched, and needs an engine spike |
 
-715 headless checks pass. Two consecutive full runs differ in exactly one line:
+744 headless checks pass. Two consecutive full runs differ in exactly one line:
 the wall-clock performance reading.
 
 ## What is actually missing, and the three updates that fix it
@@ -276,6 +277,93 @@ the next playtest is the one that can say "I saw +18% and did not feel it", whic
 fact worth tuning against. When it is done, the lever is **speed and fog** rather than
 health: enemy speed spends itself on a human's travel and reaction time, which is what
 these roads are supposed to tax.
+
+### Update 1.7 — The refit terminal
+
+One playtest sentence: *"it shows up a short time and sometimes it shows up while I am
+fighting."* Suite 715 → 744.
+
+Three versions of the buy window had failed the same way, and the third failure is what
+made the pattern visible:
+
+| | rule | how it failed |
+|---|---|---|
+| V1 | rest + prep + the wave | "I just spam buy items out of panic" |
+| V2 | rest, fortress clear | 0 s cost to a good player, a third of the window to a bad one, 64%→97% across two passes on the same seeds |
+| V3 | rest/hold, nothing within 6 m of you | still appeared mid-fight, because a "rest" permits eight live enemies |
+
+No threshold fixes that, because the fault is not the threshold. The shop was **push** — it
+appeared at you, on a clock you cannot see, and left on its own.
+
+So buying is a **place**. A console on the deck, starboard amidships, and the shop is where
+it is. This is the depression-clamp lesson applied to the economy: the gun was clamped to
+-12° to stop it firing under the hull, the 3 m hull slab already did that, so the number
+came out and the rule became something a player can see. Here, invariant 23's "you cannot
+buy your way out of trouble" stops being a phase check and becomes geometry — the console
+sits 1.1 m above a deck 7.5 m above the sand, so the ground physically cannot reach it. And
+being at the console is being on the deck, not under the hull, which makes shopping cost
+something the pillar is already made of.
+
+**Reading was split from buying**, and that is the actual fix for "a short time". Twelve
+seconds was never short because twelve seconds is short — it was short because the panel
+existed *only* while a purchase was legal, so the whole window went on reading six items of
+two lines each, cold. Now the panel is up whenever you stand there, including mid-wave, with
+prices and stock fully readable and the keys dead. It says which state it is in on its own
+title bar, because a panel headed REFIT that swallows every keypress is worse than one that
+is absent. The window is spent deciding; the purchase is one press.
+
+**The window doubled, and this time it is a floor.** Prep is shoppable again — a deliberate
+reversal of V2, since 19b's objection was to a panel that *arrives uninvited*, and choosing
+to spend prep at the console instead of placing an emitter is exactly the trade 19b wants to
+exist. `minRest` + `prepTime` is **22 s per wave, 110 s per five-wave siege, guaranteed to
+everybody**, against V2's 52 s that only a competent player ever saw. That distinction is
+now a principle in `product.md`: an oracle tells you whether something is possible, never
+what it costs.
+
+Three things found on the way:
+
+- **A helper that arranged too much.** Nine sections broke at once when the gate moved, all
+  of them buying as scaffolding rather than as their subject. The first `shopReady()` pinned
+  `phase = REST, timer = 1e6` — and a pinned rest never advances, so test 66 spawned no
+  waves, nothing attacked the legs, and it reported "AUTOMATION PLUS UPGRADES HELD THE LINE
+  — THE PILLAR IS BROKEN". An invariant-2b failure with nothing to do with automation.
+- **The console took four placements**, and every rejection was a real constraint. Port
+  amidships was 2.37 m from the deck spawn — inside its own 3 m radius, so the panel was up
+  the instant the player appeared. Starboard amidships was **1.5 m from a boarding route
+  exit** with the reactor 3.2 m off, which would have locked the shop permanently and
+  hardest for whoever was losing the boarding fight. The centreline forward of the mast
+  cleared everything and broke two movement tests, because test 2's comment already records
+  that *"local z = -4 is the one lane clear of the mast, the crates, the bow step and the
+  engine block"*. It lives on the bow bridge now — a platform that already exists, so it
+  obstructs no deck floor, and the most visible spot on the ship for the one thing you now
+  need in order to buy anything.
+
+  Worth keeping: the comment defending the amidships position claimed "6.3 m from the
+  reactor, deliberately marginal". It was measuring to the reactor's **centre**, which
+  nothing ever stands on, and had not looked at the boarding routes at all. The assertion
+  now measures the reactor's *surface* and prints the nearest route exit, so the next person
+  who moves it can see what they are walking into.
+- **The pick nearly inherited the place clause too**, which would have meant walking to a
+  console to collect a reward already earned. `safeMoment` is now the shared safety half and
+  `atTerminal` is the shop's alone.
+
+Also **deliberately not done**: world vendors on the ruins. The idea is good and the blocker
+is hard — the fortress never stops. It walks a 165 m patrol ring continuously, and the only
+thing that sets `walking = false` is a debug key. A shop 60 m off the ring costs ~60 s round
+trip against a 152 s siege, with nobody under the hull, because you end up chasing a
+4.5 m/s building on foot at 7 m/s. And the buildings visible on the horizon are placed
+outside `patrolRadius + horizonClearance` = 255 m by invariant 31, which is 90 m beyond
+anywhere the fortress goes. The prerequisite is a reason for the fortress to hold position,
+and that is a design change rather than a feature.
+
+What the idea did usefully surface, and what is now worth doing: **give each road a market
+character** — cheaper salvage here, rares weighted up there, everything dearer somewhere
+else. The roads already carry cumulative modifiers, already describe cost and payout on the
+route panel, and the shop already re-rolls per landmark, so it is nearly free. And it makes
+a road change something the player can *feel* at the console, which is the standing
+complaint about roads ("does it matter? it seems like it just went next"). Also noted: the
+ground half of the pillar is spatially tiny — "on foot" means a 26 × 16 m box inside a 165 m
+arena.
 
 ### Update 2 — The Roster (enemy variety) ← next
 

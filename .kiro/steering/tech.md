@@ -102,7 +102,7 @@ the verification.
 ## Verification
 
 `verify.mjs` runs the real simulation modules in Node with no DOM and no
-renderer: 101 sections, 715 assertions. The failure modes here — drift, being
+renderer: 101 sections, 744 assertions. The failure modes here — drift, being
 yanked off a turning deck, an anchor that does not track the hull, an enemy
 shielded by geometry, an automated defence that quietly holds a position — are
 invisible to inspection and tedious to confirm by hand.
@@ -191,6 +191,19 @@ Every one of these produced a green or red result that was wrong:
   `horde.damage(e, n, "emitter")` directly. That proves the gate works and says
   nothing about whether `emitters.js` passes the string at all — which is the half
   that can rot. Deploy the real emitter and let it kill something.
+- **A justification that measured the wrong point.** A comment defended the refit
+  terminal's position as "6.3 m from the reactor, deliberately marginal" — outside the 6 m
+  proximity threshold, so boarders would only *occasionally* close the shop. It was
+  measuring to the reactor's **centre**, which nothing ever stands on; attackers close on a
+  *surface* (invariant 9), and the real gap was 3.2 m. The same comment had never checked
+  the boarding routes at all, and the position turned out to be 1.5 m from a route exit.
+
+  Two lessons, and the second is the general one. **Measure the point something actually
+  occupies**, not the point it is named after. And **a number defended only by a comment is
+  not defended** — the arithmetic spanned three files (route exits in `trampler.js`, the
+  threshold in `CFG.repair`, the position in a box literal), so nothing would ever have
+  noticed it drifting. It is asserted now, and it prints the nearest route exit so the next
+  person to move it can see the constraint rather than rediscover it.
 - **A check that reads a field which does not exist.** Three places tested
   `enemy.burrowed` to decide whether something was underground. There is no such
   field — the state is `e.state === ENEMY_STATE.BURROWED`, and `horde.burrowed` is a
@@ -230,6 +243,26 @@ Every one of these produced a green or red result that was wrong:
   walk REST → PREP now that the field was calm, shutting the window again, and it added a
   frame of elapsed time to a test whose whole subject is an exact replay. Arrange the
   state the gate wants; do not simulate your way toward it.
+
+  It happened again, larger, when buying became a PLACE: nine sections broke at once,
+  every one of them buying something as scaffolding rather than as its subject. The fix is
+  a named helper — `shopReady(sim)` — so the arrangement is one line and says what it is
+  for. Two things about that are worth keeping:
+
+  **A helper must arrange the minimum, or it becomes a second invisible author of every
+  test that calls it.** The first `shopReady` also pinned `phase = REST, timer = 1e6` to
+  guarantee legality. A pinned rest never advances, so in test 66 no wave ever spawned,
+  nothing attacked the legs, and the section reported "AUTOMATION PLUS UPGRADES HELD THE
+  LINE — THE PILLAR IS BROKEN". An invariant-2b failure with nothing whatsoever to do with
+  automation. It only ever needed the position.
+
+  **And a helper that steps cannot serve a test about elapsed time.** `placeOnDeckLocal`
+  runs 20 settling frames, which is right nearly everywhere and wrong in the one section
+  whose subject is an exact replay. Hence a second, explicit `shopReadyNoStep`, rather than
+  a flag that reads as an optimisation.
+
+  Watch for the fresh-sim case too: several of the nine built their own sims inside
+  helpers (`fitOne`, `rateAt`, `takenAt`), so arranging the outer one changed nothing.
 - **Sampling an oscillating state at one instant.** "Is the chewer parked" and
   "is the gun overheated" both cycle. Measure over a window, or track whether the
   state was *ever* reached.
