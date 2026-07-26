@@ -190,6 +190,21 @@ export class Director {
   }
 
   /**
+   * How far along the ROSTER schedule a wave is, as opposed to how big it is.
+   *
+   * Two different counters on purpose. `wave` rewinds at every landmark, because the
+   * size curve should: a first wave is a first wave, and the curve was tuned against
+   * measured pacing. The roster should not rewind, and it used to -- landmark 2 wave
+   * 1 was seven chewers and three climbers again, so the fight after a road was
+   * structurally simpler than the one before it, which is why a playtester read the
+   * road choice as "it just went next".
+   */
+  tierOf(wave) {
+    const perLeg = CFG.enemies.composition.tierPerLeg;
+    return wave + perLeg * Math.max(0, (this.run?.leg ?? 1) - 1);
+  }
+
+  /**
    * Decide exactly what a wave is made of.
    *
    * Specials SUBSTITUTE for chewers rather than adding to the total. The wave-size
@@ -200,8 +215,13 @@ export class Director {
    *
    * Waves one and two are chewers and climbers only. Those are the two pressures
    * the whole design rests on and they deserve to be learned without noise.
+   *
+   * @param wave decides the SIZE, and rewinds at every landmark.
+   * @param tier decides the ROSTER, and carries across them. Defaults to `wave` so a
+   *        caller asking "what is wave 5 made of" still gets a straight answer --
+   *        which is what the harness wants when it is testing the schedule itself.
    */
-  buildWave(wave) {
+  buildWave(wave, tier = wave) {
     const w = CFG.waves;
     const c = CFG.enemies.composition;
     const count = Math.max(
@@ -215,16 +235,57 @@ export class Director {
     };
 
     const ramp = (from, every, max) =>
-      wave < from ? 0 : Math.min(max, 1 + Math.floor((wave - from) / every));
+      tier < from ? 0 : Math.min(max, 1 + Math.floor((tier - from) / every));
 
-    push(CLIMBER, Math.round(count * w.climberShare));
-    push(BURROWER, wave >= c.burrowerFromWave ? Math.round(count * c.burrowerShare) : 0);
-    push(BULWARK, ramp(c.bulwarkFromWave, c.bulwarkEvery, c.bulwarkMax));
-    push(SAPPER, ramp(c.sapperFromWave, c.sapperEvery, c.sapperMax));
-    // Chewers make up the remainder. They are the floor of the wave, so if the
-    // specials ever grew past the count this would go to zero rather than
-    // negative -- and the wave would stop containing the type the under-hull
-    // arena is built around, which is why the ramps above are capped.
+    // Chewers are the FLOOR of a wave, reserved before anything else is allowed in,
+    // and the specials fill what is left in priority order.
+    //
+    // This used to be the other way round -- specials first, chewers as the remainder
+    // -- with a comment observing that the caps were the only thing stopping the
+    // remainder reaching zero. Carrying the tier across landmarks breaks that
+    // immediately: at tier 7 the ramps want three bulwarks and three sappers, and a
+    // first wave is ten enemies. A wave with no chewers has nothing under the hull,
+    // which deletes the reason to dismount, and it would have happened quietly.
+    //
+    // Allocated in TWO passes, and the first one is the important half.
+    //
+    // A single pass in priority order starves whatever is last. Measured: at landmark
+    // 3 the bulwark ramp wanted three and took the remaining room, and the SAPPER --
+    // the only enemy that is a timer rather than a damage race, and the one that makes
+    // going under the hull urgent -- vanished from the wave entirely. Escalating the
+    // roster and then having it eat itself is worse than not escalating it.
+    //
+    // So: one of every type that is DUE at this tier first, because presence is what
+    // "the roster grew" actually means to a player, and exact counts are texture. Then
+    // the remainder in priority order, where the shares can dominate.
+    //
+    // Priority is the two pillar types first — the deck and the under-hull arena both
+    // have to be populated before anything expensive is, since those two pressures ARE
+    // the game.
+    let room = Math.max(0, count - Math.max(1, Math.round(count * c.chewerFloor)));
+    const wanted = [
+      [CLIMBER, Math.round(count * w.climberShare)],
+      [BURROWER, tier >= c.burrowerFromWave ? Math.round(count * c.burrowerShare) : 0],
+      [BULWARK, ramp(c.bulwarkFromWave, c.bulwarkEvery, c.bulwarkMax)],
+      [SAPPER, ramp(c.sapperFromWave, c.sapperEvery, c.sapperMax)],
+    ];
+    const got = wanted.map(() => 0);
+
+    for (let i = 0; i < wanted.length && room > 0; i++) {
+      if (wanted[i][1] > 0) {
+        got[i] = 1;
+        room--;
+      }
+    }
+    for (let i = 0; i < wanted.length && room > 0; i++) {
+      const more = Math.min(wanted[i][1] - got[i], room);
+      if (more > 0) {
+        got[i] += more;
+        room -= more;
+      }
+    }
+    for (let i = 0; i < wanted.length; i++) push(wanted[i][0], got[i]);
+
     push(CHEWER, Math.max(0, count - types.length));
 
     this.#shuffle(types);
@@ -248,7 +309,7 @@ export class Director {
     this.forced = false;
     this.wave++;
 
-    this.queueTypes = this.buildWave(this.wave);
+    this.queueTypes = this.buildWave(this.wave, this.tierOf(this.wave));
     this.queue = this.queueTypes.length;
     this.spawnAccum = 0;
     this.phase = PHASE.SPAWNING;

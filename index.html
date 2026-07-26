@@ -131,12 +131,35 @@
   #hud { left: 14px; top: 14px; min-width: 236px; display: none; }
   #hud.show { display: block; }
 
-  /* ---- operative status: the stakes, and the only always-visible panel ---- */
-  #combat { left: 50%; bottom: 16px; transform: translateX(-50%); min-width: 330px; }
+  /* ---- operative status: the stakes, and the only always-visible panel ----
+
+     BOTTOM LEFT, and it used to be bottom centre. Four things were anchored there:
+     this panel, the contextual prompt, the salvage pick and the road choice. The three
+     transient ones draw on top of the permanent one, so the health and reactor bars —
+     the two numbers the whole run hangs on — were covered at exactly the moments they
+     matter: while repairing under fire, while choosing an item, while choosing a road.
+     Reported in those words: "it covers the health and the other stats".
+
+     Bottom left rather than top left for two reasons. Top left is the diagnostics
+     panel's, and moving THAT would mean re-homing a second thing to fix the first; and
+     every other corner is taken already — shop top right, buff strip bottom right.
+     Bottom left was the one empty anchor. It is also where an FPS conventionally puts
+     vitals, in the lower visual field, near where the weapon sits.
+
+     The alternative was moving the three transient panels instead, and it is worse: a
+     permanent readout can be placed once and learned, while a prompt that appears has
+     to appear where the player is already looking. Bottom centre is now transient-only,
+     and test 67 asserts that no other box shares this anchor. */
+  #combat { left: 14px; bottom: 16px; min-width: 300px; }
   #combat .lbl {
     font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase;
     color: var(--ink-dim);
   }
+  /* Hostiles is the one row that changes what you do THIS SECOND, so it is the one
+     row given size. Everything else here is a state you check; this is a number you
+     react to. */
+  #combat .row.loud { font-size: 14px; margin-top: 2px; }
+  #combat .row.loud .k { font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase; }
   /* Segmented gauges. A smooth bar is a progress indicator; a segmented one is
      an instrument, and the notches make small changes legible at a glance. */
   .bar {
@@ -167,7 +190,18 @@
 
   /* ---- refit: only visible between waves, because that is the only time
      buying is allowed. A panel always up would imply otherwise. ---- */
-  #shop { right: 14px; top: 14px; width: 292px; display: none; }
+  /* Wider and larger than it was, and this is the other half of one playtest
+     complaint: "it's just in the corner, it's hard to manage to look at the shop, so I
+     just spam buy items out of panic." The window itself was the bigger fault and is
+     fixed in economy.js — it used to include the incoming-wave telegraph. But a
+     292 px column of 12 px type asking you to compare six items, two lines each, is
+     the reason the fix has to be legible as well as well-timed.
+
+     Stays top-right rather than moving to the middle. It shares that side with the
+     buff strip, which is bottom-right and only up during a fight, and the middle is
+     already the bay's — a shop that took over the screen would be a fourth full-frame
+     overlay in a game whose owner has already complained about overlapping tabs. */
+  #shop { right: 14px; top: 14px; width: 344px; display: none; font-size: 13px; }
   #shop.show { display: block; }
   .item { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
   .item + .item { margin-top: 6px; }
@@ -175,8 +209,11 @@
     display: inline-block; min-width: 15px; color: var(--accent); font-weight: 700;
   }
   .nm { letter-spacing: 0.04em; }
-  .dt { font-size: 10px; color: var(--ink-dim); }
+  .dt { font-size: 11px; color: var(--ink-dim); }
   .px { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  /* Rows need air between them more than the panel needs to be short. Six items you
+     cannot tell apart is worse than six items that take up more of the corner. */
+  .item + .item { margin-top: 9px; }
   /* Affordability has to be readable at a glance mid-siege, so it is colour plus
      dimming rather than colour alone. */
   .item.can .px { color: var(--accent); }
@@ -239,6 +276,18 @@
     font-size: 15px; letter-spacing: 0.14em; color: var(--warn);
     text-align: center; margin-bottom: 10px;
   }
+  /* What the roads already taken have cost, above the two on offer. A road's modifier
+     is permanent and compounds across the whole biome, and it used to surface nowhere a
+     player would ever look — only as one combined number in the hidden diagnostics
+     panel, merged with the elapsed-time ramp so even there you could not separate them.
+     Hence a playtester asking whether the choice mattered at all. */
+  #route .carried {
+    text-align: center; font-size: 10px; line-height: 1.6;
+    margin: -2px 0 10px; padding-bottom: 9px;
+    border-bottom: 1px solid var(--panel-edge);
+  }
+  #route .carried .none { color: var(--ink-dim); }
+  #route .carried .rw { color: var(--bad); }
   #route .roads { display: flex; gap: 12px; }
   #route .road {
     flex: 1; padding: 10px 12px; border: 1px solid var(--panel-edge);
@@ -275,6 +324,46 @@
   #pick .it .rr.uncommon { color: var(--accent); }
   #pick .it .rr.rare { color: var(--warn); }
   #pick .it .rs { font-size: 10px; color: var(--ink-dim); }
+
+  /* ---- target readout ----
+     What the crosshair is on, and how much of it is left. One target, one bar.
+
+     The alternative was a bar floating over every enemy, and both of the games
+     nearest this one ship without those on purpose — they turn a fight into a
+     spreadsheet, and forty-five of them is forty-five things to draw. But the
+     project's own invariant 8 demands SOME feedback ("a magazine emptied into
+     something with the health bar refusing to move is indistinguishable from a
+     bug"), and until now there was none at all beyond a one-frame flash.
+
+     So: the crowd is read from the enemies themselves (they darken as they are
+     worn down, which costs nothing) and the thing you are actually aiming at gets
+     a number. Sits just under the crosshair, because that is where the eye already
+     is, and it is up only while something is under the reticle — so it is not a
+     panel and never joins the count of things permanently on screen. */
+  #target {
+    position: fixed; left: 50%; top: 50%; z-index: 8;
+    transform: translate(-50%, 26px); width: 168px;
+    pointer-events: none; display: none; text-align: center;
+  }
+  #target.show { display: block; }
+  #target .tn {
+    font-size: 10px; letter-spacing: 0.18em; color: var(--ink);
+    text-shadow: 0 2px 8px rgba(0,0,0,0.95);
+  }
+  /* Armour is the one property that changes which WEAPON is correct, so it gets
+     its own colour rather than being a word in the same line. Amber for "this is the
+     wrong tool", and the interactive cyan the moment you are behind it and it is not —
+     the same colour the game uses everywhere else for "you can touch this". A player
+     who never happens to walk behind a bulwark would otherwise never learn the flank
+     exists at all. */
+  #target .ta {
+    font-size: 9px; letter-spacing: 0.2em; color: var(--warn);
+    text-shadow: 0 2px 8px rgba(0,0,0,0.95);
+  }
+  #target.open .ta { color: var(--accent); }
+  #target .bar { height: 4px; margin: 4px 0 0; }
+  #target .bar > span { background: linear-gradient(90deg, #a02020, var(--bad)); }
+  #target.hurt .bar > span { background: linear-gradient(90deg, #b0752a, var(--warn)); }
 
   /* ---- live conditional damage ----
      Half the salvage table pays only in a particular place, or for a few seconds
@@ -488,7 +577,8 @@
       <dl>
         <dt>chewers</dt><dd>eat the legs from under the hull, where no gun can see them. Go down.</dd>
         <dt>climbers</dt><dd>board and eat the reactor. Come back up.</dd>
-        <dt>bulwarks</dt><dd>armoured. The rifle barely marks them &mdash; kill them at range, from a gun.</dd>
+        <dt>bulwarks</dt><dd>armoured &mdash; but only on the front. Kill them at range from a gun, or
+          get behind one and your rifle works fine. The target readout tells you which.</dd>
         <dt>burrowers</dt><dd>travel underground. Watch for the spoil heaps; you cannot shoot them until they surface.</dd>
         <dt>sappers</dt><dd>plant a charge worth a whole leg. Kill it before the fuse ends or the leg is gone.</dd>
         <dt>the titan</dt><dd>too tall to fit under the hull, so it works from outside &mdash; the one fight the deck wins.</dd>
@@ -526,27 +616,38 @@
    <div class="dismiss">H to close</div>
   </div>
 
+  <!-- Trimmed as well as moved, and the test for each row is "is this shown anywhere
+       else, and does the player act on it".
+
+       GONE: the deck gun heat bar, because the contextual prompt's progress bar already
+       IS `1 - gun.heat` while you are manning a gun, and says OVERHEATED in words. The
+       bar was a second copy of the same number, permanently on screen, for a state that
+       only exists while you are sitting in a mount. GONE: the hardpoints row, because
+       the refit bay draws its own three sockets and a count of them told you nothing
+       you could act on without opening it anyway.
+
+       FOLDED: leg count and drive percentage into the LEGS caption, since the pips
+       underneath are the same fact drawn better; and journey, siege and pacing into one
+       line, because "where am I" and "what is next" is one question asked twice.
+
+       ADDED: both purses. They were only ever on the shop panel, which is up solely
+       while the buy window is open — so for the two thirds of a siege you cannot buy
+       anything, you were earning money you could not see, and could not plan around.
+       The owner asked whether scrap still existed. It did. -->
   <div id="combat" class="panel">
     <div class="lbl">operative</div>
     <div class="bar"><span id="b-hp"></span></div>
     <div class="lbl">reactor</div>
     <div class="bar"><span id="b-reactor"></span></div>
-    <div class="lbl">deck gun heat</div>
-    <div class="bar"><span id="b-heat"></span></div>
-    <div class="lbl">legs</div>
+    <div class="lbl">legs <span id="r-drive">6 · 100%</span></div>
     <div id="pips">
       <div class="pip"></div><div class="pip"></div><div class="pip"></div>
       <div class="pip"></div><div class="pip"></div><div class="pip"></div>
     </div>
-    <!-- Only rows a player acts on. Pressure, the threat ramp and the kill count
-         are director instrumentation and live in the diagnostics panel now. -->
-    <div class="row"><span class="k">legs / drive</span><span class="v" id="r-drive">6 · 100%</span></div>
+    <div class="row loud"><span class="k">hostiles</span><span class="v" id="r-live">0</span></div>
+    <div class="row"><span class="k">salvage · scrap</span><span class="v"><span id="v-salvage">0</span> · <span id="v-scrap">0</span></span></div>
     <div class="row"><span class="k">emitters (X)</span><span class="v" id="r-emitters">3 / 3</span></div>
-    <div class="row"><span class="k">hardpoints (Tab)</span><span class="v" id="r-build">0 / 3</span></div>
-    <div class="row"><span class="k">journey</span><span class="v" id="r-leg">1 / 4</span></div>
-    <div class="row"><span class="k">siege</span><span class="v" id="r-wave">0 / 5</span></div>
-    <div class="row"><span class="k">pacing (Q)</span><span class="v" id="r-next">rest 12 s</span></div>
-    <div class="row"><span class="k">hostiles</span><span class="v" id="r-live">0</span></div>
+    <div class="row"><span class="k">leg <span id="r-leg">1 / 4</span> · wave <span id="r-wave">0 / 5</span></span><span class="v" id="r-next">rest 12 s</span></div>
   </div>
 
   <div id="prompt">
@@ -583,7 +684,14 @@
 
   <div id="route" class="panel">
     <div class="head" id="route-head">CHOOSE THE ROAD</div>
+    <div class="carried" id="route-carried"></div>
     <div class="roads" id="route-items"></div>
+  </div>
+
+  <div id="target">
+    <div class="tn" id="tgt-name">CHEWER</div>
+    <div class="ta" id="tgt-armour"></div>
+    <div class="bar"><span id="tgt-bar"></span></div>
   </div>
 
   <div id="buffs">

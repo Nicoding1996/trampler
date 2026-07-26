@@ -107,12 +107,64 @@ intent measured in the hull's frame*, not on look direction.
 boxes matching what is drawn, not spheres, and a ray starting inside a box counts
 as a hit so point-blank enemies are killable.
 
+**8a. And the player must be able to SEE that a shot worked.** This clause was
+implicit in 8 for a long time — "a magazine emptied into something with the health bar
+refusing to move is indistinguishable from a bug" — and then a playtest found the game
+had no such feedback at all beyond a one-frame white flash. Against a bulwark carrying
+740 hp at the ramp it actually spawns on, a player could not tell "wrong tool" from
+"broken game", and said so.
+
+Two mechanisms, because a crowd and a target are different questions:
+
+- **The crowd reads from the enemies themselves.** Wounded bodies are drawn darker,
+  quantised into four bands, written into the per-instance colour buffer the hit flash
+  already allocated. No UI, no draw calls, and an untouched crowd costs no upload.
+  Deliberately not forty-five floating bars: the two shipped games nearest this one
+  omit those on purpose and invest in in-world feedback instead.
+- **The thing under the crosshair gets a number**, plus its name and whether its
+  armour is in the way. One target, one readout, up only while something is there.
+
+The flash and a lit fuse both OUTRANK the tint. That ordering is deliberate: the flash
+is the only "that connected" signal in the game, and a wounded body quietly swallowing
+it would trade the more urgent reading for the less urgent one.
+→ tests 84, 97, 98
+
 Two corollaries added with the new roster. **Armour is never immunity**: damage is
 `max(raw - armour, raw * minDamageFraction)`, so a rifle still does 5 to a titan.
 A magazine emptied into something with the health bar refusing to move is
 indistinguishable from a bug. And **the one type that cannot be shot cannot stay
 that way**: a burrower is untouchable only while submerged, on a hard clock, and it
 surfaces on that clock wherever it has got to.
+
+That second corollary has a converse which was broken for an entire update: **while it
+is submerged, NOTHING may reach it — not just shots.** Fragmentation splash and the arc
+chain do not route through `shootFrom` and so get no occlusion clip; both were written
+with an exclusion for burrowers and neither exclusion worked, because both tested a
+per-enemy `burrowed` field that does not exist. A proc could kill a thing the player
+cannot see or shoot. The predicate is now exported from `enemies.js` as `isSubmerged` so
+the mistake is not spellable; `tech.md` has the general lesson.
+→ test 94
+
+**8b. Armour has a POSITIONAL answer, not an aim-based one.** A playtester asked for
+headshot damage, and the instinct was right — there was no way to out-*play* armour at
+all, only to out-buy it. A head multiplier was the wrong shape though: it would have
+handed the rifle a bulwark and taken away the recurring job the bulwark exists to give
+the deck gun, after which the deck stops mattering past the opening ten seconds again.
+
+So the bulwark's plate is on its FRONT only, 70° either side of directly behind it.
+Measured: 60 rifle rounds head-on against 12 from behind. Abeam is deliberately not
+enough — you have to be behind it. That turns "which weapon" into "which side of it am
+I on", which is the pillar's own question rather than a new one, and it reads spatially
+rather than as a number: a bulwark locked onto a leg has its back to the open ground.
+
+Three things hold it in place. The intended meeting is still head-on during the
+approach, from a mount, at range, because the bulwark is slower than the hull. The
+titan keeps an omnidirectional plate, because that is the one fight built around the
+deck (13c) and a rifle answer found by walking round the back would undo the geometry
+it is made of. And **only `shootFrom` consults the facing**, so a shock emitter always
+meets the full plate — automation does not get rewarded for standing in the right
+place, because it never chose where to stand.
+→ tests 69, 84
 → tests 8, 27, 69, 71
 
 **9. No enemy may be shielded by geometry it is standing inside.** Attackers close
@@ -236,17 +288,102 @@ not exist". Every id must have a static effect or be read by the runtime, and ev
 rarity tier must be populated or its weight is a dead letter.
 → test 91
 
-**22f. Holding a siege pays a free pick of three, and the pick is personal.** Being
-handed something is a different beat from buying it, and it is the only acquisition
-that does not compete with the fortress for money. Salvage items only — a free hull
-plate would be one purse funding the other, which is 22 broken from the reward side.
-Taking one clears the rest, because the whole value of a pick is what you gave up.
-The boss leg pays nothing: an item you can never spend is a menu, not a reward.
-→ tests 79, 96
+**22f. A free pick of three arrives on a cadence the player actually reaches, and the
+pick is personal.** Being handed something is a different beat from buying it, and it is
+the only acquisition that does not compete with the fortress for money. Salvage items
+only — a free hull plate would be one purse funding the other, which is 22 broken from
+the reward side. Taking one clears the rest, because the whole value of a pick is what
+you gave up.
 
-**23. Buying happens between waves only.** Spending mid-fight would let a player
-purchase their way out of trouble and would drain the tension the siege is built
-on. It also gives the preparation window a second job.
+The cadence clause is the one a playtest forced. The pick was paid ONLY for holding a
+siege — wave five of five — and the player averaged wave four, so the headline reward of
+the whole item update was behind a gate they had passed once in an evening. A reward the
+player does not reach is not a reward, it is a rumour. It now pays every two waves the
+crew *sees off*, on top of the hold's own: three per landmark, first one at wave 2.
+
+Three properties fall out of polling the director's resolved counter rather than taking
+a callback, and all three are wanted. A wave BURIED by pressing Q pays nothing, which is
+part of what calling early costs. The cadence keys off the wave number *within* a siege,
+so the rhythm is identical at every landmark rather than drifting for no reason a player
+could infer. And an offer already in hand is never overwritten, because an item you were
+looking at vanishing reads as a bug rather than as luck.
+
+Nothing may be left on offer once the biome is done, from either source — an item you
+can never spend is a menu, not a reward. The boss leg pays no pick for *holding* it, but
+the cadence does pay during the boss siege, because there is still a titan to spend it
+on.
+
+**And the pick waits for the same window the shop does**, through the same getter rather
+than a second rule that means roughly the same thing. The pick panel is a 680 px menu of
+three items on the bottom-centre anchor and it used to appear the instant a pick was
+earned — which is the instant a wave resolves, frequently with the remains of that wave
+still on you. That is the shop's "I just spam buy items out of panic" with none of the
+shop's protection.
+
+Three things make the wait free rather than a punishment. The offer is **banked, never
+withdrawn**, so nothing is lost by not being ready. The keys are **not owned by it while
+it waits**, or they would be dead — claimed by something that refuses to act on them and
+unavailable to the shop or the bay. And the prompt **says** it is banked, because a
+reward the player earned and never found out about is the same illegibility this was
+meant to fix.
+
+Pausing was the alternative and it is rejected: co-op is the primary experience and you
+cannot stop a horde game for one player's menu. Risk of Rain 2 and Deep Rock Galactic
+both decline to, for the same reason.
+
+One consequence worth recording, because it turned a rare bug into an ordinary one: a
+pick that waits is far more likely to still be in hand when the siege is held, and the
+hold's payer was overwriting it. The cadence's payer already guarded against that; the
+hold's did not.
+→ tests 79, 96, 99
+
+**23. Buying happens between waves only, and "between waves" has to mean a moment you
+can actually READ a shop in.** Spending mid-fight would let a player purchase their way
+out of trouble and would drain the tension the siege is built on.
+
+The second clause is the one a playtest added, and the numbers were worse than the
+complaint. The window used to be the rest *plus the preparation window*, and the rest
+permits `holdUntilCleared` — eight — enemies still alive. So a player could be fighting
+eight things, be told a named wave was inbound, and be shown a six-item shop, all at
+once, on a countdown. They panic-bought, which was the correct response.
+
+It is now the rest or a held siege, **and nothing alive within `repair.threatRange` of
+the OPERATIVE**. Three deliberate choices in that:
+
+- The preparation window is excluded because 19b already says what it is for. A shop
+  competing for it does not add an option, it takes the preparation away.
+- The safety test is NOT `director.calm`. That is the pacing threshold and is generous
+  on purpose, because reinforcements should not wait for a spotless field. Stragglers at
+  60 m are not a reason to keep your wallet shut.
+- And it asks about the **player**, not about the fortress. It reuses the 6 m the
+  contested-repair rule already owns, because the two are asking the same question — is
+  the operative under enough pressure that this job should not be going well — and two
+  nearly-identical safety thresholds drift apart.
+
+The second clause was first written as "nothing beneath the hull and nothing on the
+deck", which sounded better than it measured, and the measurement is the part worth
+keeping. **It cost a competent player exactly zero seconds and a struggling one up to a
+third of their window** — the player who most needs to buy something was the only one it
+locked out. It also varied unpredictably: two passes over the *same seeds* left 64% and
+97% of the rest available, because it depended on where the horde happened to be. A
+playtester could not use the shop and could not tell why, which is the real fault. "Some
+enemy is under the hull somewhere on a 26 m chassis" is not a state a player can see or
+fix in a second.
+
+The property the rule now has is that **you satisfy it by moving**. Step back and the
+shop opens. The fortress version could only be satisfied by finishing the fight, which
+is the same as saying it was not a rule the player could act on.
+
+Measured before being trusted, because a window that reads well and never fires would be
+worse than the panic: about 52 s of shoppable time across a 152 s five-wave siege, in
+windows of roughly 12 s. A held siege has no timer, so the unhurried moment to spend a
+siege's earnings is right after holding one — which is where the money came from.
+
+Note what that 52 s is: a **ceiling**, taken with a scripted defender that clears the
+field. For a safety rule the interesting number is the *floor* — what the struggling
+player gets — and that is exactly the number the first version got wrong while its
+ceiling looked fine. See the same trap from the other direction in `product.md` under
+the oracle defender.
 → test 63
 
 **24. Every kill pays, whatever killed it.** The hook is on `Horde.damage`, the one
@@ -364,6 +501,29 @@ The size curve was tuned against measured pacing, and changing size and composit
 together moves two variables at once — after which no difficulty change can be
 attributed to either. Road modifiers are the one thing allowed to change the count,
 and they say so explicitly.
+
+**19f. The journey escalates in KIND, and the size curve rewinds at every landmark.**
+Same principle, applied across landmarks rather than within a siege, and it was added
+because the opposite was shipping: `resetSiege()` rewinds the wave counter, composition
+was keyed off it, and so a landmark's first wave was always seven chewers and three
+climbers. You fought thirty enemies with two bulwarks and a sapper, chose a road, and
+the next fight was structurally SIMPLER than the one you had survived. A playtester read
+that exactly as it was — "when I press one, does it matter? it seems like it just went
+next."
+
+Composition now runs on a tier that carries across landmarks; size still comes from the
+per-siege wave number. Measured: landmark 1 is byte-identical to before, sizes are
+10/15/20/25/30 at every leg, and landmark 2 opens with the roster it took three waves to
+earn the first time.
+
+Two guards, both found by measuring rather than reasoning. **Chewers are a reserved
+floor** (40%), not the remainder, or the ramps squeeze them to zero at higher tiers and a
+wave with nothing under the hull deletes half the pillar silently. And **one of every
+due type is allocated before any type gets a second**, because a single priority pass let
+the bulwark ramp take the room and the sapper — the only enemy that is a timer rather
+than a damage race — disappeared entirely. The boss wave is the explicit exception to the
+floor: `bossWaveScale` truncates a shuffled escort on purpose, and a thinner arena is the
+point of the one fight the deck wins.
 → test 81
 
 **20. Enemies must never teleport.** Worst legitimate frame-to-frame movement is
@@ -419,6 +579,40 @@ key for it. **A readout about the current second is transient, not a panel** —
 live conditional bonus is up only while a condition is actually being met, like the
 prompt and the telegraph, and so it never joins the count. The temptation both times
 was one more always-on box.
+
+**27b. A PERMANENT READOUT OWNS ITS SCREEN ZONE OUTRIGHT.** Nothing transient may share
+an anchor with something always visible, because a thing that comes and goes draws on
+top of the thing that is always there.
+
+This is 27's blind spot, and it shipped for two updates behind two green checks. The
+vitals panel, the contextual prompt, the salvage pick and the road choice were *all*
+anchored bottom-centre. The anchor check only compared always-visible panels to each
+other, so three of the four were out of scope; and the prompt is not a `.panel` at all,
+so it was invisible to the test twice over. The health and reactor bars — the two numbers
+the whole run hangs on — were therefore covered at precisely the moments they matter:
+while repairing under fire, while choosing an item, while choosing a road. Reported in
+those words: "it covers the health and the other stats".
+
+The fix moved the *permanent* thing, not the transient ones, and the reason generalises:
+a permanent readout can be placed once and learned, while a prompt has to appear where
+the player is already looking. Vitals went to the empty bottom-left corner — the FPS
+convention, in the lower visual field — and bottom-centre is now transient-only.
+
+Asserted by **screen zone** rather than by pixel rectangles, and that limit is
+deliberate. Heights here are content-driven and the harness has no DOM, so a rectangle
+test would need heights invented inside the test: a number that agrees with the layout
+the day it is written and then silently stops agreeing. A zone comes straight out of the
+CSS and cannot drift from what the browser does. The set of boxes is **derived**, not
+listed — every `.panel`, plus anything `position: fixed` that the HUD writes into — since
+a hard-coded list is exactly how the prompt escaped in the first place.
+
+The move also paid for a trim, and the test for each row was "is this shown anywhere
+else, and does the player act on it". The deck-gun heat bar went because the prompt's
+progress bar already *is* `1 - gun.heat` while a gun is manned; the hardpoints count went
+because the bay draws its own sockets. Both purses were **added**, because they lived
+only on the shop panel — which is up for about a third of a siege, so for the rest of it
+the player was earning money they could not see. The owner asked whether scrap still
+existed. It did.
 → test 67
 
 **28. The number keys have exactly one owner per frame.** The refit panel, the refit

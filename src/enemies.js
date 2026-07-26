@@ -57,6 +57,28 @@ const S = {
 
 export { S as ENEMY_STATE };
 
+/**
+ * Is this body underground, and therefore untouchable by ANYTHING?
+ *
+ * Exported as a predicate rather than left to each caller to write out, because the
+ * obvious spelling of the test — `e.burrowed` — is wrong and fails silently. There is
+ * no per-enemy `burrowed` flag; `horde.burrowed` is a COUNT, and `e.burrowed` is
+ * therefore always `undefined`, which is falsy, which means "not underground". Three
+ * separate call sites guessed that field name and every one of them read as a working
+ * exclusion while excluding nothing.
+ *
+ * Two of those were real bugs that shipped: fragmentation splash and the arc chain both
+ * skipped their burrowed check and could damage a submerged enemy, which is invariant
+ * 8's "the one type that cannot be shot cannot stay that way" read backwards — it cannot
+ * be shot, but a proc could reach it. Nothing tested it because the shot path has its
+ * own guard and the tests followed the shot.
+ *
+ * Same argument as the event bus using named methods over a string-keyed map: a
+ * misspelled channel fails silently in both directions, so make the mistake a
+ * `TypeError`. A typo'd import is a load error; a typo'd property is a wrong answer.
+ */
+export const isSubmerged = (e) => e.state === S.BURROWED;
+
 const _v = new THREE.Vector3();
 const _local = new THREE.Vector3();
 const _m = new THREE.Matrix4();
@@ -68,6 +90,15 @@ const _white = new THREE.Color(1, 1, 1);
 // is 400 Vector3s a frame at a full pool, and test 17 pins the whole simulation
 // step at well under a millisecond -- garbage is exactly how that budget goes.
 const _yAxis = new THREE.Vector3(0, 1, 0);
+
+// Wounded-tint resolution and its darkest step. Four bands is enough to answer the
+// only question a crowd raises -- "which of these is nearly dead" -- and few enough
+// that each step is unmistakable rather than a shade you have to compare. Kept here
+// rather than in CFG because these are the shape of the visual effect, not a
+// feel-relevant number anybody would tune in play, and CFG earns its weight from
+// numbers that get argued about.
+const TINT_BANDS = 4;
+const TINT_FLOOR = 0.42;
 
 /** Uniform spatial hash. Only used for neighbour separation, so hash
  *  collisions are harmless -- a false neighbour is a negligible extra nudge. */
@@ -141,6 +172,10 @@ export class Horde {
     for (let i = 0; i < CFG.enemies.max; i++) {
       this.pool[i] = {
         alive: false, type: CHEWER, hp: 0, maxHp: 1,
+        // Which wounded-tint band was last written for this body. -1 means "not
+        // written yet", which forces one upload on the frame it appears rather than
+        // inheriting whatever the previous occupant of this pool slot looked like.
+        tintBand: -1,
         x: 0, y: 0, z: 0, vx: 0, vz: 0,
         state: S.HUNT_LEG, legIndex: 0, routeIndex: 0, climbT: 0, atkCd: 0,
         onHull: false, yaw: 0, flash: 0,
@@ -285,6 +320,10 @@ export class Horde {
     e.type = type;
     e.maxHp = cfg.hp * hpScale;
     e.hp = e.maxHp;
+    // Force one tint write on the frame it appears. A pooled slot keeps its last
+    // occupant's band, so a fresh full-health enemy re-using the slot of something
+    // that died at 20% would otherwise be drawn dark until it took a hit.
+    e.tintBand = -1;
     e.x = t.group.position.x + Math.cos(ang) * r;
     e.z = t.group.position.z + Math.sin(ang) * r;
     e.y = cfg.height / 2;
@@ -325,7 +364,16 @@ export class Horde {
       e.alive = false;
       e.reactorSlot = false;
     }
+    // All four counters, not just the live count. The other three are recomputed in
+    // update(), so leaving them stale means anything polling them between a clear and
+    // the next frame reads the cleared fight's numbers -- the HUD showing "0 (5 under,
+    // 2 aboard)" for a frame after a restart, and, since the buy window now asks
+    // whether anything is under the hull, a shop that stays shut on the frame a run
+    // begins.
     this.liveCount = 0;
+    this.underHull = 0;
+    this.aboard = 0;
+    this.burrowed = 0;
 
     // Re-seed, so a restarted encounter is the SAME fight. Seeding exists to make
     // two attempts comparable; carrying the stream across a reset would hand the
@@ -779,7 +827,42 @@ export class Horde {
         _flash.setRGB(beat, beat * 0.45, beat * 0.3);
         mesh.setColorAt(i, _flash);
       } else if (mesh.instanceColor) {
-        mesh.setColorAt(i, _white);
+        // Wounded things read darker. This is the crowd half of enemy health
+        // feedback and it is deliberately NOT a bar.
+        //
+        // Why it matters: until this existed the only damage feedback in the game
+        // was a one-frame white flash, so against a bulwark carrying 740 hp at the
+        // ramp it actually spawns on, a player emptying a magazine had no way to
+        // tell "wrong tool" from "broken game". That is the exact failure invariant
+        // 8 was written to prevent, and it was happening.
+        //
+        // Why not floating bars: the two games nearest this one both ship without
+        // them and invest in in-world feedback instead. Forty-five bars over a
+        // crowd is also forty-five things to draw, and this is free -- the
+        // per-instance colour buffer already exists for the flash.
+        //
+        // QUANTISED into bands rather than a smooth fade, for two reasons. It reads
+        // as a state you can name instead of a gradient you have to compare against
+        // a neighbour, which is the same argument the segmented HUD gauges won. And
+        // it makes the "did anything change" test below cheap and exact, so an
+        // untouched crowd costs no buffer upload at all.
+        const band = e.hp > 0
+          ? Math.ceil((e.hp / Math.max(e.maxHp, 1e-6)) * TINT_BANDS)
+          : 0;
+        if (band !== e.tintBand) {
+          e.tintBand = band;
+          anyFlash = true;
+        }
+        if (band >= TINT_BANDS) {
+          mesh.setColorAt(i, _white);
+        } else {
+          // Floor short of black: the silhouette is the only cue available at 70 m
+          // through dust, and a nearly-dead enemy that has gone invisible is a
+          // worse problem than the one this solves.
+          const k = TINT_FLOOR + (1 - TINT_FLOOR) * (band / TINT_BANDS);
+          _flash.setScalar(k);
+          mesh.setColorAt(i, _flash);
+        }
       }
     }
 

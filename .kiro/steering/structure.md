@@ -1,6 +1,6 @@
 # Trampler — code structure
 
-26 modules, ~11,000 lines in `src/`, plus a ~6,100-line headless harness.
+26 modules, ~11,900 lines in `src/`, plus a ~7,300-line headless harness.
 
 Line counts below are rounded to the nearest ten and are there for a sense of
 weight, not as a fact to rely on. They drift every commit.
@@ -19,7 +19,7 @@ tools/
   summarise.mjs     failures + totals from a run, since the output is 700 lines
 assets/             vendored CC0 textures + HDRI, plus manifest.json
 src/
-  config.js   1670  every tunable, with a comment explaining each value
+  config.js   1800  every tunable, with a comment explaining each value
   util.js       60  box(), boxToMesh(), seeded RNG, clamp/lerp/damp/smoothstep
   look.js      480  HEADLESS-SAFE materials, UV tiling, enemy silhouettes
   collision.js 180  space-agnostic AABB resolve, ground probe, mantle search
@@ -27,18 +27,18 @@ src/
   trampler.js 1000  the fortress: geometry, gait, spatial damage, transforms
   player.js    570  FPS controller, based movement, mantle, health
   grapple.js   260  winch: hull-local anchors, brake, cut-vs-arrive release
-  enemies.js  1010  pooled horde, instanced draw, spatial hash, six AI types
-  waves.js     340  director: pacing on crew pressure, composition, the boss
-  run.js       230  legs of a journey, the salvage pick, road choice, modifiers
-  weapon.js    260  the single hitscan path, tracers, impacts
+  enemies.js  1090  pooled horde, instanced draw, spatial hash, wounded tint
+  waves.js     400  director: pacing, size vs roster tier, composition, the boss
+  run.js       360  legs, the pick cadence, road choice, cumulative modifiers
+  weapon.js    350  the single hitscan path, the aim scan, tracers, impacts
   deckgun.js   250  manned mounts, hull-local traverse arcs, heat
   repair.js    180  contextual repair, ground markers, grace window
   emitters.js  290  hull-mounted shock emitters: the tower-defence layer
   modules.js   200  three hardpoints, six modules, absolute-from-count effects
   events.js    120  the kill/hit bus items hang procs off, with a depth cap
-  items.js     330  the salvage table: static effects, conditionals, procs
-  economy.js   670  two purses, the re-rolled shop, the pick, the early call
-  hud.js       670  gauges, prompts, refit panel, bay, pick, route, buff strip
+  items.js     350  the salvage table: static effects, conditionals, procs
+  economy.js   810  two purses, the re-rolled shop, the pick, the buy window
+  hud.js       780  gauges, prompts, shop, bay, pick, route, target, buffs
   render.js    390  renderer, EffectComposer chain, camera shake
   fx.js        470  one pooled particle system, muzzle light
   viewmodel.js 160  the rifle in your hands
@@ -50,7 +50,7 @@ src/
 ## The headless boundary
 
 This is the most important structural rule in the project, and it is what makes a
-6,100-line test harness possible at all.
+7,000-line test harness possible at all.
 
 The harness constructs the **real** `World`, `Trampler`, `Player`, `Horde`,
 `Director`, `Weapon`, `Repair`, `DeckGun`, `Emitters`, `Modules`, `Events`,
@@ -218,6 +218,60 @@ Two things about it are load-bearing:
   present — invariant 2b failing in a way nothing looks wrong about. Income
   deliberately ignores `source` and pays either way.
 
+### Wave SIZE and wave ROSTER run on different counters
+
+`buildWave(wave, tier)`. `wave` rewinds at every landmark and decides how many
+enemies arrive; `tier` carries across landmarks and decides which types.
+
+They were one counter, and the result was the flattest thing in the run: a landmark's
+first wave was always seven chewers and three climbers, so the fight *after* a road
+was structurally simpler than the one before it. Four repetitions of one five-wave
+curve, escalating only through multipliers on enemy health nobody can perceive.
+
+The split is invariant 19e restated. Size was tuned against measured pacing and is
+not what was wrong; moving both at once is what makes a later difficulty change
+impossible to attribute to either.
+
+Two things protect the arena the escalation happens in, and both were found by
+measuring rather than by reasoning:
+
+- **Chewers are a reserved floor, not the remainder.** They used to be whatever was
+  left after the specials, with a comment noting the caps were the only thing
+  stopping that reaching zero. Carry the tier across landmarks and the ramps want
+  three bulwarks and three sappers against a ten-enemy first wave. A wave with no
+  chewers has nothing under the hull, which deletes half the pillar silently.
+- **Allocation is two passes, and the first one is why.** One of every type *due* at
+  this tier, then the remainder in priority order. A single priority pass let the
+  bulwark ramp take the room and the SAPPER vanished from the wave — the one enemy
+  that is a timer rather than a damage race. Escalating a roster and having it eat
+  itself is worse than not escalating it.
+
+### The simulation publishes what the HUD needs; the HUD computes nothing
+
+Established by the pure readers (`fx.js` polls `trampler.footfalls`), and Update 1.5
+added three more:
+
+- `weapon.aimTarget` / `aimDist` / `aimArmour` — what a shot fired right now would
+  hit. In `weapon.js` rather than `hud.js` for the reason the number-key router is in
+  `economy.js`: the harness cannot import `main.js` or see the DOM, so a rule that
+  lives in the HUD has no test behind it. It is also the honest home, since "would
+  this shot land" is the weapon's own question and therefore goes through the same
+  occlusion clip that keeps chewers safe under the hull.
+- `items.bonus` / `items.reasons` — the live conditional damage and why.
+- `run.modifiers` / `run.roadsTaken` — what the roads have cost so far.
+- `economy.open` / `economy.pickOpen` — whether this is a moment to read a shop or a
+  three-item menu in. Both the panels and the number-key router read the same getters,
+  which is the point: a HUD that decided for itself when to show the pick would be a
+  second safety rule, and two nearly-identical safety rules drift until the shop and the
+  pick disagree about whether the moment is safe.
+
+Note the ORDER lesson buried in the aim scan. `shootFrom` clips on geometry first,
+because the clip decides where the tracer ends. The scan must do the opposite — walk
+the horde first and only clip if something is on the ray — because no clip can produce
+a target when the horde is not there. Copying the shot's order cost 0.21 ms a frame at
+a full pool, against a whole-simulation budget of one millisecond, for a readout under
+the crosshair. `intersectObjects` is the expensive call, not the pool walk.
+
 ### Run modifiers are instance state too
 
 `run.threatScale`, `run.extraCount`, `run.fogScale` and `horde.speedScale` are the
@@ -284,6 +338,11 @@ pending salvage pick (1-3) all want the same keys. `routePurchaseInput` in
 `economy.js` picks one owner in priority order — **pick, road, bay, panel** — and
 hands `null` as the input to the others. Two consumers of one key set is a bug
 waiting for the frame both are visible.
+
+The pick's claim is gated on `economy.pickOpen`, not on the offer existing. A pick now
+*waits* for a safe window, and a claim it cannot act on is worse than no claim: the keys
+would be owned by something that refuses them and unavailable to the shop or the bay for
+as long as the pick sat there. **An owner that can refuse must not claim.**
 
 The precedence is ordered by how stuck the crew is without it. A pending pick
 blocks the road behind it; a road blocks the whole run; the bay and the panel are

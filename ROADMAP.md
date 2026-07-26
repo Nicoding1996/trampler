@@ -5,7 +5,7 @@ Design context is in `.kiro/steering/`. Read `product.md` first, then
 
 ```
 npm start      # http://localhost:5173
-npm run verify  # 98 sections, 643 checks, headless
+npm run verify  # 101 sections, 715 checks, headless
 npm run audit   # static checks the harness structurally cannot make
 npm run cost    # draw calls, triangles, shadow casters, lights — no renderer needed
 npm run imports # every import specifier resolves
@@ -34,10 +34,12 @@ Everything that was on this roadmap below Tier 3 is built and measured.
 | Tier 2 Audio | done — synthesised, no files |
 | Tier 2 An automated deck turret | **still deliberately shelved**, see below |
 | Update 1 The Salvage Table — build variety | done |
-| Update 2 The Roster — enemy variety | next |
+| Update 1.5 Legibility — make it all readable | done |
+| Update 1.6 HUD layout and the buy window | done |
+| Update 2 The Roster — enemy variety | next, after a playtest |
 | Tier 3 Networked players on a moving platform | untouched, and needs an engine spike |
 
-643 headless checks pass. Two consecutive full runs differ in exactly one line:
+715 headless checks pass. Two consecutive full runs differ in exactly one line:
 the wall-clock performance reading.
 
 ## What is actually missing, and the three updates that fix it
@@ -52,9 +54,9 @@ What varies between two runs:
 | | Variety | after Update 1 |
 |---|---|---|
 | Weapons | 1 rifle, never changes | unchanged |
-| Personal upgrades | 4, all numeric multipliers, always offered, same prices, same order | **16 in a pool, 3 rarity tiers, 4 offered per landmark, plus a free pick of 3** |
+| Personal upgrades | 4, all numeric multipliers, always offered, same prices, same order | **16 in a pool, 3 rarity tiers, 4 offered per landmark, plus 3 free picks** |
 | Fortress | 2 refits + 6 modules, always offered | unchanged, deliberately — the bounded track is the dependable one |
-| Enemies | 6 types, on a fixed introduction schedule | unchanged — Update 2 |
+| Enemies | 6 types, on a fixed introduction schedule | same six, but the schedule now **carries across landmarks** — Update 2 adds types |
 | Boss | 1 | unchanged — Update 3 |
 | Roads | 6 in the table, 2 offered per landmark | unchanged |
 | Biome | 1 | unchanged — Update 3 |
@@ -127,6 +129,153 @@ Invariant 2b-i is the enforced form, and the measurement is that the whole table
 three stacks deep changes unattended time-to-crippled by **nothing at all**: 131.1 s
 before the item layer existed, 131.1 s with it, and 0 procs across 23 unattended
 kills.
+
+### Update 1.5 — Legibility — DONE
+
+Not planned. It came out of the first playtest of Update 1, and the striking thing about
+that playtest was that **none of the four complaints was about balance**:
+
+| what was said | what it actually was |
+|---|---|
+| "the grey creature, the tank — why are they hard to kill?" | no enemy damage feedback existed at all |
+| "I just spam buy items out of panic" | the buy window overlapped the fight |
+| "when I press one, does it matter? it seems like it just went next" | road costs were never shown, and the roster reset each landmark |
+| "I barely survive wave 4" | plausibly all three of the above |
+
+The last row is the one that set the order. A difficulty report from a player who cannot
+read the fight is not attributable to difficulty — and note that the player reported the
+same wave-4 ceiling *before and after* eighteen new items, which is strong evidence they
+could not tell what to buy or when. So: fix every readout, change no difficulty number,
+then ask again.
+
+Five items, suite 643 → 697.
+
+1. **Enemy damage feedback**, which the game had none of. Wounded bodies are drawn
+   darker in four bands through the per-instance colour buffer the hit flash already
+   allocated — free, no UI, and an untouched crowd costs no upload. The thing under the
+   crosshair gets a name, a bar, and whether its armour is in the way. Deliberately not
+   forty-five floating bars: the two shipped games nearest this one omit those on purpose.
+2. **A pick every two waves**, not only for holding a siege. The old cadence put the
+   headline reward of Update 1 behind wave five of five, and the player averaged four —
+   they had met it once in an evening. Three per landmark now, first at wave 2.
+3. **The buy window narrowed** to a rest or a hold *with the fortress clear*. It used to
+   include the incoming-wave telegraph and a rest that permits eight live enemies.
+   Measured after: 52 s of shopping across a 152 s siege, in windows of about 12 s, and
+   with a competent defender the clear-field clause never bites.
+4. **The journey escalates in kind.** Composition runs on a tier that carries across
+   landmarks while wave size still rewinds, so landmark 2 opens with the roster it took
+   three waves to earn — instead of the fight after a road being *simpler* than the one
+   before it. Plus the road readout: the arrival banner names the cost as well as the
+   payout, and the route panel shows what the biome has already taken from you.
+5. **The bulwark's plate is on its front only.** This is the answer to a playtester
+   asking for headshot damage. The instinct was right — armour could only be out-bought,
+   never out-played — but a head multiplier would have handed the rifle a bulwark and
+   taken the deck gun's recurring job away. 60 rounds head-on, 12 from behind, and abeam
+   is not enough. Skill answer, positional, so it reinforces the pillar instead of
+   competing with it.
+
+**One thing deliberately NOT done: the road costs were not retuned.** They are measured
+and they are tiny — four of six roads cost essentially nothing, and the worst is +18%
+enemy health against a time ramp already at x2.40:
+
+| road | real cost | pays |
+|---|---|---|
+| THE OLD FOUNDRY | **nothing** | 30 scrap |
+| SALT FLATS | +12% enemy speed | 45 salvage, 15 scrap |
+| THE DUST BOWL | fog to 55% | 20 salvage, 60 scrap |
+| THE RIFT | +4 enemies per wave | 55 salvage, 70 scrap |
+| THE BONEYARD | +18% enemy health | 30 salvage, 20 scrap, a free module |
+| SCRAP FIELDS | +10% health, +2 per wave | 95 salvage, 25 scrap |
+
+The reason for waiting is the update's own thesis: I cannot yet tell whether those costs
+are imperceptible *as numbers* or imperceptible *because nothing displayed them*. Now
+that both are displayed, the next playtest can produce the attributable version — "I saw
++18% and did not feel it" — and that is a fact worth tuning against. Raising them is
+also a difficulty increase, and the player is already struggling.
+
+Four things it also fixed on the way, each found by measuring rather than by review:
+
+- **Chewers could have hit zero.** They were the *remainder* after specials, and carrying
+  the tier across landmarks made the ramps want more than a ten-enemy wave holds. A wave
+  with no chewers has nothing under the hull, which deletes half the pillar silently.
+  They are a reserved 40% floor now.
+- **The sapper vanished at landmark 3.** A single-pass priority allocation let the bulwark
+  ramp eat the room, and the one enemy that is a timer rather than a damage race dropped
+  out of the wave. Fixed by allocating one of every due type before any type gets two.
+- **`Horde.clear()` left three counters stale.** Harmless until the buy window started
+  reading `underHull`, at which point the shop stayed shut on the frame a run began.
+- **Two tests were firing into a bulwark's back without knowing it**, and had passed only
+  because angle used to be irrelevant. The geometric form of "sampling at the wrong
+  moment", now an entry in `tech.md`.
+
+### Update 1.6 — the HUD layout, and a rule written backwards
+
+The playtest after 1.5 produced two complaints, and both were about 1.5's own work rather
+than about anything older. Suite 697 → 715.
+
+**"It covers the health and the other stats."** Four things were anchored to the bottom
+centre of the screen — the vitals panel, the contextual prompt, the salvage pick and the
+road choice — and the three transient ones drew on top of the permanent one. So the health
+and reactor bars were hidden at precisely the moments they matter: repairing under fire,
+choosing an item, choosing a road.
+
+It shipped for two updates behind a green test, which is the interesting part. Test 67
+compared always-visible panels *to each other*, so the three that come and go were out of
+scope; and the prompt is not a `.panel`, so it was invisible twice over. The test was
+extended **first**, made to fail naming all three offenders, and only then was anything
+moved. It now asserts by screen zone that a permanent readout owns its anchor outright,
+over a set of boxes it derives rather than one written down — a hard-coded list is how the
+prompt escaped originally.
+
+Vitals moved to the empty bottom-left corner and lost every row shown elsewhere: the
+deck-gun heat bar, because the prompt's progress bar already *is* `1 - gun.heat` while a
+gun is manned; the hardpoints count, because the bay draws its own sockets. Both purses
+were added, which answers the other complaint — **"is the scrap shop gone? I can't seem
+to use it"**. Scrap was fine. The purses were only ever drawn on the shop panel, which is
+up for about a third of a siege, so for the rest of it the player was earning money they
+could not see.
+
+**And the buy window was rewritten, because 1.5's version measured badly.** "Nothing
+beneath the hull and nothing on the deck" sounded better than it performed: it cost a
+competent player exactly zero seconds and a struggling one up to a third of their window,
+and it varied 64% to 97% between two passes on the *same seeds*. The player who most
+needs to buy something was the only one locked out, and could not tell why — "some enemy
+is under the hull somewhere on a 26 m chassis" is not a state you can see or fix in a
+second. It now asks whether anything is within 6 m of **you**, reusing the range the
+contested-repair rule already owns. The property that matters is that you satisfy it by
+stepping back; the old one could only be satisfied by finishing the fight.
+
+The salvage pick waits for that same window now, through the same getter rather than a
+second rule that means roughly the same thing. A 680 px three-item menu used to open the
+instant a wave resolved, which is frequently while the remains of it are still on you —
+the shop's panic problem with none of the shop's protection. Rejected: **pausing**. Co-op
+is the primary experience and you cannot stop a horde game for one player's menu.
+
+Three bugs found on the way, and the first is the one worth remembering:
+
+- **A live invariant violation hidden behind a field that does not exist.** Three places
+  tested `enemy.burrowed` to decide whether something was underground. There is no such
+  field — `horde.burrowed` is a *count* — so every check read `undefined`, every branch
+  said "not underground", and all three exclusions excluded nothing. Two were live:
+  fragmentation splash and the arc chain could damage a submerged burrower, which is
+  invariant 8's "the one type that cannot be shot cannot stay that way" read backwards.
+  Nothing caught it because the shot path has its own occlusion clip and the tests
+  followed the shot. Found by writing the same wrong line a fourth time and having a new
+  test disagree. Fixed with an exported `isSubmerged` predicate, so the mistake is now a
+  load error rather than a silent falsy read.
+- **Holding a siege re-rolled a pick still in hand**, which invariant 22f forbids. Latent
+  for as long as picks resolved within a frame or two of being earned; making the pick
+  *wait* turned a rare case into an ordinary one.
+- **My own overlap test misread the CSS twice** — any percentage offset as "centred", so
+  the telegraph at `top: 8%` landed in the middle of the screen, and only `display: none`
+  as "hidden", so a banner that fades on `opacity` counted as permanent. Both reported a
+  bogus failure with complete confidence.
+
+**Still not done: the road costs.** Deferred again, and for the same reason as in 1.5 —
+the next playtest is the one that can say "I saw +18% and did not feel it", which is a
+fact worth tuning against. When it is done, the lever is **speed and fog** rather than
+health: enemy speed spends itself on a human's travel and reaction time, which is what
+these roads are supposed to tax.
 
 ### Update 2 — The Roster (enemy variety) ← next
 
@@ -412,6 +561,19 @@ controls.
   still?** The transition pair is the whole thesis of the categories — one item pays
   for boarding, another for dropping off — and three seconds may be too short to
   notice at all.
+- **Now that a road states its cost, is +18% enemy health a cost you can feel?** This is
+  the question Update 1.5 deliberately left open rather than pre-emptively tuning. If the
+  answer is no, the road table needs bigger numbers — and the ones worth raising are
+  speed and fog, because those are what a human perceives, not health.
+- **Does the wounded tint let you pick out a nearly-dead enemy in a crowd of thirty?**
+  Four bands, floored at 42% brightness so a dying body does not disappear at 70 m
+  through dust. Eyes-only.
+- **Is the flank on a bulwark something you actually do, or something you know about and
+  never bother with?** It costs leaving the fortress. If nobody does it, the readout
+  saying ARMOUR EXPOSED is doing nothing and the arc should widen.
+- **Do three picks a landmark feel generous or noisy?** It went from one to three in one
+  step, which is also a power increase — so if wave 4 suddenly stops being a wall, that
+  is a candidate cause and not necessarily the legibility work.
 - **Is four shop slots enough exposure to the pool across a biome?** Sixteen offers
   plus three picks a landmark. If a run regularly ends without having seen anything
   interesting, `CFG.economy.pickCount` is cheaper to raise than the key count.

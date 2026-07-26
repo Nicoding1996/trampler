@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { CFG } from "./config.js";
+import { CFG, enemyCfg, armourAt } from "./config.js";
 import { makeRandom } from "./util.js";
 
 // Hitscan rifle. Deliberately plain -- it exists so there is something to do
@@ -33,6 +33,26 @@ export class Weapon {
     this.kills = 0;
     this.blockedByHull = 0; // diagnostic: shots that hit the fortress instead
     this.hitFlash = 0;      // drives the crosshair hitmarker
+
+    // What a shot fired RIGHT NOW would connect with, or null. Rescanned every
+    // frame and polled by the HUD, following the same rule as every other reader:
+    // the simulation publishes state and has no idea a HUD exists.
+    //
+    // This lives on the weapon rather than in hud.js for the reason the number-key
+    // router does: a rule that matters belongs in a module, because the harness
+    // cannot import main.js and cannot see the DOM. It is also the honest place for
+    // it -- the question the readout answers is "would this shot land", which is
+    // the weapon's own question, and it therefore goes through the same occlusion
+    // clip that keeps chewers safe under the hull. A target you cannot shoot is
+    // correctly reported as no target at all.
+    this.aimTarget = null;
+    this.aimDist = 0;
+    // How much armour a shot RIGHT NOW would actually meet, which is not the same as
+    // the type's armour once a plate is directional. Published so the readout can say
+    // "your rifle works from here", which is the only way the flank rule ever gets
+    // taught -- a player who never happens to walk behind a bulwark would otherwise
+    // never learn it exists.
+    this.aimArmour = 0;
 
     this.raycaster = new THREE.Raycaster();
 
@@ -105,9 +125,73 @@ export class Weapon {
     }
   }
 
+  /**
+   * Rescan what the crosshair is on.
+   *
+   * Traced from the eye along the look direction, which is what the crosshair
+   * actually points at whether or not a station owns the trigger. A manned gun
+   * fires from its own mount with its own traverse clamp, so the readout answers
+   * "what are you looking at" rather than "what can that mount reach" -- naming the
+   * thing under the reticle is the useful answer, and the gun's own arc is already
+   * legible from the fact that it refuses to depress.
+   *
+   * Clipped on geometry first, like every shot, so something standing behind the
+   * hull reads as nothing rather than as a target.
+   */
+  scanTarget() {
+    const range = CFG.combat.weapon.range;
+    this.player.eyePosition(_origin);
+    this.player.lookDirection(_dir);
+
+    // Note the order, which is the REVERSE of shootFrom's and is the whole reason
+    // this is affordable to run every frame.
+    //
+    // A shot has to clip on geometry first, because the clip decides where the
+    // tracer ends and whether the round hit the fortress. This does not: if the
+    // horde is not on the ray at all then no clip can produce a target, so the
+    // expensive half is skipped entirely whenever the crosshair is on empty desert
+    // — which is most of the time. Doing it the other way round cost 0.21 ms a
+    // frame at a full pool, against a whole-simulation budget of one millisecond,
+    // for a readout under the crosshair.
+    //
+    // `intersectObjects` is the expensive call, not the pool walk: the world's
+    // static scenery is merged into a few large meshes, and three.js tests those
+    // triangle by triangle.
+    const hit = this.horde.raycast(_origin, _dir, range);
+    if (!hit) {
+      this.aimTarget = null;
+      this.aimDist = 0;
+      this.aimArmour = 0;
+      return null;
+    }
+
+    // Something is on the ray. Now find out whether the fortress is in the way,
+    // because naming a chewer you cannot shoot through the hull would be worse than
+    // naming nothing at all — the readout has to agree with what a shot would do.
+    this.raycaster.set(_origin, _dir);
+    this.raycaster.far = hit.distance;
+    const solid = this.raycaster.intersectObjects(this.occluders, false);
+    const blocked = solid.length > 0 && solid[0].distance < hit.distance;
+
+    this.aimTarget = blocked ? null : hit.enemy;
+    this.aimDist = blocked ? 0 : hit.distance;
+    // The pierce a purchase bought is folded in here too, so the readout answers "will
+    // my armour problem actually bite from this angle with this build", rather than
+    // reciting a number off the type.
+    this.aimArmour = blocked
+      ? 0
+      : Math.max(0, armourAt(enemyCfg(hit.enemy.type), hit.enemy.yaw, _dir.x, _dir.z)
+        - this.armourPierce);
+    return this.aimTarget;
+  }
+
   update(dt, input) {
     this.cooldown = Math.max(0, this.cooldown - dt);
     this.hitFlash = Math.max(0, this.hitFlash - dt);
+    // Before the station early-return below, so the readout keeps working while a
+    // deck gun owns the trigger. Being told what you are aiming at matters MORE
+    // from a mount, because that is where the armoured things are answered from.
+    this.scanTarget();
 
     for (const t of this.tracers) {
       if (t.life <= 0) continue;
@@ -182,9 +266,20 @@ export class Weapon {
       // "player" because both the rifle and the manned deck guns come through here,
       // and a manned gun is the crew aiming. Only automation is excluded.
       //
-      // armourPierce is SABOT ROUNDS. Applied here rather than inside the item,
-      // because armour is resolved in one place on purpose -- see Horde.damage.
-      if (this.horde.damage(hit.enemy, dealt, "player", this.armourPierce)) this.kills++;
+      // TWO pierce terms, added together, and expressing the flank as a pierce is what
+      // keeps armour resolved in exactly one place (Horde.damage) rather than growing a
+      // second armour path here.
+      //
+      // armourPierce is SABOT ROUNDS -- a thing you bought.
+      // The second is a thing you DID: a shot arriving inside a type's rear cone goes
+      // around the plate instead of through it, so the bypass is worth exactly the
+      // plate you walked around. Composes with sabot for free, and stays zero for
+      // every type whose armour is omnidirectional.
+      const cfg = enemyCfg(hit.enemy.type);
+      const flank = cfg.armour - armourAt(cfg, hit.enemy.yaw, dir.x, dir.z);
+      if (this.horde.damage(hit.enemy, dealt, "player", this.armourPierce + flank)) {
+        this.kills++;
+      }
       // After the damage, so an on-hit item sees the enemy in the state the shot
       // left it in -- including dead, which is what lets "on hit" and "on kill"
       // items stack on the same shot rather than racing each other.

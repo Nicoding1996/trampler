@@ -1,6 +1,7 @@
 import * as THREE from "three";
-import { CFG, releasePresetName } from "./config.js";
+import { CFG, releasePresetName, enemyCfg } from "./config.js";
 import { PHASE } from "./waves.js";
+import { describeRoad } from "./run.js";
 import { Look } from "./look.js";
 
 const _v = new THREE.Vector3();
@@ -49,10 +50,13 @@ export class Hud {
 
       barHp: id("b-hp"),
       barReactor: id("b-reactor"),
-      barHeat: id("b-heat"),
       drive: id("r-drive"),
       emitters: id("r-emitters"),
-      build: id("r-build"),
+      // Both purses, on the always-visible panel as well as on the shop. The shop's
+      // copy is the one you buy against; this one is the one you PLAN against, and it
+      // exists because the shop is only up for about a third of a siege.
+      purseSalvage: id("v-salvage"),
+      purseScrap: id("v-scrap"),
       leg: id("r-leg"),
       wave: id("r-wave"),
       next: id("r-next"),
@@ -95,6 +99,7 @@ export class Hud {
     this.route = document.getElementById("route");
     this.routeHead = document.getElementById("route-head");
     this.routeItems = document.getElementById("route-items");
+    this.routeCarried = document.getElementById("route-carried");
     this.routeSignature = "";
 
     this.pick = document.getElementById("pick");
@@ -105,6 +110,11 @@ export class Hud {
     this.buffs = document.getElementById("buffs");
     this.buffGain = document.getElementById("buff-gain");
     this.buffWhy = document.getElementById("buff-why");
+
+    this.target = document.getElementById("target");
+    this.targetName = document.getElementById("tgt-name");
+    this.targetArmour = document.getElementById("tgt-armour");
+    this.targetBar = document.getElementById("tgt-bar");
 
     // Full-frame feedback. Both are elements rather than post-processing passes
     // because both are UI: they say something about the player's state, not about
@@ -133,7 +143,11 @@ export class Hud {
     // on screen at once — and worse than unreadable, it would be a lie: the router
     // gives the keys to the pick, so a press aimed at a refit spends the free pick
     // instead. The panel that does not own the keys has to be the one that goes away.
-    const open = economy.open && !this.bayOpen && !run?.picking;
+    //
+    // Keyed off the pick list rather than the run's phase, matching the router. A
+    // pick handed out mid-siege leaves the phase at SIEGE, so a phase check here
+    // would leave the shop up and lying about what its keys do.
+    const open = economy.open && !this.bayOpen && economy.pendingPick.length === 0;
     cls(this.shop, open ? "panel show" : "panel");
     if (!open) return;
 
@@ -241,15 +255,24 @@ export class Hud {
   }
 
   /**
-   * The free salvage pick, offered for holding a siege and resolved before the road.
+   * The free salvage pick — paid every couple of waves, and again for holding a
+   * siege.
    *
-   * Driven off `economy.pendingPick` rather than off the run's phase, so the panel
-   * cannot be up with nothing in it: the one thing it must never do is ask for a
-   * keypress that does nothing.
+   * Driven off `economy.pickOpen`, never the run's phase. Two reasons, and the second
+   * one was a bug waiting: the panel must not be up with nothing in it, because the one
+   * thing it can never do is ask for a keypress that does nothing — and a mid-siege
+   * pick leaves the run's phase at SIEGE, so a phase check would have hidden exactly
+   * the picks this cadence exists to deliver.
+   *
+   * `pickOpen` rather than `pendingPick.length` because the panel must also not be up
+   * at a moment the pick cannot be taken. It is a 680 px menu on the bottom-centre
+   * anchor, and it arrived the instant a wave resolved, which is frequently while the
+   * remains of that wave are still on you. Same window as the shop, same reason, and
+   * the rule is computed in economy.js so it has a test behind it.
    */
-  #pickPanel(run, economy) {
-    const offers = economy?.pickEntries ?? [];
-    const open = !!run?.picking && offers.length > 0;
+  #pickPanel(economy) {
+    const offers = economy?.pickOpen ? economy.pickEntries : [];
+    const open = offers.length > 0;
     cls(this.pick, open ? "panel show" : "panel");
     if (!open) return;
 
@@ -264,6 +287,53 @@ export class Hud {
       + `<div class="rr ${e.rarity}">${e.rarity}</div>`
       + (e.stacks > 0 ? `<div class="rs">you carry ${e.stacks}</div>` : "")
       + `</div>`).join("");
+  }
+
+  /**
+   * What the crosshair is on, and how much of it is left.
+   *
+   * Polled from `weapon.aimTarget`, which the simulation rescans every frame and
+   * clips on geometry exactly as a shot would — so something standing behind the
+   * hull correctly reads as no target rather than as one you cannot hit.
+   *
+   * The armour line is the point of this as much as the bar is. A bulwark carries
+   * flat armour 20 against a 25-damage rifle, which is the design saying "wrong
+   * tool", and the game had no way of saying it out loud: a playtester who had
+   * fought them for an hour still described one as "the grey creature, the tank",
+   * and could not tell a five-damage hit from a bug.
+   */
+  #targetPanel(weapon) {
+    const e = weapon?.aimTarget;
+    if (!e || !e.alive) {
+      cls(this.target, "");
+      return;
+    }
+
+    const cfg = enemyCfg(e.type);
+    // Three states, not two, and the third is the one that teaches something.
+    //
+    // A bulwark's plate is only on its front, and a rule nobody is ever told about is
+    // a rule nobody plays around: a player who never happens to walk behind one would
+    // never learn the flank exists. So the line reports the armour actually in the way
+    // RIGHT NOW — ARMOURED head-on, flipping to EXPOSED the moment you get behind it,
+    // in the same place, while you are looking at the thing.
+    //
+    // `weapon.aimArmour` already has sabot rounds subtracted, so a build that bought
+    // its way past armour also stops being nagged about it.
+    const inTheWay = weapon.aimArmour ?? cfg.armour;
+    const exposed = cfg.armour > 0 && inTheWay <= 0;
+
+    // The state classes go on the CONTAINER rather than on the line, because `set`'s
+    // third argument rewrites className to "v ..." and would drop the styling class
+    // off an element that is not one of the diagnostics rows.
+    cls(this.target, `show${e.hp < e.maxHp ? " hurt" : ""}${exposed ? " open" : ""}`);
+
+    set(this.targetName, cfg.label);
+    set(
+      this.targetArmour,
+      cfg.armour <= 0 ? "" : exposed ? "ARMOUR EXPOSED" : `ARMOURED ${Math.round(inTheWay)}`,
+    );
+    fill(this.targetBar, e.hp / Math.max(e.maxHp, 1e-6));
   }
 
   /**
@@ -289,9 +359,15 @@ export class Hud {
     set(this.buffWhy, items.reasons.join(" · "));
   }
 
-  /** Road choice at a landmark. Only up while the run is actually asking. */
-  #routePanel(run) {
-    const open = !!run?.choosing;
+  /**
+   * Road choice at a landmark. Only up while the run is actually asking.
+   *
+   * Steps aside for a pending pick, because the two share a screen anchor and the
+   * router gives the pick the keys. An untaken mid-siege pick is still pending when
+   * the last wave falls, so this pair genuinely overlaps now.
+   */
+  #routePanel(run, economy) {
+    const open = !!run?.choosing && (economy?.pendingPick?.length ?? 0) === 0;
     cls(this.route, open ? "panel show" : "panel");
     if (!open) return;
 
@@ -306,18 +382,7 @@ export class Hud {
       : `CHOOSE THE ROAD — LANDMARK ${nextLeg} OF ${CFG.run.legs}`;
 
     this.routeItems.innerHTML = run.offers.map((r, i) => {
-      const costs = [];
-      if (r.threat > 1) costs.push(`+${Math.round((r.threat - 1) * 100)}% enemy health`);
-      if (r.count > 0) costs.push(`+${r.count} per wave`);
-      if (r.speed > 1) costs.push(`+${Math.round((r.speed - 1) * 100)}% enemy speed`);
-      if (r.fog < 1) costs.push("visibility falls");
-      if (costs.length === 0) costs.push("no added risk");
-
-      const pays = [];
-      if (r.salvage) pays.push(`${r.salvage} salvage`);
-      if (r.scrap) pays.push(`${r.scrap} scrap`);
-      if (r.module) pays.push("a free module");
-
+      const { costs, pays } = describeRoad(r);
       return `<div class="road">`
         + `<div class="rn"><span class="key">${i + 1}</span> ${r.name}</div>`
         + `<div class="rd">${r.detail}</div>`
@@ -325,6 +390,20 @@ export class Hud {
         + `<div class="rp">pays ${pays.join(" · ")}</div>`
         + `</div>`;
     }).join("");
+
+    // What the roads already taken have done, above the two on offer.
+    //
+    // This is the answer to "when I press one, does it matter?" — it does, permanently
+    // and cumulatively, and until now nothing ever said so. Showing it HERE rather than
+    // as a standing HUD row is deliberate: it is not something you act on mid-fight, it
+    // is context for the choice being made, and it costs no always-visible space.
+    const carried = run.modifiers;
+    this.routeCarried.innerHTML = carried.length === 0
+      ? `<span class="none">the roads so far have cost you nothing</span>`
+      : `<span class="none">carrying, for the rest of the biome:</span> `
+        + `<span class="rw">${carried.join(" · ")}</span>`
+        + (run.roadsTaken.length
+          ? ` <span class="none">(${run.roadsTaken.join(" → ")})</span>` : "");
   }
 
   #showTelegraph(head, sub, frac, boss) {
@@ -400,9 +479,10 @@ export class Hud {
     } = ctx;
     this.#shopPanel(economy, run);
     this.#bayPanel(economy, modules);
-    this.#pickPanel(run, economy);
-    this.#routePanel(run);
+    this.#pickPanel(economy);
+    this.#routePanel(run, economy);
     this.#buffStrip(items);
+    this.#targetPanel(weapon);
 
     // ---- movement readout
     const world = player.worldVelocity(_v);
@@ -489,12 +569,11 @@ export class Hud {
       trampler.immobilised ? "bad" : drive < 1 ? "" : "on",
     );
 
-    // Deck gun heat
-    if (gun) {
-      fill(this.el.barHeat, gun.heat);
-      const heatCls = gun.overheated ? "hot" : "";
-      if (this.el.barHeat.className !== heatCls) this.el.barHeat.className = heatCls;
-    }
+    // Deck gun heat used to have a permanent bar here. It does not need one: the
+    // contextual prompt's progress bar is literally `1 - gun.heat` while a gun is
+    // manned, and the prompt says OVERHEATED in words when it is. Two readouts of one
+    // number, one of them always on screen for a state that only exists while you are
+    // sitting in a mount.
 
     if (emitters) {
       const ready = emitters.canDeploy(player);
@@ -505,12 +584,14 @@ export class Hud {
       );
     }
 
-    if (modules) {
-      set(
-        this.el.build,
-        `${modules.fittedCount} / ${modules.sockets.length}`,
-        modules.fittedCount > 0 ? "on" : "",
-      );
+    // The purses. Salvage rises on every kill and scrap only when a wave resolves, so
+    // seeing them apart is also the clearest statement invariant 22 has: one of these
+    // you earned alone, and the other the crew earned together.
+    if (economy) {
+      set(this.el.purseSalvage, String(Math.floor(economy.salvage)),
+        economy.open ? "on" : "");
+      set(this.el.purseScrap, String(Math.floor(economy.scrap)),
+        economy.open ? "on" : "");
     }
 
     if (run) {
@@ -527,8 +608,8 @@ export class Hud {
     // then the gun you are standing at, then the repair under your hands. Standing
     // at a mount and standing at a repair point are never the same place, so those
     // two cannot both be true, but a road choice can overlap either.
-    if (run?.picking && economy?.pendingPick?.length) {
-      this.#prompt(`1-${economy.pendingPick.length}`, "TAKE ONE", 1);
+    if (economy?.pickOpen) {
+      this.#prompt(`1-${economy.pendingPick.length}`, "TAKE SALVAGE", 1);
     } else if (run?.choosing) {
       this.#prompt("1-2", "CHOOSE A ROAD", 1);
     } else if (gun?.mounted) {
@@ -562,6 +643,15 @@ export class Hud {
         horde.fuseWarning / Math.max(CFG.enemies.sapper.fuse, 0.001),
         "blocked",
       );
+    } else if (economy?.pendingPick?.length) {
+      // A pick is banked but this is not a moment to read three items in. Lowest
+      // priority on purpose — everything above it is something to do RIGHT NOW, and
+      // this is the opposite: a reward that is already yours and cannot be lost.
+      //
+      // It has to be said at all, though. Making the panel wait without saying so
+      // would mean the player earned something and simply never found out, which is
+      // the same illegibility this whole update is about rather than a fix for it.
+      this.#prompt("1-3", "SALVAGE BANKED — TAKE IT WHEN CLEAR", 1);
     } else if (this.prompt.className !== "") {
       cls(this.prompt, "");
     }
@@ -594,7 +684,9 @@ export class Hud {
         paceCls = "bad";
         break;
       case PHASE.HELD:
-        pace = run?.picking ? "take salvage" : run?.choosing ? "choose a road" : "siege held";
+        pace = economy?.pendingPick?.length
+          ? "take salvage"
+          : run?.choosing ? "choose a road" : "siege held";
         paceCls = "on";
         break;
       default:

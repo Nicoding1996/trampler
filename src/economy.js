@@ -2,6 +2,7 @@ import { CFG, ENEMY_TYPE_KEYS } from "./config.js";
 import { makeRandom } from "./util.js";
 import { ITEM_EFFECTS } from "./items.js";
 import { PHASE } from "./waves.js";
+import { isSubmerged } from "./enemies.js";
 
 // The economy, and the reason it exists is Q.
 //
@@ -195,10 +196,82 @@ export class Economy {
 
   // ------------------------------------------------------------------ buying
 
-  /** Buying is a between-waves act, never a way to spend out of trouble. */
+  /**
+   * Buying is a between-waves act, never a way to spend out of trouble — and
+   * "between waves" has to mean a moment the crew can actually READ a shop in.
+   *
+   * This was three phases wide and a playtester described the result exactly: "in the
+   * middle of the wave I am fighting, so I just spam buy items out of panic." They
+   * were right, and the numbers are worse than the complaint. The old window was the
+   * 10 s rest, which permits up to `holdUntilCleared` — EIGHT — enemies still alive,
+   * plus the 12 s preparation window, which exists to announce an incoming wave with a
+   * named bearing. So you could be told a wave was inbound, be fighting eight things,
+   * and be shown a six-item shop, all at once, on a countdown.
+   *
+   * Two things are wrong with that and they are the same thing said twice:
+   *
+   * PREP is not spare time. Invariant 19b says what it is for — the window that makes
+   * deploying an emitter a decision and gives the guns a reason to be manned at a
+   * specific moment. A shop competing for it does not add an option, it takes the
+   * preparation away.
+   *
+   * And a rest with eight hostiles in it is not a rest. `director.calm` is the
+   * PACING threshold and is deliberately generous, because reinforcements should not
+   * wait for a spotless field. Safety is a different question, and it is asked here
+   * about the OPERATIVE rather than about the fortress: is anything close enough to
+   * you, right now, that reading a shop is a bad idea.
+   *
+   * That second clause was originally "nothing beneath the hull and nothing on the
+   * deck", and it was wrong in a way worth recording, because it sounded better than
+   * it measured. Two things:
+   *
+   *   It cost a competent player exactly ZERO seconds and a struggling one up to a
+   *   third of their window. The player who most needs to buy something was the only
+   *   one it locked out, which is precisely backwards.
+   *
+   *   And the amount varied unpredictably between runs — two measured passes over the
+   *   same seeds gave 64% and 97% of the rest available — because it depended on which
+   *   enemies happened to be where. "Something is under the hull somewhere on a 26 m
+   *   chassis" is not a state a player can see or fix in a second, so a refusal read
+   *   as arbitrary. A playtester reported exactly that: they could not use the shop and
+   *   could not tell why.
+   *
+   * `threatRange` is the same 6 m the contested-repair rule already owns, and reusing
+   * it is deliberate: the two rules are asking the same question — is the operative
+   * under enough pressure that this job should not be going well — so they should not
+   * drift apart. The point of the change is that this is a rule you satisfy by MOVING.
+   * Step back and the shop opens; the old one only opened when the fight was finished.
+   *
+   * The window that remains is a rest or a hold with nothing on top of you, and HELD
+   * has no timer at all — so the unhurried moment to spend a siege's earnings is right
+   * after holding one. That is where the money came from.
+   *
+   * Measured: about 52 s of shopping per five-wave siege, in windows of roughly 12 s.
+   */
   get open() {
     const phase = this.director?.phase;
-    return phase === PHASE.REST || phase === PHASE.PREP || phase === PHASE.HELD;
+    if (phase !== PHASE.REST && phase !== PHASE.HELD) return false;
+    return !this.#crowded();
+  }
+
+  /** Is anything close enough to the operative to make reading a menu a bad idea? */
+  #crowded() {
+    const pool = this.horde?.pool;
+    if (!pool || !this.player) return false;
+    const reach = CFG.repair.threatRange;
+    const reach2 = reach * reach;
+    const p = this.player.position;
+    for (const e of pool) {
+      // Burrowed things are underground and cannot touch you, so they must not hold the
+      // shop shut either — the same exclusion the pacing pressure count makes, and for
+      // the same reason: there is nothing the crew can act on yet.
+      if (!e.alive || isSubmerged(e)) continue;
+      const dx = e.x - p.x;
+      const dy = e.y - p.y;
+      const dz = e.z - p.z;
+      if (dx * dx + dy * dy + dz * dz < reach2) return true;
+    }
+    return false;
   }
 
   /**
@@ -542,6 +615,30 @@ export class Economy {
   }
 
   /**
+   * Is there a pick to take, AND is this a moment to read three items in?
+   *
+   * The pick panel used to appear the instant a pick was earned, which is the instant
+   * a wave resolves — so a three-item menu 680 px wide arrived while the player was
+   * often still fighting the remains of a wave, on the same screen anchor as the
+   * health bars. The complaint about the shop was "I just spam buy items out of panic",
+   * and the pick had the identical problem with none of the shop's protection.
+   *
+   * So it waits for the same window the shop does, and deliberately the SAME getter
+   * rather than a second rule that means roughly the same thing: two nearly-identical
+   * safety conditions drift, and then the shop and the pick disagree about whether
+   * this moment is safe, which is unexplainable to a player.
+   *
+   * PAUSING was the alternative and it is rejected. Co-op is the primary experience
+   * and you cannot stop a horde game for one player's menu — Risk of Rain 2 and Deep
+   * Rock Galactic both decline to, for the same reason. Waiting costs the player
+   * nothing: the offer is never withdrawn, and invariant 22f already guarantees it
+   * cannot be stranded at the end of a biome.
+   */
+  get pickOpen() {
+    return this.pendingPick.length > 0 && this.open;
+  }
+
+  /**
    * Take one of the offered picks. Clears the rest: this is a choice, not a
    * shopping list, and the whole value of it is what you give up.
    *
@@ -549,6 +646,10 @@ export class Economy {
    *        because it is the only method here that takes a position.
    */
   takePick(slot) {
+    // The refusal lives here and not only in the router, because this is a public
+    // method and the router is not the only thing that could reach it. A rule enforced
+    // solely at the call site is a rule the next caller does not have.
+    if (!this.pickOpen) return null;
     const catIndex = this.pendingPick[slot];
     if (catIndex === undefined) return null;
     const item = CFG.economy.catalogue[catIndex];
@@ -652,9 +753,13 @@ export class Economy {
  * PRECEDENCE, most urgent first: salvage pick, road choice, refit bay, refit panel.
  * The ordering is by how stuck the crew is without it. A pick blocks the road behind
  * it; a road blocks the whole run; the bay and the panel are both things you can
- * simply walk away from. The pick and the road are never live at the same time --
- * the run resolves one into the other -- so that pair is ordered for safety rather
- * than because it can happen.
+ * simply walk away from.
+ *
+ * The pick and the road CAN now be live together, which they could not when a pick
+ * only came from holding a siege: an untaken mid-siege pick is still pending when the
+ * last wave falls, and the run then wants a road. So that pair is ordered because it
+ * happens, not merely for safety, and the panels follow the same order — the route
+ * panel steps aside for the pick, since they share a screen anchor.
  *
  * @param bayOpen whether the refit bay is up.
  */
@@ -662,7 +767,18 @@ export function routePurchaseInput({ economy, run, bayOpen, input, dt }) {
   // Highest precedence, because it is the only one of these states the crew cannot
   // leave by doing something else: the shop can be ignored and the bay can be shut,
   // but a pending pick blocks the road choice behind it until it is taken.
-  if (run?.picking) {
+  //
+  // Keyed off the pick list itself rather than off `run.picking`. A pick is now also
+  // handed out part-way through a siege, where the run's phase is still SIEGE, and a
+  // phase check would have left those picks with no owner for the keys at all — the
+  // panel up, the prompt saying TAKE ONE, and nothing happening. The honest question
+  // is "is there something to take", and that is what this asks.
+  //
+  // Gated on `pickOpen` rather than on the list alone, so a pick that is EARNED under
+  // fire does not seize the number keys before it is takeable. If it did, the keys
+  // would be dead for as long as the pick waited: owned by the pick, refused by
+  // `takePick`, and unavailable to the shop or the bay.
+  if (economy.pickOpen) {
     economy.update(dt, null);
     for (let i = 0; i < economy.pendingPick.length; i++) {
       if (!input.pressed(CFG.economy.keys[i])) continue;

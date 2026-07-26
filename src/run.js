@@ -39,6 +39,33 @@ import { makeRandom } from "./util.js";
 // you -- and partly so a headless test of "does a siege end" cannot be
 // invalidated by the run structure quietly starting the next one.
 
+/**
+ * What a road costs and what it pays, as text.
+ *
+ * Exported and shared because two places need it and they must not drift: the route
+ * panel, which describes a road you have not taken yet, and the arrival banner, which
+ * has to say what the road you just took actually DID.
+ *
+ * The banner used to name only the payout — "+20 salvage, +60 scrap" — and say nothing
+ * about the cost, which is half of why a playtester asked "when I press one, does it
+ * matter? it seems like it just went next." It did matter. Nothing told them.
+ */
+export function describeRoad(road) {
+  const costs = [];
+  if (road.threat > 1) costs.push(`+${Math.round((road.threat - 1) * 100)}% enemy health`);
+  if (road.count > 0) costs.push(`+${road.count} per wave`);
+  if (road.speed > 1) costs.push(`+${Math.round((road.speed - 1) * 100)}% enemy speed`);
+  if (road.fog < 1) costs.push("visibility falls");
+  if (costs.length === 0) costs.push("no added risk");
+
+  const pays = [];
+  if (road.salvage) pays.push(`${road.salvage} salvage`);
+  if (road.scrap) pays.push(`${road.scrap} scrap`);
+  if (road.module) pays.push("a free module");
+
+  return { costs, pays };
+}
+
 export const RUN = {
   SIEGE: "siege",
   // Holding a siege pays a free item BEFORE the road choice, not alongside it.
@@ -82,6 +109,11 @@ export class Run {
     this.extraCount = 0;
     this.fogScale = 1;
     this.horde.speedScale = 1;
+
+    // How many resolved waves have already been paid a pick. Polled against the
+    // director rather than driven by a callback, the same way the economy watches
+    // the same counter -- the director stays unaware that either exists.
+    this.seenResolved = this.director?.resolved ?? 0;
 
     this.#configureSiege();
   }
@@ -128,22 +160,39 @@ export class Run {
   }
 
   /**
-   * Called every frame. The only thing it watches for is a siege being held, at
-   * which point it offers roads -- it never advances anything by itself.
+   * Called every frame. It pays the wave cadence's picks and watches for a siege
+   * being held, at which point it offers roads -- it never advances anything itself.
    */
   update() {
+    this.#payWavePick();
+
     if (this.phase === RUN.SIEGE && this.director.held) {
       if (this.isBossLeg) {
-        // The boss leg pays nothing: the run is over, and an item you can never
-        // spend is a menu rather than a reward.
+        // The boss leg pays no pick FOR HOLDING IT: the run is over at that moment,
+        // and an item you can never spend is a menu rather than a reward.
+        //
+        // Anything still in hand goes with it, for the same reason. The wave cadence
+        // does pay during the boss siege -- fighting the titan is exactly when one
+        // more piece of build is worth having, and there is a wave left to spend it
+        // on -- but an offer left untaken when the biome ends would sit on screen
+        // asking for a keypress that can no longer matter.
         this.phase = RUN.DONE;
+        if (this.economy) this.economy.pendingPick = [];
       } else {
         // Seeing off a siege earns a pick. This is the reward beat the shop cannot
         // provide -- buying something is not the same feeling as being handed it --
         // and it widens how much of the pool a run actually sees, since four shop
         // slots a landmark only ever exposes a fraction of it.
+        //
+        // Not offered over the top of one already in hand. Invariant 22f says an offer
+        // must never be overwritten, because an item you were looking at vanishing
+        // reads as a bug rather than as luck -- and the cadence's own payer already
+        // honours that. This branch did not, and the gap only mattered once the pick
+        // started WAITING for a safe window: before that a mid-siege offer was almost
+        // always resolved within a frame or two of being earned, so the hold rarely
+        // found one still open. The window made the rare case ordinary.
         this.phase = RUN.PICKING;
-        this.economy?.offerPick();
+        if (!this.economy?.pendingPick?.length) this.economy?.offerPick();
       }
     }
 
@@ -158,6 +207,79 @@ export class Run {
 
   get picking() {
     return this.phase === RUN.PICKING;
+  }
+
+  /**
+   * Everything the roads have done to this run so far, as text, or an empty list.
+   *
+   * The modifiers were invisible. They are instance state on this object, they compound
+   * across the whole biome, and the only place any of it surfaced was a single combined
+   * number in the diagnostics panel — which is hidden by default and merges the road
+   * effect with the elapsed-time ramp, so even there you could not tell them apart.
+   *
+   * A cost you cannot perceive is not a cost, and a decision whose consequences are
+   * never shown is not a decision. This is read at the moment the next road is offered,
+   * which is the moment the question gets asked.
+   */
+  get modifiers() {
+    const out = [];
+    if (this.threatScale > 1.0001) {
+      out.push(`+${Math.round((this.threatScale - 1) * 100)}% enemy health`);
+    }
+    if (this.extraCount > 0) out.push(`+${this.extraCount} enemies per wave`);
+    if (this.horde.speedScale > 1.0001) {
+      out.push(`+${Math.round((this.horde.speedScale - 1) * 100)}% enemy speed`);
+    }
+    if (this.fogScale < 0.9999) {
+      out.push(`visibility ${Math.round(this.fogScale * 100)}%`);
+    }
+    return out;
+  }
+
+  /** The roads taken so far, in order, by name. */
+  get roadsTaken() {
+    return this.history.map((id) => CFG.run.routes.find((r) => r.id === id)?.name ?? id);
+  }
+
+  /**
+   * A free pick every few waves the crew sees off, not only at the end of a siege.
+   *
+   * The end-of-siege pick is a beat: you held the line, here is something, now
+   * choose a road. It is also, on its own, unreachable — a playtest averaged wave
+   * four of five, so the reward existed and the player had met it once. This is the
+   * same reward on a cadence they can actually reach.
+   *
+   * Three things about how it is written:
+   *
+   * It watches the director's own resolved counter rather than taking a callback, so
+   * a wave BURIED by pressing Q never pays one. That is not an edge case, it is part
+   * of what calling a wave early costs, and it falls out for free by polling the
+   * counter the economy already trusts for exactly the same reason.
+   *
+   * It uses the wave number WITHIN the siege, so the cadence is the same at every
+   * landmark. The resolved counter accumulates across the whole run, and keying off
+   * that would drift the rhythm — a pick after wave 3 at one landmark and after wave
+   * 2 at the next, for no reason a player could ever infer.
+   *
+   * And it never offers on top of a pick already pending. Overwriting one would make
+   * an offered item vanish and be replaced, which reads as a bug; the previous pick
+   * simply stands until it is taken.
+   */
+  #payWavePick() {
+    const d = this.director;
+    if (!d || !this.economy) return;
+    if (d.resolved === this.seenResolved) return;
+    this.seenResolved = d.resolved;
+
+    const every = CFG.run.pickEveryWaves;
+    if (every <= 0) return;
+    // The final wave of a siege is the hold's own business, and it pays a pick of
+    // its own a moment later. Two offers a frame apart would replace the first.
+    if (d.wave >= d.siegeLength) return;
+    if (d.wave % every !== 0) return;
+    if (this.economy.pendingPick.length > 0) return;
+
+    this.economy.offerPick();
   }
 
   #offerRoads() {
@@ -221,6 +343,11 @@ export class Run {
     this.lastArrival = {
       name: road.name,
       detail: road.detail,
+      // The road itself, so a caller can describe what it COST as well as what it paid.
+      // The flattened payout fields below are kept because existing readers use them,
+      // but anything new should go through `describeRoad(arrival.road)` rather than
+      // growing this object a field at a time until it is a copy of the road.
+      road,
       salvage: road.salvage,
       scrap: road.scrap,
       module: !!road.module,

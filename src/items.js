@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { CFG, hyperGain } from "./config.js";
 import { makeRandom } from "./util.js";
+import { isSubmerged } from "./enemies.js";
 
 // The salvage table: what a purchase actually does.
 //
@@ -205,7 +206,10 @@ export class Items {
       const o = pool[i];
       if (!o.alive || o === dead) continue;
       // Burrowed things are underground and untouchable -- invariant 8's other half.
-      if (o.burrowed) continue;
+      // This read `o.burrowed` for an entire update and therefore excluded NOTHING:
+      // there is no such per-enemy field, so splash was reaching enemies a bullet
+      // cannot touch. Hence the imported predicate. See `isSubmerged` in enemies.js.
+      if (isSubmerged(o)) continue;
       const dx = o.x - dead.x;
       const dz = o.z - dead.z;
       if (dx * dx + dz * dz > r2) continue;
@@ -223,7 +227,8 @@ export class Items {
     let bestD = r2;
     for (let i = 0; i < pool.length; i++) {
       const o = pool[i];
-      if (!o.alive || o === from || o.burrowed) continue;
+      // Same silent bug as #splash: an arc could chain INTO something underground.
+      if (!o.alive || o === from || isSubmerged(o)) continue;
       const dx = o.x - from.x;
       const dz = o.z - from.z;
       const d = dx * dx + dz * dz;

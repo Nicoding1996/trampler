@@ -102,7 +102,7 @@ the verification.
 ## Verification
 
 `verify.mjs` runs the real simulation modules in Node with no DOM and no
-renderer: 98 sections, 643 assertions. The failure modes here — drift, being
+renderer: 101 sections, 715 assertions. The failure modes here — drift, being
 yanked off a turning deck, an anchor that does not track the hull, an enemy
 shielded by geometry, an automated defence that quietly holds a position — are
 invisible to inspection and tedious to confirm by hand.
@@ -191,12 +191,61 @@ Every one of these produced a green or red result that was wrong:
   `horde.damage(e, n, "emitter")` directly. That proves the gate works and says
   nothing about whether `emitters.js` passes the string at all — which is the half
   that can rot. Deploy the real emitter and let it kill something.
+- **A check that reads a field which does not exist.** Three places tested
+  `enemy.burrowed` to decide whether something was underground. There is no such
+  field — the state is `e.state === ENEMY_STATE.BURROWED`, and `horde.burrowed` is a
+  *count*. So `e.burrowed` was `undefined` on every enemy, every branch read as
+  "not underground", and all three exclusions excluded nothing. Two of them were live
+  bugs: fragmentation splash and the arc chain could damage a submerged burrower, which
+  is invariant 8's "the one type that cannot be shot cannot stay that way" read
+  backwards. Nothing caught it because the *shot* path has its own occlusion clip and
+  the tests followed the shot.
+
+  A wrong property name is worse than a wrong function name, because it is not an
+  error. The fix is the same one the event bus uses: export a predicate —
+  `isSubmerged(e)` — so the mistake becomes a load failure rather than a silent falsy
+  read. **When a condition is asked in more than one module, export the question.**
+
+  Note how it surfaced: writing the identical line in a fourth place and having a new
+  test disagree with it. The other three had no test at all.
+- **A test whose own parser misreads the thing it is checking.** The panel-overlap
+  check maps CSS to a screen zone, and the first version treated *any* percentage
+  offset as "centred" — so `#telegraph` at `top: 8%` was placed in the middle of the
+  screen. It also looked only for `display: none` when deciding what was permanently
+  visible, and the telegraph hides with `opacity: 0` because it is a fading banner. Two
+  wrong readings, one bogus failure reported with total confidence. A test that derives
+  facts from source text needs its derivation checked against the real thing, exactly
+  like any other measurement.
+- **A rule with no test because it only exists in the HUD.** Every readout added in
+  Update 1.5 is computed in a simulation module and merely *drawn* by `hud.js`, for the
+  same reason the number-key router lives in `economy.js`: the harness cannot import
+  `main.js` and cannot see the DOM, so anything decided in the presentation layer is
+  untestable by construction. If a readout has a rule in it — "a target behind the hull
+  is no target", "armour that a purchase already pierced should not be nagged about" —
+  the rule belongs in the module and the HUD gets a field to read.
+- **Test scaffolding that fights a gate the feature just tightened.** When the buy window
+  narrowed, a restart test that forced `phase = REST` to make a purchase legal started
+  failing — legality now also wanted a clear fortress. The first repair added
+  `horde.clear()` *and* a `step()`, and broke two more checks: the step let the director
+  walk REST → PREP now that the field was calm, shutting the window again, and it added a
+  frame of elapsed time to a test whose whole subject is an exact replay. Arrange the
+  state the gate wants; do not simulate your way toward it.
 - **Sampling an oscillating state at one instant.** "Is the chewer parked" and
   "is the gun overheated" both cycle. Measure over a window, or track whether the
   state was *ever* reached.
 - **Sampling at the wrong moment in a sequence.** The boss is released first and
   its escort trickles in behind it, so checking the escort's health on the frame
   the boss appears measures an empty set and passes for the wrong reason.
+  The same trap has a **geometric** form, and it caught two tests at once. Once a
+  bulwark's armour was only on its front, the assertions claiming "a rifle round is
+  soaked" and "the readout says ARMOURED" both turned out to be firing into its *back*:
+  the bulwark spawns between the player and the fortress and walks toward the fortress,
+  so its back was to the shooter. Both had passed only because angle used to be
+  irrelevant. If a test depends on an orientation, **pin the orientation and assert it**
+  before asserting the outcome.
+  And a **third** form: a probe that loops `wave = 1..8` over a boss siege that is only
+  three waves long reports numbers for waves the game never builds. The first version of
+  the chewer-floor check "found" a 22% share from a wave that does not exist.
 - **Waiting for a coincidence.** A test that waited for a foot to happen to land
   on an enemy measured whether the timing lined up, not whether the shove worked.
   Drive the mechanism directly.

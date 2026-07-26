@@ -39,6 +39,10 @@ a health bar with a different colour on it. If a new type cannot be described as
 - **Bulwarks** are armoured past the point where a rifle is a sensible answer —
   five damage a shot against 300 health. They are the reason the deck gun still
   matters after the first ten seconds of a wave, which it previously did not.
+  The plate is on the **front** only, so there is a skill answer and it is a
+  positional one: 60 rifle rounds head-on, 12 from behind. The gun keeps its job
+  because the bulwark is slower than the hull and the intended meeting is head-on
+  during the approach.
 - **Burrowers** travel underground, where they cannot be shot, and surface beneath
   the hull. They are the reason camping a gun is not a strategy: every other ground
   threat has an approach you can shoot at, so a player parked at the bow could farm
@@ -63,10 +67,19 @@ a menu where one option is strictly best is a menu, not a decision.
 The last landmark is the boss. About fifteen minutes for a biome, against a
 30-45 minute target for a full run — biomes are the unit that repeats.
 
-Holding a siege pays a free pick of three items before the road choice, so a
-landmark has a shape: fight, get handed something, spend what you earned, then
-gamble on a road. The boss leg pays no pick, because an item you can never spend is
-a menu rather than a reward.
+Every couple of waves the crew sees off pays a free pick of three items, and holding a
+siege pays one more before the road choice — so a landmark has a shape: fight, get
+handed something, fight, get handed something, spend what you earned, then gamble on a
+road. Three per landmark. It used to be one, paid only for holding the whole siege, and
+a playtester averaging wave four of five had met it once in an evening. A reward the
+player does not reach is not a reward, it is a rumour.
+
+The roster escalates across landmarks as well: arriving somewhere new means meeting the
+types you had earned by mid-siege, not starting the schedule over. Wave *size* still
+rewinds — that curve was tuned against measured pacing — so a landmark is a step up in
+kind rather than in volume. Before this, the fight immediately after a road was
+structurally simpler than the one before it, which is why the road choice read as a
+counter ticking over.
 
 ## The salvage table
 
@@ -200,6 +213,45 @@ proved the fight was winnable and the real constraint was travel and reaction
 time, which points at completely different knobs. Build the upper bound before
 adjusting numbers.
 
+**But an upper bound is not an answer, and it is easy to present one as though it were.**
+The buy window was measured at 52 s of shoppable time per five-wave siege, which sounded
+like a finding and was a *ceiling*: it was taken with a defender that clears the field,
+and the rule being measured only ever bit when the field was not clear. For a competent
+player the restriction cost nothing at all; for a struggling one it cost up to a third of
+the window, and it varied 64% to 97% between two passes on the *same seeds*. The number
+that mattered was the floor, and the probe was structurally incapable of reporting it.
+
+So the rule is the oracle principle's other half: **an oracle tells you whether something
+is possible, never what it costs.** When a mechanic exists to protect the player who is
+losing, measure the player who is losing.
+
+**And separate both of those from "illegible", which is the one that keeps happening.**
+A playtest produced four complaints, and the striking thing was that not one of them was
+about balance:
+
+| what was said | what it actually was |
+|---|---|
+| "the grey creature, the tank — why are they hard to kill?" | no enemy damage feedback existed at all |
+| "I just spam buy items out of panic" | the buy window overlapped the fight |
+| "when I press one, does it matter? it seems like it just went next" | road costs were never displayed, and the roster reset |
+| "I barely survive wave 4" | possibly all three of the above |
+
+Every one of them was the player being unable to *see* a system that was working
+correctly. And the fourth is why the order matters: a difficulty report from a player
+who cannot read the fight is not attributable to difficulty. Notice also what the item
+update did NOT change — the player reported the same wave-4 ceiling before and after
+eighteen new items, which is strong evidence they could not tell what to buy or when.
+
+So the rule is: **when a playtest complaint could be either a number or a readout, fix
+the readout first.** It is cheaper, it is reversible, and it converts the next report
+into something you can act on. Tuning first means tuning against an unmeasured feeling.
+
+The corollary is a discipline about *when* to display something. A readout at the moment
+the question is asked beats a permanent panel: what you carry sits on the shop, which is
+only up when you are choosing what to buy; what the roads have cost sits on the route
+panel, which is only up when you are choosing the next one. Neither costs a line of
+always-visible screen, and both answer the question at the moment it arises.
+
 **Enemy speed is a human-facing knob, not a difficulty knob.** Slowing enemies 16%
 changed the oracle's survival by one second in 227, because the oracle never
 travels. Speed spends itself almost entirely on a human's travel and reaction
@@ -221,6 +273,21 @@ with branching roads, and a boss that inverts the pillar for one fight.
 
 Sound is synthesised at runtime. The art is eight CC0 texture sets and one CC0
 HDRI, vendored, and entirely optional — everything else is generated in code.
+
+Update 1.5 made all of it readable rather than adding to it: enemies show damage, the
+crosshair names what it is on and whether its armour is in the way, the shop only opens
+when you are genuinely safe, picks arrive often enough to learn from, and a road says
+what it cost as well as what it paid.
+
+Update 1.6 fixed where all of that is *drawn*, and one rule that was written backwards.
+Four things were anchored to the bottom centre of the screen, three of them transient,
+and they covered the health and reactor bars at exactly the moments those matter. Vitals
+moved to the empty bottom-left corner and lost every row shown elsewhere; both purses
+were added, since they had only ever been visible during the third of a siege when the
+shop was up. And the buy window now asks whether anything is close to *you* rather than
+whether the fortress is tidy — a rule you satisfy by stepping back, where the old one
+could only be satisfied by finishing the fight. The salvage pick waits for the same
+window, so a three-item menu no longer opens over a fight.
 
 **The pillar is confirmed.** A solo playtest reported the intended rhythm —
 picking off the approach from a gun, dropping down to fight and repair under the

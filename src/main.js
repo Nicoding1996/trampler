@@ -19,7 +19,7 @@ import { Economy, routePurchaseInput } from "./economy.js";
 import { Events } from "./events.js";
 import { Items } from "./items.js";
 import { Modules } from "./modules.js";
-import { Run } from "./run.js";
+import { Run, describeRoad } from "./run.js";
 import { Hud } from "./hud.js";
 import { createRenderer, Post, Shake } from "./render.js";
 import { Fx } from "./fx.js";
@@ -249,11 +249,17 @@ function boot() {
     if (routed.arrival) {
       const a = routed.arrival;
       world.setFogScale(run.fogScale);
+      // Names the COST as well as the payout, and both through the same describer the
+      // route panel used a moment ago, so the banner cannot promise something the panel
+      // did not. It used to list only the money, which is why a playtester pressed 1,
+      // got paid, and concluded the choice had done nothing.
+      const { costs, pays } = describeRoad(a.road);
       toast(
-        `${a.name}<small>${a.detail} · +${a.salvage} salvage`
-        + ` · +${a.scrap} scrap${a.module ? " · a free module" : ""}`
-        + `${a.boss ? " <br>SOMETHING IS WAITING AT THIS ONE" : ""}</small>`,
-        4,
+        `ARRIVED — ${a.name}`
+        + `<small>${costs.join(" · ")}, for the rest of the biome`
+        + `<br>paid ${pays.join(" · ")}`
+        + `${a.boss ? "<br>SOMETHING IS WAITING AT THIS ONE" : ""}</small>`,
+        4.5,
       );
     }
   }
@@ -331,9 +337,12 @@ function boot() {
       } else if (toastTimer > 0) {
         toastTimer -= dt;
         hud.showBanner(toastHtml);
-      } else if (run.picking) {
+      } else if (economy.pickOpen) {
         // The pick panel says what to do; a banner over it would cover the three
-        // things being chosen between.
+        // things being chosen between. Keyed off `pickOpen` rather than `run.picking`,
+        // because a pick is now also paid part-way through a siege, where the phase is
+        // still SIEGE -- and rather than off the pick list, because a pick that is
+        // banked but waiting for a safe window has no panel to protect.
         hud.hideBanner();
       } else if (run.choosing) {
         // Deliberately blank. The route panel and the contextual prompt both say

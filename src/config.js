@@ -16,6 +16,13 @@
 // and nowhere else. You cannot write it any more without the module failing to
 // load, which is a much better failure than a harmless enemy.
 const ENEMY_BASE = {
+  // What the target readout calls this thing. A field rather than an uppercased
+  // type id, because the id is a code name and the player-facing word is a
+  // separate decision -- and because a playtester who has fought these for an hour
+  // still described a bulwark as "the grey creature, the tank". Something has to
+  // say the word.
+  label: "HOSTILE",
+
   hp: 50,
   speed: 4.5,
   damage: 9,
@@ -27,6 +34,15 @@ const ENEMY_BASE = {
   // Flat damage soak, applied before the floor in CFG.enemies.minDamageFraction.
   // Zero for everything unarmoured, which is most things.
   armour: 0,
+
+  // Half-angle, in radians, of the cone BEHIND this thing where its armour does not
+  // apply. Zero means the plate is omnidirectional and no angle helps you.
+  //
+  // Zero is the deliberate default, so armour stays a flat wall unless a type opts
+  // in. The titan keeps zero on purpose: it is the one fight built around the deck
+  // (invariant 13c), and a rifle answer found by walking round the back would undo
+  // the geometry that fight is made of.
+  armourArc: 0,
 
   // How far inboard of the centreline this type plants itself to attack a leg.
   // For anything that fits under the hull this must stay inside the 8 m half
@@ -538,6 +554,7 @@ export const CFG = {
     // carried by the hull, so this number only decides how fast they ARRIVE and
     // can be tuned freely. See the latch in enemies.js and test 15b.
     chewer: enemyType({
+      label: "CHEWER",
       hp: 50, speed: 4.7, damage: 9, attackRate: 1.1,
       radius: 0.5, height: 1.6, reach: 2.0,
 
@@ -559,6 +576,7 @@ export const CFG = {
     // Climbers board via authored attach points and go for the reactor, which
     // is the opposite pressure: staying on the ground too long costs you.
     climber: enemyType({
+      label: "CLIMBER",
       // 4.52 sits 0.02 m/s above the hull's 4.5, which is a rounding error rather
       // than a margin -- so this was measured before being trusted. Boarding is
       // unharmed: 8 of 8 climbers still get aboard a hull walking at full speed,
@@ -608,10 +626,33 @@ export const CFG = {
     // It is deliberately SLOWER than the hull (2.9 against 4.5), so a healthy
     // fortress that dealt with it during the approach never sees it again, and
     // one that ignored it meets it on the next lap of the patrol circle.
+    // ARMOUR IS ONLY ON THE FRONT, and that is the answer to a playtest question.
+    //
+    // A player asked whether headshots should do more damage. The instinct is right --
+    // there was no way to out-play armour at all, only to out-purchase it -- but a
+    // plain damage multiplier on the head would have broken the reason this enemy
+    // exists. It is here to make the rifle the WRONG TOOL and the deck gun the right
+    // one, which is what gives the gun a recurring job (test 69). A rifle that kills
+    // a bulwark head-on takes that job away and the deck stops mattering after the
+    // opening ten seconds again.
+    //
+    // So the skill answer is POSITION, not aim: 70 degrees either side of directly
+    // behind it, the plate is not there. That turns "which weapon" into "which side
+    // of it am I on", which is the pillar's own question rather than a new one. And
+    // it reads spatially, which this project prefers to a number: a bulwark locked
+    // onto a leg has its back to the open ground.
+    //
+    // What it does NOT do is retire the gun. The bulwark is slower than the hull, so
+    // the intended meeting is head-on during the approach, from a mount, at range --
+    // where you are looking at its face and the gun's 25-per-shot is still the
+    // reliable answer. Going round the back is a thing you choose to leave the
+    // fortress for.
     bulwark: enemyType({
+      label: "BULWARK",
       hp: 300, speed: 2.9, damage: 22, attackRate: 0.8,
       radius: 0.85, height: 2.4, reach: 2.4,
       armour: 20,
+      armourArc: 1.22,   // ~70 degrees, so abeam is not enough -- you must be behind
       climbTime: 5.0,
       reactorReach: 1.5,
       shoveScale: 0.5,
@@ -635,6 +676,7 @@ export const CFG = {
     // invariant 8 -- "everything the player can see, the player can shoot" only
     // means anything if everything eventually becomes visible.
     burrower: enemyType({
+      label: "BURROWER",
       hp: 40, speed: 5.6, damage: 7, attackRate: 1.3,
       radius: 0.45, height: 1.2, reach: 2.0,
       burrowTime: 4.5,
@@ -655,6 +697,7 @@ export const CFG = {
     // there at some point" into "I have six seconds", which is the thing the
     // under-hull arena was missing.
     sapper: enemyType({
+      label: "SAPPER",
       hp: 70, speed: 4.9, damage: 0, attackRate: 1.0,
       radius: 0.5, height: 1.7, reach: 2.0,
       fuse: 6.0,
@@ -682,6 +725,7 @@ export const CFG = {
     // it on the fortress feels the legs holding. It is the exam for whichever
     // power curve you actually built.
     titan: enemyType({
+      label: "SIEGEBREAKER",
       hp: 2600, speed: 2.2, damage: 45, attackRate: 0.7,
       radius: 1.9, height: 5.2, reach: 3.6,
       armour: 30,
@@ -717,6 +761,45 @@ export const CFG = {
     // pressures the entire design rests on, and they deserve to be learned
     // without noise.
     composition: {
+      // How much of the roster schedule a landmark carries forward.
+      //
+      // This exists because of a playtest question -- "when I press one, does it
+      // matter? it seems like it just went next" -- and the answer was worse than
+      // no. `resetSiege()` rewinds the wave counter, and composition was keyed off
+      // that, so landmark 2 wave 1 was seven chewers and three climbers AGAIN. You
+      // fought thirty enemies with two bulwarks and a sapper, chose a road, and the
+      // next fight was structurally SIMPLER than the one you had just survived. Four
+      // repetitions of one five-wave curve, escalating only through multipliers on
+      // enemy health that nobody can perceive.
+      //
+      // So the composition schedule now runs on a TIER that carries across
+      // landmarks, while wave SIZE still comes from the per-siege wave number. That
+      // split is invariant 19e restated: add to the roster, not to the count. The
+      // size curve was tuned against measured pacing and is not what was wrong.
+      //
+      // Two per landmark rather than a full siege's worth, so arriving somewhere new
+      // means meeting the roster you had earned by mid-siege rather than starting
+      // over. Landmark 2 opens with a bulwark and burrowers already in the first
+      // wave, which is the step up the player was expecting a road to buy.
+      tierPerLeg: 2,
+
+      // The floor of every wave, as a fraction of its size, reserved for chewers
+      // before any special is allowed in.
+      //
+      // Previously chewers were simply "the remainder", with a comment noting that a
+      // special ramp growing past the count would squeeze them to zero and that the
+      // caps were what prevented it. Carrying the tier across landmarks breaks that
+      // assumption immediately: at tier 7 the ramps want three bulwarks and three
+      // sappers, and a first wave is only ten enemies. Chewers would have hit zero,
+      // and a wave with no chewers has nothing under the hull -- which deletes the
+      // reason to dismount, i.e. half the pillar, silently.
+      //
+      // So the floor is now explicit and the specials fill what is LEFT, in priority
+      // order, rather than being trusted to stay small. At 0.4 this changes nothing
+      // about landmark 1 -- wave 1 is still 7 chewers and 3 climbers, wave 5 still
+      // 13/9/5/2/1 -- and only binds where the old arithmetic would have failed.
+      chewerFloor: 0.4,
+
       burrowerFromWave: 2,
       burrowerShare: 0.15,
       bulwarkFromWave: 3,
@@ -1014,6 +1097,27 @@ export const CFG = {
     // five-wave siege and then a boss on top turns the climax into an endurance
     // tax on whatever you had left.
     bossSiegeLength: 3,
+
+    // A free salvage pick every this many waves the crew sees off, on top of the
+    // one holding a siege pays.
+    //
+    // This number exists because of a playtest, and the finding was worse than a
+    // tuning problem. The pick was offered ONLY on a held siege -- wave five of
+    // five -- and the player averaged wave four. So the headline feature of the
+    // whole item update was behind a gate they had passed once. A reward the player
+    // does not reach is not a reward, it is a rumour.
+    //
+    // Two, so the first one lands at wave 2: before the difficulty step at wave 3
+    // where bulwarks arrive, early enough to be learned, and often enough that
+    // "what did I get" is a question the run keeps asking. It also means dying at
+    // wave 4 still leaves you having made two build decisions rather than none.
+    //
+    // Note honestly that this makes a run STRONGER as well as more legible, which is
+    // a second variable riding along inside a legibility change. It is in the
+    // direction the playtest needed, and the count is measured and recorded here so a
+    // later difficulty read stays attributable: picks now land after waves 2, 4 and 5
+    // of a five-wave siege -- THREE per landmark, against one for the hold alone.
+    pickEveryWaves: 2,
 
     // How much of the normal wave still arrives alongside the titan. All of it
     // and the boss becomes a crowd-control problem you cannot see through; none
@@ -1626,6 +1730,31 @@ export function afterArmour(raw, armour, pierce = 0) {
   const left = Math.max(0, armour - pierce);
   if (left <= 0) return raw;
   return Math.max(raw - left, raw * CFG.enemies.minDamageFraction);
+}
+
+/**
+ * How much of a type's armour a shot from `dir` actually meets.
+ *
+ * Returns the full plate for anything unarmoured-from-behind, and zero for a shot
+ * arriving inside the rear cone. Pure and 2D on purpose: elevation should not decide
+ * whether you are behind something, or shooting a bulwark from a deck gun would count
+ * as a flank whenever the geometry happened to line up.
+ *
+ * `yaw` follows the same convention as everything else here -- built by
+ * `atan2(-vx, -vz)`, so local forward is -Z and the world facing is
+ * `(-sin yaw, -cos yaw)`. A shot travelling the SAME way the enemy walks has come from
+ * behind it, which is why the test is a dot product against +1 rather than -1.
+ *
+ * Note what this deliberately leaves out: it is only consulted by `shootFrom`, so a
+ * shock emitter always meets the full plate. Automation does not get to be rewarded
+ * for standing in the right place, because it never chose where to stand.
+ */
+export function armourAt(cfg, yaw, dirX, dirZ) {
+  if (!(cfg.armour > 0) || !(cfg.armourArc > 0)) return cfg.armour;
+  const len = Math.hypot(dirX, dirZ);
+  if (len < 1e-9) return cfg.armour;
+  const facing = (-Math.sin(yaw) * dirX + -Math.cos(yaw) * dirZ) / len;
+  return facing >= Math.cos(cfg.armourArc) ? 0 : cfg.armour;
 }
 
 /** Hyperbolic stack curve: approaches `cap` as stacks rise, never reaches it. */

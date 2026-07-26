@@ -10,7 +10,7 @@ import * as THREE from "three";
 import { readFileSync } from "node:fs";
 import {
   CFG, applyReleasePreset, releasePresetName, applyEnemySpeedScale,
-  ENEMY_TYPE_KEYS, enemyCfg, afterArmour,
+  ENEMY_TYPE_KEYS, enemyCfg, afterArmour, armourAt,
 } from "./src/config.js";
 import { World } from "./src/world.js";
 import { Trampler } from "./src/trampler.js";
@@ -28,7 +28,7 @@ import { Economy, routePurchaseInput } from "./src/economy.js";
 import { Events } from "./src/events.js";
 import { Items, ITEM_EFFECTS } from "./src/items.js";
 import { Modules } from "./src/modules.js";
-import { Run, RUN } from "./src/run.js";
+import { Run, RUN, describeRoad } from "./src/run.js";
 
 const DT = 1 / 60;
 
@@ -2820,6 +2820,113 @@ console.log("\n63. Buying is a between-waves act only");
   ok("and buying mid-wave is refused", boughtWhileEngaged === null);
   ok("with a reason given", economy.blockedReason === "NOT BETWEEN WAVES",
     economy.blockedReason);
+
+  // ---- and "between waves" has to mean a moment you can READ a shop in.
+  //
+  // A playtester panic-bought and said why: "in the middle of the wave I am fighting."
+  // They were right. The window used to be REST + PREP, and REST permits
+  // holdUntilCleared -- eight -- enemies still alive, while PREP is the telegraphed
+  // warning that a named wave is inbound. Eight hostiles, an incoming-wave banner, and
+  // a six-item shop, on a countdown.
+  const w = makeSim();
+  w.trampler.walking = false;
+  w.trampler.turning = false;
+  w.economy.salvage = 100000;
+
+  // The preparation window is for PREPARING. Invariant 19b is explicit about what it
+  // buys -- the moment deploying an emitter becomes a decision -- and a shop competing
+  // for it does not add an option, it takes the preparation away.
+  w.director.phase = PHASE.PREP;
+  w.director.timer = CFG.waves.prepTime;
+  step(w, 1);
+  ok("the telegraph window is not shopping time, because it is preparation time",
+    !w.economy.open, `phase ${w.director.phase}, open ${w.economy.open}`);
+
+  // A rest with something in your face is not a rest. Note this is deliberately NOT
+  // director.calm: that is the PACING threshold and is generous on purpose, because
+  // reinforcements should not wait for a spotless field.
+  //
+  // It is also deliberately not asked about the FORTRESS any more. The first version of
+  // this rule was "nothing beneath the hull and nothing on the deck", and it measured
+  // badly: zero cost to a competent player, up to a third of the window for a
+  // struggling one, and varying unpredictably between runs (64% and 97% of the rest
+  // available across two passes on the same seeds) because it depended on where the
+  // horde happened to be. A playtester could not use the shop and could not tell why,
+  // which is the real fault: "something is under the hull somewhere on a 26 m chassis"
+  // is not a state you can see or fix in a second.
+  //
+  // Now it asks about the OPERATIVE, at the same 6 m the contested-repair rule uses.
+  // The property that matters is that it is a rule you satisfy by MOVING.
+  w.director.phase = PHASE.REST;
+  w.director.timer = CFG.waves.minRest;
+  placeOnGroundAt(w, 0, -30);
+  w.director.phase = PHASE.REST;
+  w.director.timer = CFG.waves.minRest;
+  step(w, 2);
+  ok("a rest with nobody on top of you IS shopping time (test is not vacuous)",
+    w.economy.open, `${w.horde.liveCount} alive, open ${w.economy.open}`);
+
+  const near = w.horde.spawn(CHEWER);
+  near.x = w.player.position.x + 1.5;
+  near.y = w.player.position.y;
+  near.z = w.player.position.z;
+  step(w, 2);
+  ok("something in your face closes it, because that is what you should be dealing with",
+    !w.economy.open && w.economy.buy(0) === null,
+    `nearest ${Math.hypot(near.x - w.player.position.x, near.z - w.player.position.z).toFixed(1)} m,`
+    + ` open ${w.economy.open}, refused with "${w.economy.blockedReason}"`);
+
+  // THE PROPERTY THE OLD RULE DID NOT HAVE: you can fix this yourself, immediately, by
+  // stepping away. The fortress version could only be satisfied by finishing the fight.
+  near.x = w.player.position.x + CFG.repair.threatRange * 3;
+  step(w, 2);
+  ok("and stepping away re-opens it, which the fortress version could never do",
+    w.economy.open,
+    `nearest now ${Math.hypot(near.x - w.player.position.x, near.z - w.player.position.z).toFixed(1)} m`
+    + ` vs a ${CFG.repair.threatRange} m threshold`);
+
+  // Something chewing a leg on the far side of the hull is NOT your problem this second,
+  // and must not hold your wallet shut. This is the case the old rule got wrong.
+  w.horde.clear();
+  const farLeg = w.horde.spawn(CHEWER);
+  const spot = w.trampler.legAttackWorld(3, new THREE.Vector3());
+  farLeg.x = spot.x;
+  farLeg.y = spot.y;
+  farLeg.z = spot.z;
+  step(w, 4);
+  ok("a chewer under the hull but nowhere near you registers (test is not vacuous)",
+    (w.horde.underHull ?? 0) > 0
+    && Math.hypot(farLeg.x - w.player.position.x, farLeg.z - w.player.position.z)
+      > CFG.repair.threatRange,
+    `${w.horde.underHull} under the hull,`
+    + ` ${Math.hypot(farLeg.x - w.player.position.x, farLeg.z - w.player.position.z).toFixed(1)} m away`);
+  ok("and no longer locks the shop -- the old rule's worst case, now fixed",
+    w.economy.open, `open ${w.economy.open}`);
+
+  // Stragglers out in the open are NOT a reason to keep your wallet shut either. The
+  // rule has to distinguish "under attack" from "enemies exist".
+  w.horde.clear();
+  const distant = w.horde.spawn(CHEWER);
+  distant.x = w.trampler.group.position.x + 90;
+  distant.z = w.trampler.group.position.z;
+  distant.y = 0.8;
+  step(w, 2);
+  ok("nor does a hostile out at range, or one straggler would lock a whole siege",
+    w.economy.open && (w.horde.liveCount ?? 0) > 0,
+    `${w.horde.liveCount} alive, open ${w.economy.open}`);
+
+  // A burrower is underground and cannot touch you, so it must not hold the shop shut.
+  // Same exclusion the pacing pressure count makes, and for the same reason.
+  w.horde.clear();
+  const under = w.horde.spawn(BURROWER);
+  under.x = w.player.position.x + 1;
+  under.y = -CFG.enemies.burrower.height;
+  under.z = w.player.position.z;
+  step(w, 1);
+  ok("and a burrower beneath your feet does not, because it cannot reach you",
+    w.economy.open && (w.horde.burrowed ?? 0) > 0,
+    `${w.horde.burrowed} burrowed at ${Math.hypot(under.x - w.player.position.x, under.z - w.player.position.z).toFixed(1)} m,`
+    + ` open ${w.economy.open}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -3024,6 +3131,95 @@ console.log("\n67. The HUD is wired to markup that exists, and panels do not pil
     const toggled = new RegExp(`"${p.id}"`).test(hudSrc);
     ok(`${p.id} is toggled from code rather than orphaned`, toggled);
   }
+
+  // ---- and NOTHING TRANSIENT MAY COVER SOMETHING PERMANENT.
+  //
+  // Every check above has two limits, and between them they hid one fault for two
+  // updates. The anchor check compares always-visible panels only TO EACH OTHER, and
+  // it only ever looked at `.panel` divs at all.
+  //
+  // The prompt, the salvage pick and the road choice are all bottom-centre, and so is
+  // the vitals panel. The prompt is not a `.panel`, so it was invisible to this test;
+  // the pick and the road are, but they carry `display: none` and were filtered out as
+  // "not always visible" -- which is true, and is exactly what makes them dangerous.
+  // A thing that comes and goes draws ON TOP of the thing that is always there. So the
+  // health and reactor bars were covered at precisely the moments they matter most:
+  // while repairing under fire, while choosing an item, while choosing a road. The
+  // owner reported it in those words -- "it covers the health and the other stats".
+  //
+  // Asserted by SCREEN ZONE rather than by pixel rectangles, and that is a deliberate
+  // limitation rather than a shortcut. Heights here are content-driven and the harness
+  // has no DOM, so a rectangle test would need heights invented inside the test: a
+  // number that agrees with the layout the day it is written and then silently stops
+  // agreeing. A zone is read straight out of the CSS -- `left: 50%` under a translate
+  // is the centre, `left: 14px` is the left edge -- and cannot drift from what the
+  // browser actually does. Nine zones, and the rule is that a permanent readout owns
+  // its zone outright.
+  const zoneOf = (id) => {
+    const body = ruleOf(id);
+    const val = (side) => {
+      const m = body.match(new RegExp(`(?:^|;|\\s)${side}:\\s*([^;]+)`));
+      return m ? m[1].trim() : null;
+    };
+    const axis = (near, far, mid) => {
+      // Only 50% is the centring idiom. Any other percentage is still an offset from
+      // the near edge -- the telegraph sits at `top: 8%`, and reading "a percentage"
+      // as "centred" put it in the middle of the screen, which is not where it is.
+      if (val(near) !== null) return /^50%/.test(val(near)) ? mid : near;
+      return val(far) !== null ? far : "?";
+    };
+    return `${axis("left", "right", "centre")}-${axis("top", "bottom", "middle")}`;
+  };
+
+  // Hidden by default has two spellings here, and only one of them is `display: none`.
+  // The telegraph fades in on `opacity`, because it is a banner rather than a box and
+  // a transition needs something to interpolate. Reading only for `display` classified
+  // it as permanently on screen.
+  const hiddenByDefault = (id) => {
+    const cls = panels.find((p) => p.id === id)?.classes ?? "";
+    const body = ruleOf(id);
+    return /\bhidden\b/.test(cls)
+      || /display:\s*none/.test(body)
+      || /opacity:\s*0\s*(?:;|$)/.test(body.trim());
+  };
+
+  // What counts as a readout box: positioned, not a full-bleed effect layer, and
+  // carrying at least one element the HUD writes into. Derived rather than listed,
+  // because a hard-coded list is how the prompt escaped this test in the first place
+  // -- the next transient box added would escape it the same way.
+  const blockOf = (id) => {
+    const start = html.indexOf(`<div id="${id}"`);
+    if (start < 0) return "";
+    const next = html.indexOf('\n  <div id="', start + 1);
+    return html.slice(start, next < 0 ? html.length : next);
+  };
+  const writesInto = (id) => [...blockOf(id).matchAll(/id="([\w-]+)"/g)]
+    .some((m) => m[1] !== id && ids.includes(m[1]));
+
+  const boxIds = [...new Set([
+    ...panels.map((p) => p.id),
+    ...[...html.matchAll(/#([\w-]+)\s*\{([^}]*)\}/g)]
+      .filter((m) => /position:\s*fixed/.test(m[2]) && !/(?:^|;|\s)inset:/.test(m[2]))
+      .map((m) => m[1]),
+  ])].filter((id) => panels.some((p) => p.id === id) || writesInto(id));
+
+  ok("the transient readouts are in scope now, not just the panels",
+    boxIds.includes("prompt") && boxIds.includes("target") && boxIds.includes("buffs"),
+    boxIds.join(", "));
+
+  const permanent = boxIds.filter((id) => !hiddenByDefault(id));
+  ok("and something really is permanent (test is not vacuous)", permanent.length >= 1,
+    permanent.map((id) => `${id}@${zoneOf(id)}`).join(", "));
+
+  for (const id of permanent) {
+    const zone = zoneOf(id);
+    const sharers = boxIds.filter((o) => o !== id && zoneOf(o) === zone);
+    ok(`nothing else is anchored where ${id} lives, so nothing can cover it`,
+      sharers.length === 0,
+      sharers.length
+        ? `${id}@${zone} IS COVERED BY ${sharers.map((s) => `${s}@${zoneOf(s)}`).join(", ")}`
+        : `${id} owns ${zone} outright`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3129,10 +3325,36 @@ console.log("\n69. Armour makes the rifle the wrong tool and the gun the right o
   step(sim, 1);
   aimAt(player, new THREE.Vector3(b.x, b.y, b.z));
 
+  // The bulwark's plate is on its FRONT now, so this test has to state which way the
+  // thing is facing instead of inheriting whatever the walk left.
+  //
+  // It was inheriting the wrong one. The bulwark spawns between the player and the
+  // fortress and walks toward the fortress, so it had its BACK to the shot -- and this
+  // assertion, which claims a frontal plate soaks a rifle round, was measuring a flank
+  // and passing only because angle used to be irrelevant. Exactly the "sampling the
+  // wrong moment" trap wearing a geometric hat.
+  //
+  // `yaw` follows atan2(-dx, -dz), so pointing it at the player makes the shot frontal.
+  // Nothing steps between here and the shots below, and yaw is only rewritten inside
+  // horde.update, so it stays put.
+  const faceAt = (e, x, z) => { e.yaw = Math.atan2(-(x - e.x), -(z - e.z)); };
+  const shotDir = (e) => {
+    const d = new THREE.Vector3(e.x, e.y, e.z).sub(player.eyePosition(new THREE.Vector3()));
+    return d.normalize();
+  };
+
+  faceAt(b, player.position.x, player.position.z);
+  {
+    const d = shotDir(b);
+    ok("the bulwark is genuinely facing the shooter (test is not vacuous)",
+      armourAt(CFG.enemies.bulwark, b.yaw, d.x, d.z) === armour,
+      `meets ${armourAt(CFG.enemies.bulwark, b.yaw, d.x, d.z)} of ${armour} armour head-on`);
+  }
+
   const hpBefore = b.hp;
   weapon.fire();
   const dealt = hpBefore - b.hp;
-  ok("a live rifle shot through the real hitscan path is soaked too",
+  ok("a live rifle shot into its FRONT is soaked, through the real hitscan path",
     dealt > 0 && dealt <= rifle * 0.25,
     `${dealt.toFixed(1)} damage from a ${rifle} shot`);
 
@@ -3141,6 +3363,7 @@ console.log("\n69. Armour makes the rifle the wrong tool and the gun the right o
   let shots = 1;
   while (b.alive && shots < 400) {
     aimAt(player, new THREE.Vector3(b.x, b.y, b.z));
+    faceAt(b, player.position.x, player.position.z);
     weapon.fire();
     shots++;
   }
@@ -3149,6 +3372,60 @@ console.log("\n69. Armour makes the rifle the wrong tool and the gun the right o
   ok("but it costs far more rounds than a chewer would",
     shots > Math.ceil(CFG.enemies.chewer.hp / rifle) * 8,
     `${shots} rounds vs ${Math.ceil(CFG.enemies.chewer.hp / rifle)} for a chewer`);
+
+  // ---- and the answer that is a POSITION rather than a purchase.
+  //
+  // A playtester asked whether headshots should do more damage. The instinct was right
+  // -- there was no way to out-PLAY armour at all, only to out-buy it -- but a head
+  // multiplier would have handed the rifle a bulwark and taken away the recurring job
+  // this whole enemy exists to give the deck gun. So the plate is frontal instead:
+  // the skill answer is which side of it you are standing on.
+  const rear = spawnAt(BULWARK, 6);
+  faceAt(rear, player.position.x, player.position.z);
+  faceAt(rear, rear.x + (rear.x - player.position.x), rear.z + (rear.z - player.position.z));
+  {
+    const d = shotDir(rear);
+    ok("stepping behind one puts no armour in the way at all (test is not vacuous)",
+      armourAt(CFG.enemies.bulwark, rear.yaw, d.x, d.z) === 0,
+      `meets ${armourAt(CFG.enemies.bulwark, rear.yaw, d.x, d.z)} of ${armour} armour from behind`);
+  }
+  aimAt(player, new THREE.Vector3(rear.x, rear.y, rear.z));
+  const rearBefore = rear.hp;
+  weapon.fire();
+  const rearDealt = rearBefore - rear.hp;
+  ok("so a rifle round into its back lands in full",
+    Math.abs(rearDealt - rifle * weapon.damageScale) < 1e-6,
+    `${rearDealt.toFixed(1)} of ${rifle}, against ${dealt.toFixed(1)} head-on`);
+
+  let rearShots = 1;
+  while (rear.alive && rearShots < 400) {
+    aimAt(player, new THREE.Vector3(rear.x, rear.y, rear.z));
+    faceAt(rear, rear.x + (rear.x - player.position.x), rear.z + (rear.z - player.position.z));
+    weapon.fire();
+    rearShots++;
+  }
+  ok("which is a real, measurable reward for taking the risk of getting round it",
+    !rear.alive && rearShots * 3 < shots,
+    `${rearShots} rounds from behind vs ${shots} head-on`);
+
+  // But it must NOT become the answer to a bulwark you meet head-on, or the deck gun
+  // loses the job the bulwark was added to create and the deck stops mattering after
+  // the opening ten seconds again. Abeam is deliberately not enough.
+  const side = spawnAt(BULWARK, 6);
+  side.yaw = Math.atan2(-(player.position.z - side.z), (player.position.x - side.x));
+  {
+    const d = shotDir(side);
+    const met = armourAt(CFG.enemies.bulwark, side.yaw, d.x, d.z);
+    ok("and standing merely abeam of one is not a flank",
+      met === armour, `meets ${met} of ${armour} armour from the side`);
+  }
+
+  // The titan keeps an omnidirectional plate on purpose: it is the one fight built
+  // around the deck, and a rifle answer found by walking round the back would undo the
+  // geometry that fight is made of.
+  ok("the titan's plate has no back door, because that fight belongs to the deck",
+    CFG.enemies.titan.armourArc === 0 && CFG.enemies.titan.armour > 0,
+    `arc ${CFG.enemies.titan.armourArc}, armour ${CFG.enemies.titan.armour}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -3967,6 +4244,19 @@ console.log("\n79. A run is legs of a journey with roads you choose between");
 
   ok("choosing a road advances the journey", arrival && run.leg === legBefore + 1,
     `leg ${run.leg} of ${CFG.run.legs}, took ${arrival?.name}`);
+  // The arrival has to carry the ROAD, not just its payout, or nothing downstream can
+  // say what the choice cost. The banner used to list only the money, which is why a
+  // playtester pressed 1, got paid, and concluded the choice had done nothing.
+  ok("and the arrival names the road itself, so its cost can be reported too",
+    !!run.lastArrival?.road && run.lastArrival.road.id === run.history[0],
+    `road ${run.lastArrival?.road?.id ?? "MISSING"}`);
+  {
+    const d = describeRoad(run.lastArrival.road);
+    ok("which describes a cost as well as a payout, through one shared describer",
+      d.costs.length > 0 && d.pays.length > 0,
+      `costs [${d.costs.join(", ")}] pays [${d.pays.join(", ")}]`);
+  }
+
   ok("and pays on arrival, before the siege it paid for",
     economy.salvage === salvageBefore + road.salvage
     && economy.scrap === scrapBefore + road.scrap,
@@ -4025,6 +4315,26 @@ console.log("\n79. A run is legs of a journey with roads you choose between");
     `threat x${run.threatScale.toFixed(3)} (want x${expectThreat.toFixed(3)}),`
     + ` speed x${horde.speedScale.toFixed(3)}, +${run.extraCount} per wave,`
     + ` roads: ${run.history.join(" -> ")}`);
+  // The accumulation has to be REPORTABLE, not merely real. It is instance state on the
+  // run, it compounds across the whole biome, and the only place any of it surfaced was
+  // one combined number in the hidden diagnostics panel — merged with the elapsed-time
+  // ramp, so even there the road's share could not be separated out. A cost nobody can
+  // perceive is not a cost.
+  {
+    const listed = run.modifiers;
+    ok("the accumulated road cost is reportable, not just real",
+      listed.length > 0, `[${listed.join(" · ")}]`);
+    ok("and it names the roads that caused it",
+      run.roadsTaken.length === run.history.length && run.roadsTaken.length > 0,
+      run.roadsTaken.join(" -> "));
+    // A fresh run must report nothing rather than a list of zeroes, or the line is
+    // noise on the first road choice of every run.
+    const clean = makeSim().run;
+    ok("while a run that has taken no roads reports nothing at all",
+      clean.modifiers.length === 0 && clean.roadsTaken.length === 0,
+      `[${clean.modifiers.join(", ")}]`);
+  }
+
   ok("and the accumulation is a real difficulty change, not a rounding error",
     run.threatScale * expectSpeed > 1.15,
     `combined x${(run.threatScale * horde.speedScale).toFixed(3)}`);
@@ -4047,7 +4357,12 @@ console.log("\n79. A run is legs of a journey with roads you choose between");
   ok("holding the last one ends the biome rather than offering more roads",
     holdSiege() && (step(sim, 2), run.done),
     `phase ${run.phase}, leg ${run.leg}`);
-  ok("the final landmark pays no pick, since there is nothing left to spend it on",
+  // Nothing is on offer once the biome is done, and there are two ways a pick could
+  // be sitting there: the hold's own pick (never paid on the boss leg) and one from
+  // the wave cadence, which DOES pay during the boss siege because there is still a
+  // titan to spend it on. An offer that outlives the run would be a panel asking for
+  // a keypress that can no longer change anything.
+  ok("nothing is left on offer once the biome is done, from either source",
     economy.pendingPick.length === 0, `${economy.pendingPick.length} on offer`);
   ok("and nothing further spawns once it is done", horde.liveCount === 0);
 
@@ -4188,6 +4503,117 @@ console.log("\n81. Waves gain new types on schedule without changing size");
   const a = makeSim().director.buildWave(4).join(",");
   const b = makeSim().director.buildWave(4).join(",");
   ok("the same seed builds the same wave", a === b);
+
+  // ---- the roster carries across landmarks; the size curve does not.
+  //
+  // This is the fix for the flattest thing in the run. `resetSiege()` rewinds the wave
+  // counter and composition used to be keyed off it, so landmark 2 wave 1 was seven
+  // chewers and three climbers AGAIN — you fought thirty enemies with two bulwarks and
+  // a sapper, chose a road, and the next fight was structurally SIMPLER than the one
+  // you had survived. A playtester read that exactly as it was: "it just went next".
+  const tierSim = makeSim();
+  const tally = (types) => {
+    const c = {};
+    for (const t of types) c[ENEMY_TYPE_KEYS[t]] = (c[ENEMY_TYPE_KEYS[t]] ?? 0) + 1;
+    return c;
+  };
+  const waveAt = (leg, wave) => {
+    tierSim.run.leg = leg;
+    return tally(tierSim.director.buildWave(wave, tierSim.director.tierOf(wave)));
+  };
+  const sizeAt = (leg, wave) =>
+    Object.values(waveAt(leg, wave)).reduce((x, y) => x + y, 0);
+
+  ok("landmark 1 still opens on the two pressures the pillar is built on, and nothing else",
+    Object.keys(waveAt(1, 1)).sort().join(",") === "chewer,climber",
+    Object.entries(waveAt(1, 1)).map(([k, n]) => `${n} ${k}`).join(", "));
+
+  const l2 = waveAt(2, 1);
+  ok("but landmark 2 opens with a roster it took three waves to earn the first time",
+    (l2.bulwark ?? 0) > 0 && (l2.burrower ?? 0) > 0,
+    Object.entries(l2).map(([k, n]) => `${n} ${k}`).join(", "));
+
+  // The half that must NOT move. Wave size was tuned against measured pacing, and
+  // moving size and composition together is what makes a later difficulty change
+  // impossible to attribute to either — invariant 19e.
+  const sizesMoved = [];
+  for (let leg = 1; leg <= 3; leg++) {
+    for (let wave = 1; wave <= CFG.waves.siegeLength; wave++) {
+      if (sizeAt(leg, wave) !== sizeAt(1, wave)) sizesMoved.push(`leg ${leg} wave ${wave}`);
+    }
+  }
+  ok("and the wave SIZE curve is identical at every landmark, which is 19e",
+    sizesMoved.length === 0,
+    sizesMoved.length
+      ? `SIZE MOVED at ${sizesMoved.join(", ")}`
+      : `w1..w5 = ${[1, 2, 3, 4, 5].map((n) => sizeAt(3, n)).join("/")} at every leg`);
+
+  // The floor, which is what stops the escalation eating the arena it escalates in.
+  // Specials used to be allocated first with chewers as the remainder, and at tier 7
+  // the ramps want three bulwarks and three sappers against a ten-enemy first wave.
+  // Chewers would have reached zero, and a wave with no chewers has nothing under the
+  // hull — half the pillar gone, quietly.
+  let lowest = 1;
+  let lowestAt = "";
+  const emptyOf = [];
+  let bossShare = 1;
+  for (let leg = 1; leg <= CFG.run.legs; leg++) {
+    const len = leg >= CFG.run.legs ? CFG.run.bossSiegeLength : CFG.waves.siegeLength;
+    for (let wave = 1; wave <= len; wave++) {
+      const t = waveAt(leg, wave);
+      const size = Object.values(t).reduce((x, y) => x + y, 0);
+      if (!t.chewer) emptyOf.push(`no chewers at leg ${leg} wave ${wave}`);
+      if (!t.climber) emptyOf.push(`no climbers at leg ${leg} wave ${wave}`);
+      const share = (t.chewer ?? 0) / size;
+      // The boss wave is the ONE exception and it is deliberate, not an oversight.
+      // `bossWaveScale` truncates the shuffled escort — the titan IS the wave, and
+      // keeping the full escort alongside it turns the climax into a crowd-control
+      // problem you cannot see through. Truncating a shuffled list can cut chewers, and
+      // on that one fight it should: the titan is too tall for the hull's shadow and
+      // attacks from outboard, so the deck is the right place to be (invariant 13c) and
+      // the under-hull arena mattering less is the point of the fight.
+      if (t.titan) {
+        bossShare = share;
+        continue;
+      }
+      if (share < lowest) {
+        lowest = share;
+        lowestAt = `leg ${leg} wave ${wave}, size ${size}`;
+      }
+    }
+  }
+  ok("every wave of every landmark still contains both pillar types",
+    emptyOf.length === 0, emptyOf.length ? emptyOf.join("; ") : "chewers and climbers throughout");
+  ok("and chewers never fall below their floor on any normal wave, whatever the tier wants",
+    lowest >= CFG.enemies.composition.chewerFloor - 1e-9,
+    `lowest ${(lowest * 100).toFixed(0)}% at ${lowestAt},`
+    + ` floor ${(CFG.enemies.composition.chewerFloor * 100).toFixed(0)}%`);
+  // Asserted rather than merely skipped, so the exception is a measured statement and
+  // not a hole. The boss wave has a smaller chewer share BY DESIGN, and if it ever
+  // stopped having one at all that would be worth knowing.
+  ok("the boss wave is the exception, with a thinner escort but still an arena under it",
+    bossShare > 0 && bossShare < CFG.enemies.composition.chewerFloor,
+    `boss wave is ${(bossShare * 100).toFixed(0)}% chewers, against a`
+    + ` ${(CFG.enemies.composition.chewerFloor * 100).toFixed(0)}% floor elsewhere`);
+
+  // And the tail of the priority list must not be starved. Measured: a single-pass
+  // allocation in priority order let the bulwark ramp take the remaining room at
+  // landmark 3, and the SAPPER disappeared from the wave — the one enemy that is a
+  // timer rather than a damage race, and the reason to go under the hull right now.
+  // Escalating the roster and having it eat itself is worse than not escalating it.
+  const starved = [];
+  for (let leg = 2; leg <= 3; leg++) {
+    for (let wave = 2; wave <= CFG.waves.siegeLength; wave++) {
+      const t = waveAt(leg, wave);
+      const tier = leg === 2 ? wave + 2 : wave + 4;
+      if (tier >= CFG.enemies.composition.sapperFromWave && !t.sapper) {
+        starved.push(`leg ${leg} wave ${wave} (tier ${tier})`);
+      }
+    }
+  }
+  ok("once a type is due it always appears, so the roster cannot eat its own tail",
+    starved.length === 0,
+    starved.length ? `SAPPER STARVED at ${starved.join(", ")}` : "every due type is present");
 }
 
 // ---------------------------------------------------------------------------
@@ -4225,9 +4651,15 @@ console.log("\n82. A full restart replays the same run, modules and roads includ
   sim.economy.scrap = 1e6;
   sim.economy.salvage = 1e6;
   // Buying is a between-waves act, and forty seconds in the fight is on. Put the
-  // director back into a rest so the purchase is legal -- the point here is the
-  // reset, not the shop's gate, which test 63 already owns.
+  // director back into a rest AND clear the fortress, because the buy window now
+  // requires both -- a rest with things under the hull is not a shopping moment. The
+  // point here is the reset, not the shop's gate, which test 63 owns.
   sim.director.phase = PHASE.REST;
+  // No step between the clear and the buy. `clear()` zeroes the counters itself, and a
+  // frame here would let the director walk REST -> PREP now that the field is calm,
+  // shutting the window again -- and would add an extra frame of elapsed time to a
+  // test whose entire subject is an exact replay.
+  sim.horde.clear();
   sim.economy.buy(0);
   sim.economy.buyModule(0);
   sim.run.threatScale = 1.5;
@@ -4692,6 +5124,40 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
       routeHud.promptLabel.textContent.includes("ROAD"),
       `"${routeHud.promptLabel.textContent}"`);
 
+    // The accumulated-cost line. Both branches, because "nothing yet" is the state the
+    // first road choice of every run is made in.
+    ok("at the first road, it says plainly that the roads have cost nothing yet",
+      routeHud.routeCarried.innerHTML.includes("nothing"),
+      `"${routeHud.routeCarried.innerHTML}"`);
+
+    // Hand it a run that has already taken costly roads, so the populated branch is
+    // driven with real accumulated state rather than with a string.
+    const carriedSim = makeSim();
+    const carriedHud = new Hud();
+    const boneyard = CFG.run.routes.find((r) => r.id === "boneyard");
+    const rift = CFG.run.routes.find((r) => r.id === "rift");
+    carriedSim.run.offers = [boneyard, rift];
+    carriedSim.run.phase = RUN.CHOOSING;
+    carriedSim.run.choose(0); // takes the boneyard: +18% enemy health
+    carriedSim.run.offers = [rift, boneyard];
+    carriedSim.run.phase = RUN.CHOOSING;
+    carriedSim.run.choose(0); // takes the rift: +4 per wave
+    carriedSim.run.offers = [boneyard, rift];
+    carriedSim.run.phase = RUN.CHOOSING;
+    try {
+      carriedHud.update({
+        ...carriedSim, guns: carriedSim.guns, input: carriedSim.input,
+        gun: null, fps: 60, dt: DT,
+      });
+    } catch (err) {
+      failures.push(`route carried: ${err.message}`);
+    }
+    ok("and once roads have been taken it names what they cost, permanently",
+      carriedHud.routeCarried.innerHTML.includes("enemy health")
+      && carriedHud.routeCarried.innerHTML.includes("per wave")
+      && carriedHud.routeCarried.innerHTML.includes(boneyard.name),
+      `"${carriedHud.routeCarried.innerHTML.replace(/<[^>]+>/g, "")}"`);
+
     // ---- repair, contested repair, and the fuse warning
     const repairSim = makeSim();
     const repairHud = new Hud();
@@ -4769,6 +5235,116 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     }
     ok("a lit charge warns on the prompt, because nothing else does", sawFuse,
       `"${fuseHud.promptLabel.textContent}"`);
+
+    // ---- the target readout
+    //
+    // Every branch: nothing under the reticle, an unarmoured thing at full health,
+    // the same thing wounded, and an ARMOURED one — that last line being the whole
+    // reason this readout exists, since it is the game's only way of saying "wrong
+    // tool" out loud.
+    const tSim = makeSim();
+    const tHud = new Hud();
+    const tctx = () => ({
+      ...tSim, guns: tSim.guns, input: tSim.input, gun: null, fps: 60, dt: DT,
+    });
+    tSim.trampler.walking = false;
+    tSim.trampler.turning = false;
+    placeOnGroundAt(tSim, 0, -40);
+    aimAt(tSim.player, new THREE.Vector3(tSim.player.position.x, 1.2, tSim.player.position.z - 60));
+    step(tSim, 2);
+    try {
+      tHud.update(tctx());
+    } catch (err) {
+      failures.push(`target empty: ${err.message}`);
+    }
+    ok("with nothing under the crosshair the target readout is not on screen",
+      !tHud.target.className.includes("show"), `class "${tHud.target.className}"`);
+
+    const aimTarget = (sim2, e) => {
+      aimAt(sim2.player, new THREE.Vector3(e.x, e.y, e.z));
+      step(sim2, 1);
+      aimAt(sim2.player, new THREE.Vector3(e.x, e.y, e.z));
+      step(sim2, 1);
+    };
+
+    const grunt = tSim.horde.spawn(CHEWER);
+    grunt.x = tSim.player.position.x;
+    grunt.y = 0.8;
+    grunt.z = tSim.player.position.z - 18;
+    aimTarget(tSim, grunt);
+    try {
+      tHud.update(tctx());
+    } catch (err) {
+      failures.push(`target named: ${err.message}`);
+    }
+    ok("aiming at one names it, at full health, with no armour line",
+      tHud.target.className.includes("show")
+      && !tHud.target.className.includes("hurt")
+      && tHud.targetName.textContent === CFG.enemies.chewer.label
+      && tHud.targetArmour.textContent === "",
+      `"${tHud.targetName.textContent}" class "${tHud.target.className}"`);
+
+    tSim.horde.damage(grunt, grunt.maxHp * 0.5);
+    aimTarget(tSim, grunt);
+    try {
+      tHud.update(tctx());
+    } catch (err) {
+      failures.push(`target hurt: ${err.message}`);
+    }
+    ok("and a wounded one reads in the hurt style",
+      tHud.target.className.includes("hurt"),
+      `class "${tHud.target.className}", ${Math.round(grunt.hp / grunt.maxHp * 100)}% left`);
+
+    // The armoured case, in a fresh sim so the wounded chewer above cannot be picked
+    // up by the ray instead.
+    const aSim = makeSim();
+    const aHud = new Hud();
+    aSim.trampler.walking = false;
+    aSim.trampler.turning = false;
+    placeOnGroundAt(aSim, 0, -40);
+    const tank = aSim.horde.spawn(BULWARK);
+    tank.x = aSim.player.position.x;
+    tank.y = CFG.enemies.bulwark.height / 2;
+    tank.z = aSim.player.position.z - 18;
+    const aCtx = () => ({
+      ...aSim, guns: aSim.guns, input: aSim.input, gun: null, fps: 60, dt: DT,
+    });
+    // Facing pinned, because the readout now reports the armour actually in the way and
+    // a bulwark walking toward the fortress has its BACK to a player standing between
+    // them. The first version of this check did not pin it, got the flank, and reported
+    // ARMOUR EXPOSED while claiming to test the armoured branch.
+    aimTarget(aSim, tank);
+    tank.yaw = Math.atan2(
+      -(aSim.player.position.x - tank.x), -(aSim.player.position.z - tank.z),
+    );
+    aSim.weapon.scanTarget();
+    try {
+      aHud.update(aCtx());
+    } catch (err) {
+      failures.push(`target armoured: ${err.message}`);
+    }
+    ok("an armoured target says so, which is the only place the game ever does",
+      aHud.target.className.includes("show")
+      && aHud.targetName.textContent === CFG.enemies.bulwark.label
+      && aHud.targetArmour.textContent.includes("ARMOURED"),
+      `"${aHud.targetName.textContent}" / "${aHud.targetArmour.textContent}"`);
+
+    // And the branch that teaches the flank. This is the only way a player ever finds
+    // out the rear cone exists — one who never happens to walk behind a bulwark would
+    // otherwise never learn it, which makes it a rule nobody plays around.
+    tank.yaw = Math.atan2(
+      -(tank.x - aSim.player.position.x), -(tank.z - aSim.player.position.z),
+    );
+    aSim.weapon.scanTarget();
+    try {
+      aHud.update(aCtx());
+    } catch (err) {
+      failures.push(`target exposed: ${err.message}`);
+    }
+    ok("and getting behind it says THAT, in the colour the game uses for 'you can act'",
+      aHud.targetArmour.textContent.includes("EXPOSED")
+      && aHud.target.className.includes("open"),
+      `"${aHud.targetArmour.textContent}" class "${aHud.target.className}"`);
 
     // ---- the live conditional bonus
     //
@@ -4881,7 +5457,7 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     // ---- and the whole point: nothing threw anywhere
     ok("no branch of the HUD threw across every state driven above",
       failures.length === 0,
-      failures.length ? failures.join(" | ") : "shop, build, bay, telegraph, boss, route, repair, contested, fuse, buffs, alarm, damage, crosshair");
+      failures.length ? failures.join(" | ") : "shop, build, bay, telegraph, boss, route, repair, contested, fuse, target, buffs, alarm, damage, crosshair");
   }
 
   delete globalThis.document;
@@ -6061,6 +6637,105 @@ console.log("\n94. Procs fire for the crew's kills and for nothing else");
   ok("but it never heals past full",
     full.player.hp === full.player.maxHp && full.items.procs.executioner === 1,
     `hp ${full.player.hp} / ${full.player.maxHp}, ${full.items.procs.executioner} procs`);
+
+  // ---- AND NO PROC MAY REACH SOMETHING UNDERGROUND.
+  //
+  // Invariant 8 says the one type that cannot be shot cannot STAY that way: a burrower
+  // is untouchable while submerged, on a hard clock. Test 71 holds up the shot half of
+  // that, and this is the half nothing was watching -- splash and the arc chain do not
+  // route through shootFrom, so they get no occlusion clip and had to exclude burrowers
+  // themselves. Both did, in code, and neither did in fact: they tested `o.burrowed`,
+  // and there is no such field. `horde.burrowed` is a count. So the check read as a
+  // working exclusion, excluded nothing, and a proc could kill a thing you cannot see.
+  //
+  // Found by writing the same line in economy.js and having a test disagree with it.
+  // The fix is an exported predicate, `isSubmerged`, so the mistake is not spellable.
+  const dig = makeSim();
+  dig.economy.stacks.fragment = 3;
+  dig.economy.stacks.arc = 20;
+  dig.economy.applyAll();
+  dig.trampler.walking = false;
+  dig.trampler.turning = false;
+  placeOnGroundAt(dig, 0, -30);
+
+  // A burrower right beside a chewer, well inside both the splash radius and the arc's
+  // range. If either proc ignores the state, this one takes damage.
+  //
+  // A SURFACE neighbour goes in at the same distance on the other side, and it is not
+  // decoration. Without it the splash finds no legal target, fires zero times, and
+  // "the burrower took no damage" passes because nothing happened at all -- the exact
+  // vacuous pass tech.md warns about, and the first version of this check hit it.
+  const surfacer = dig.horde.spawn(CHEWER);
+  surfacer.x = dig.player.position.x;
+  surfacer.y = 0.8;
+  surfacer.z = dig.player.position.z - 6;
+  const witness = dig.horde.spawn(CHEWER);
+  witness.x = surfacer.x - 1.2;
+  witness.y = 0.8;
+  witness.z = surfacer.z;
+  const witnessHp = witness.hp;
+  const digger = dig.horde.spawn(BURROWER);
+  digger.x = surfacer.x + 1.2;
+  digger.y = -CFG.enemies.burrower.height;
+  digger.z = surfacer.z;
+  digger.state = ENEMY_STATE.BURROWED;
+  digger.burrowT = 999; // stay under for the whole check
+  const diggerHp = digger.hp;
+
+  ok("the burrower is genuinely submerged and in range (test is not vacuous)",
+    ENEMY_STATE.BURROWED === digger.state
+    && Math.hypot(digger.x - surfacer.x, digger.z - surfacer.z) < CFG.items.fragment.radius
+    && Math.hypot(digger.x - surfacer.x, digger.z - surfacer.z) < CFG.items.arc.range,
+    `${Math.hypot(digger.x - surfacer.x, digger.z - surfacer.z).toFixed(1)} m from the corpse,`
+    + ` inside a ${CFG.items.fragment.radius} m splash and a ${CFG.items.arc.range} m arc`);
+
+  // Kill the neighbour with the crew's own damage, so both procs are eligible to fire.
+  dig.horde.damage(surfacer, 1e6, "player");
+  ok("the splash did fire, and reached the SURFACE neighbour (test is not vacuous)",
+    dig.items.procs.fragment > 0 && witness.hp < witnessHp,
+    `${dig.items.procs.fragment} splash procs, surface neighbour`
+    + ` ${witnessHp} -> ${witness.hp.toFixed(0)} hp at the same 1.2 m`);
+  ok("but nothing underground was touched -- a proc cannot reach what a bullet cannot",
+    digger.hp === diggerHp,
+    digger.hp === diggerHp
+      ? `burrower untouched at ${diggerHp} hp`
+      : `BURROWER TOOK ${(diggerHp - digger.hp).toFixed(0)} DAMAGE WHILE SUBMERGED`);
+
+  // And the arc specifically, since it picks a single nearest target rather than
+  // sweeping a radius -- a burrower closer than any legal target would eat the chain.
+  const arcDig = makeSim();
+  arcDig.economy.stacks.arc = 20;
+  arcDig.economy.applyAll();
+  arcDig.trampler.walking = false;
+  arcDig.trampler.turning = false;
+  placeOnGroundAt(arcDig, 0, -30);
+  const shot = arcDig.horde.spawn(CHEWER);
+  shot.x = arcDig.player.position.x;
+  shot.y = 0.8;
+  shot.z = arcDig.player.position.z - 6;
+  const nearer = arcDig.horde.spawn(BURROWER);
+  nearer.x = shot.x + 0.8;
+  nearer.y = -CFG.enemies.burrower.height;
+  nearer.z = shot.z;
+  nearer.state = ENEMY_STATE.BURROWED;
+  nearer.burrowT = 999;
+  const nearerHp = nearer.hp;
+  const far = arcDig.horde.spawn(CHEWER);
+  far.x = shot.x + 2.5;
+  far.y = 0.8;
+  far.z = shot.z;
+  const farHp = far.hp;
+  for (let i = 0; i < 12 && arcDig.items.procs.arc === 0; i++) {
+    aimAt(arcDig.player, new THREE.Vector3(shot.x, shot.y, shot.z));
+    step(arcDig, 1);
+    aimAt(arcDig.player, new THREE.Vector3(shot.x, shot.y, shot.z));
+    arcDig.weapon.fire();
+    if (!shot.alive) break;
+  }
+  ok("an arc chains PAST a submerged body to a legal one, rather than into it",
+    arcDig.items.procs.arc > 0 && nearer.hp === nearerHp && far.hp < farHp,
+    `${arcDig.items.procs.arc} arcs, burrower ${nearerHp} -> ${nearer.hp.toFixed(0)},`
+    + ` surface neighbour ${farHp} -> ${far.hp.toFixed(0)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -6253,6 +6928,349 @@ console.log("\n96. The salvage pick is personal, free, and a real choice");
   const twinB = makeSim().economy.offerPick().join(",");
   ok("two runs from the same seed are offered the same three",
     twinA === twinB, `[${twinA}]`);
+
+  // ---- AND A PICK WAITS FOR THE SAME WINDOW THE SHOP DOES.
+  //
+  // The pick panel is a 680 px menu of three items on the bottom-centre anchor, and it
+  // appeared the instant a pick was earned -- which is the instant a wave resolves,
+  // frequently with the remains of that wave still on you. The shop's version of this
+  // problem produced "I just spam buy items out of panic"; the pick had it too, with
+  // none of the shop's protection.
+  //
+  // Asserted as the SAME getter rather than as equivalent behaviour. Two nearly
+  // identical safety rules drift, and a shop and a pick disagreeing about whether this
+  // moment is safe is not explainable to a player.
+  const gated = makeSim();
+  gated.trampler.walking = false;
+  gated.trampler.turning = false;
+  placeOnGroundAt(gated, 0, -30);
+  gated.director.phase = PHASE.REST;
+  gated.director.timer = CFG.waves.minRest;
+  gated.economy.offerPick();
+  ok("a pick in a clear rest is takeable (test is not vacuous)",
+    gated.economy.pickOpen && gated.economy.open,
+    `pickOpen ${gated.economy.pickOpen}, ${gated.horde.liveCount} alive`);
+
+  const onTop = gated.horde.spawn(CHEWER);
+  onTop.x = gated.player.position.x + 1.5;
+  onTop.y = gated.player.position.y;
+  onTop.z = gated.player.position.z;
+  step(gated, 2);
+  const stillOffered = gated.economy.pendingPick.join(",");
+  ok("something in your face closes the pick, exactly as it closes the shop",
+    !gated.economy.pickOpen && gated.economy.pickOpen === gated.economy.open,
+    `pickOpen ${gated.economy.pickOpen}, shop open ${gated.economy.open}`);
+  ok("and pressing a key does not spend it -- the offer survives being refused",
+    gated.economy.takePick(0) === null
+    && gated.economy.pendingPick.join(",") === stillOffered
+    && gated.economy.purchases === 0,
+    `[${stillOffered}] still in hand, ${gated.economy.purchases} purchases`);
+
+  // The keys must not be DEAD while it waits. If the router still handed them to the
+  // pick, they would be owned by something that refuses to act on them, and the shop
+  // and the bay would be locked out for as long as the pick was pending.
+  gated.input.presses.add(CFG.economy.keys[0]);
+  const whileWaiting = routePurchaseInput({
+    economy: gated.economy, run: gated.run, bayOpen: false, input: gated.input, dt: DT,
+  });
+  ok("and the number keys are not left owned by something that refuses them",
+    whileWaiting.owner !== "pick", `owner ${whileWaiting.owner}`);
+  gated.input.presses.clear();
+
+  // Stepping away is the fix, same as the shop. That property is the whole point:
+  // the player can act on the refusal rather than waiting for the fight to end.
+  onTop.x = gated.player.position.x + CFG.repair.threatRange * 3;
+  step(gated, 2);
+  ok("stepping clear re-opens it, and it is still the same three items",
+    gated.economy.pickOpen && gated.economy.pendingPick.join(",") === stillOffered,
+    `[${gated.economy.pendingPick.join(",")}] at`
+    + ` ${Math.hypot(onTop.x - gated.player.position.x, onTop.z - gated.player.position.z).toFixed(1)} m`);
+  ok("and now it can be taken", !!gated.economy.takePick(0),
+    `${gated.economy.purchases} purchases`);
+
+  // A pick earned mid-wave is banked, not lost. Without this the cadence would quietly
+  // drop rewards whenever a wave resolved into another one.
+  const mid = makeSim();
+  mid.director.phase = PHASE.ENGAGED;
+  mid.economy.offerPick();
+  ok("a pick earned while a wave is out is banked rather than shown or lost",
+    !mid.economy.pickOpen && mid.economy.pendingPick.length === CFG.economy.pickCount,
+    `${mid.economy.pendingPick.length} banked, pickOpen ${mid.economy.pickOpen}`);
+
+  // And holding a siege must not re-roll a pick that is still in hand. Invariant 22f
+  // says an offer is never overwritten; the cadence's payer honoured that and the
+  // hold's did not, and the gate above is what made the rare case ordinary -- a pick
+  // now waits, so a hold is far more likely to find one still open.
+  const holdKeep = makeSim();
+  holdKeep.director.phase = PHASE.ENGAGED;
+  const banked = holdKeep.economy.offerPick().join(",");
+  holdKeep.director.phase = PHASE.HELD;
+  holdKeep.run.update();
+  ok("holding a siege does not re-roll a pick that is still in hand",
+    holdKeep.economy.pendingPick.join(",") === banked && holdKeep.run.picking,
+    `[${banked}] -> [${holdKeep.economy.pendingPick.join(",")}], phase ${holdKeep.run.phase}`);
+}
+
+// ---------------------------------------------------------------------------
+// Enemy health feedback, which the game had none of.
+//
+// Invariant 8 has always demanded it -- "a magazine emptied into something with the
+// health bar refusing to move is indistinguishable from a bug" -- and the only
+// feedback that existed was a one-frame white flash. A playtester who had fought
+// bulwarks for an hour still called one "the grey creature, the tank" and could not
+// tell a five-damage hit from a broken game. It was the exact failure the rule was
+// written to prevent, happening in front of us.
+//
+// Two halves, and they answer different questions. The target scan answers "would
+// this shot land, and on what" for ONE thing. The tint answers "which of these
+// forty-five is nearly dead" for a crowd, with no UI at all.
+console.log("\n97. What the crosshair is on is reported, and only when it is shootable");
+{
+  const sim = makeSim();
+  const { weapon, horde, player, trampler } = sim;
+  trampler.walking = false;
+  trampler.turning = false;
+
+  // ---- nothing on the ray
+  placeOnGroundAt(sim, 0, -40);
+  aimAt(player, new THREE.Vector3(player.position.x, 1.2, player.position.z - 60));
+  step(sim, 2);
+  ok("an empty view reports no target", weapon.aimTarget === null,
+    `${weapon.aimTarget ? "SOMETHING" : "null"}`);
+
+  // ---- something on the ray, in the open
+  const mark = horde.spawn(CHEWER);
+  mark.x = player.position.x;
+  mark.y = 0.8;
+  mark.z = player.position.z - 20;
+  aimAt(player, new THREE.Vector3(mark.x, mark.y, mark.z));
+  step(sim, 1);
+  aimAt(player, new THREE.Vector3(mark.x, mark.y, mark.z));
+  step(sim, 1);
+  ok("aiming at an enemy in the open reports it",
+    weapon.aimTarget === mark, weapon.aimTarget ? "the chewer" : "NOTHING");
+  ok("and how far away it is", Math.abs(weapon.aimDist - 20) < 3,
+    `${weapon.aimDist.toFixed(1)} m vs 20 m`);
+
+  // ---- and the readout has to agree with what a SHOT would do. This is the half
+  // that matters: the hull's shadow is the rule the whole pillar rests on, and a
+  // readout naming a chewer you cannot shoot through 3 m of hull slab would be
+  // teaching the player the opposite of the truth.
+  const hidden = makeSim();
+  hidden.trampler.walking = false;
+  hidden.trampler.turning = false;
+  const below = hidden.trampler.localToWorld(new THREE.Vector3(0, -CFG.trampler.deckHeight + 0.8, 0));
+  const under = hidden.horde.spawn(CHEWER);
+  under.x = below.x;
+  under.y = below.y;
+  under.z = below.z;
+  // On the deck, looking straight down at it through the hull.
+  hidden.player.respawnOnDeck();
+  step(hidden, 4);
+  aimAt(hidden.player, new THREE.Vector3(under.x, under.y, under.z));
+  step(hidden, 2);
+  const shot = hidden.weapon.fire();
+  ok("a chewer under the hull is genuinely unshootable from the deck (test is not vacuous)",
+    !shot && under.hp === under.maxHp,
+    `shot ${shot ? "CONNECTED" : "blocked"}, chewer at ${under.hp}/${under.maxHp}`);
+  ok("and it is reported as NO target, because the readout must agree with the shot",
+    hidden.weapon.aimTarget === null,
+    hidden.weapon.aimTarget === null
+      ? "null"
+      : "NAMED A TARGET THE HULL BLOCKS -- the readout is teaching the wrong rule");
+
+  // ---- a dead target clears rather than lingering
+  horde.damage(mark, 1e6);
+  step(sim, 2);
+  ok("killing what you were aiming at clears the readout",
+    weapon.aimTarget === null || weapon.aimTarget.alive === false,
+    `${weapon.aimTarget ? "stale reference, alive=" + weapon.aimTarget.alive : "null"}`);
+
+  // ---- every type has a word for it, because "the grey creature" is what a
+  // playtester says when nothing tells them
+  const missing = ENEMY_TYPE_KEYS.filter((k) => {
+    const l = CFG.enemies[k].label;
+    return !l || l === "HOSTILE";
+  });
+  ok("every type has a player-facing name, not just a code name",
+    missing.length === 0,
+    missing.length
+      ? `UNNAMED: ${missing.join(", ")}`
+      : ENEMY_TYPE_KEYS.map((k) => CFG.enemies[k].label).join(", "));
+
+  // The armour line is what the readout exists to say out loud, so at least one
+  // type has to actually be armoured or the branch is decoration.
+  const armoured = ENEMY_TYPE_KEYS.filter((k) => CFG.enemies[k].armour > 0);
+  ok("and the types that change which weapon is correct are armoured (not vacuous)",
+    armoured.length > 0,
+    armoured.map((k) => `${CFG.enemies[k].label} ${CFG.enemies[k].armour}`).join(", "));
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n98. A worn-down crowd reads darker, without a single floating bar");
+{
+  const sim = makeSim();
+  const { horde } = sim;
+
+  // The tint is written during the draw pass, which is the one part of the horde
+  // that exists for a renderer -- so it is driven here through a real step rather
+  // than by calling the private writer.
+  const a = horde.spawn(CHEWER);
+  const b = horde.spawn(CHEWER);
+  step(sim, 1);
+
+  ok("a fresh enemy is drawn untinted", a.tintBand > 0,
+    `band ${a.tintBand} of the top band`);
+  const full = a.tintBand;
+
+  // The hit flash owns the colour while it lasts, and it MUST -- it is the only
+  // "that connected" feedback in the game, and a wounded body quietly swallowing it
+  // would trade the more urgent signal for the less urgent one. So the tint is only
+  // written once the flash has expired, and reading the band a frame after the
+  // damage lands measures the flash instead of the tint. That is the project's own
+  // "sampling at the wrong moment in a sequence" trap, and the first version of this
+  // block walked straight into it.
+  const flashFrames = Math.ceil(60 * CFG.combat.weapon.hitFlash) + 2;
+  horde.damage(a, a.maxHp * 0.6);
+  step(sim, 1);
+  ok("a hit still flashes white, which outranks the tint while it lasts",
+    a.flash > 0 && a.tintBand === full,
+    `flash ${a.flash.toFixed(2)}s, band still ${a.tintBand}`);
+
+  step(sim, flashFrames);
+  ok("and once the flash clears, it is drawn a band darker",
+    a.flash <= 0 && a.tintBand < full,
+    `band ${full} -> ${a.tintBand} at ${Math.round(a.hp / a.maxHp * 100)}% health`);
+  ok("while its untouched neighbour did not move", b.tintBand === full,
+    `band ${b.tintBand}`);
+
+  // The band is what makes this cheap: an untouched crowd must cost no buffer
+  // upload at all, which is the whole reason it is quantised rather than smooth.
+  const settled = a.tintBand;
+  step(sim, 1);
+  ok("a steady crowd re-writes nothing, so an untouched wave is free",
+    a.tintBand === settled && b.tintBand === full,
+    `bands ${a.tintBand}, ${b.tintBand}`);
+
+  // A pooled slot must not inherit the previous occupant's tint. This is the bug
+  // this field exists to prevent: a full-health enemy drawn dark because something
+  // died at 20% in the same slot.
+  horde.damage(a, 1e6);
+  step(sim, 1);
+  const reused = horde.spawn(CHEWER);
+  ok("a recycled pool slot starts unwritten rather than inheriting a dark body",
+    reused.tintBand === -1,
+    `band ${reused.tintBand} before the first draw`);
+  step(sim, 1);
+  ok("and comes out at full health in the top band",
+    reused.tintBand === full && reused.hp === reused.maxHp,
+    `band ${reused.tintBand}, ${reused.hp}/${reused.maxHp} hp`);
+}
+
+// ---------------------------------------------------------------------------
+// The pick cadence, which exists because of a measured playtest failure rather than
+// a design idea: the pick was paid ONLY for holding a siege -- wave five of five --
+// and the player averaged wave four. The headline reward of the whole item update was
+// behind a gate they had passed once in an evening.
+//
+// So the thing to test is REACHABILITY, not just correctness. A run that dies at wave
+// four has to have been offered something.
+console.log("\n99. A pick arrives often enough to actually reach");
+{
+  const sim = makeSim();
+  const { director, run, economy } = sim;
+  const every = CFG.run.pickEveryWaves;
+  ok("the cadence is configured to something that can fire inside one siege",
+    every > 0 && every < CFG.waves.siegeLength,
+    `every ${every} waves, siege is ${CFG.waves.siegeLength}`);
+
+  // Waves are resolved by driving the director's own counter through its own phases
+  // rather than by fighting, because what is under test is the cadence and not the
+  // combat -- and a real fight would take minutes per wave to lose on purpose.
+  const resolveWave = () => {
+    director.phase = PHASE.ENGAGED;
+    director.wave = Math.min(director.wave + 1, director.siegeLength);
+    sim.horde.clear();
+    // ENGAGED resolves once the field is calm, which it now is.
+    director.update(DT);
+    run.update();
+  };
+
+  const offeredAt = [];
+  for (let w = 1; w <= CFG.waves.siegeLength; w++) {
+    resolveWave();
+    if (economy.pendingPick.length > 0) {
+      offeredAt.push(w);
+      economy.takePick(0);
+      run.update();
+    }
+  }
+
+  ok("a pick lands inside the first few waves, not only at the end",
+    offeredAt.length > 0 && offeredAt[0] <= every,
+    `offered after waves [${offeredAt.join(", ")}]`);
+  // The specific failure this replaces: dying at wave four used to mean never having
+  // been handed anything at all.
+  ok("so a run that dies before holding the siege has still made a build decision",
+    offeredAt.some((w) => w < CFG.waves.siegeLength),
+    `first pick after wave ${offeredAt[0]}, siege ends at ${CFG.waves.siegeLength}`);
+  ok("and holding the siege still pays its own on top",
+    offeredAt.includes(CFG.waves.siegeLength),
+    `[${offeredAt.join(", ")}]`);
+
+  // A buried wave must not pay. Only waves the crew actually SEES OFF increment the
+  // director's resolved counter, and stacking one with Q means the first never does --
+  // which is part of what calling early costs, and it falls out of polling that
+  // counter rather than being special-cased anywhere.
+  const q = makeSim();
+  q.director.phase = PHASE.ENGAGED;
+  q.director.wave = 1;
+  q.horde.spawn(CHEWER); // field is not calm, so nothing resolves on its own
+  const resolvedBefore = q.director.resolved;
+  q.director.callEarly();
+  q.director.update(DT);
+  q.run.update();
+  ok("a wave buried by calling early pays no pick, because it was never resolved",
+    q.director.resolved === resolvedBefore && q.economy.pendingPick.length === 0,
+    `resolved ${resolvedBefore} -> ${q.director.resolved},`
+    + ` ${q.economy.pendingPick.length} on offer`);
+
+  // An offer already in hand must not be replaced. Overwriting one would make an
+  // item the player was looking at vanish, which reads as a bug rather than as luck.
+  const keep = makeSim();
+  keep.economy.offerPick();
+  const held = keep.economy.pendingPick.join(",");
+  for (let w = 1; w < CFG.waves.siegeLength; w++) {
+    keep.director.phase = PHASE.ENGAGED;
+    keep.director.wave = w;
+    keep.horde.clear();
+    keep.director.update(DT);
+    keep.run.update();
+  }
+  ok("and a pick already on offer is never overwritten by the next one",
+    keep.economy.pendingPick.join(",") === held,
+    `[${held}] still on offer`);
+
+  // The keys have to actually work in the new state. A mid-siege pick leaves the
+  // run's phase at SIEGE, so anything gated on `run.picking` would show the panel,
+  // print TAKE SALVAGE on the prompt, and do nothing at all when pressed.
+  const keyed = makeSim();
+  keyed.director.phase = PHASE.REST;
+  keyed.economy.offerPick();
+  const wanted = CFG.economy.catalogue[keyed.economy.pendingPick[0]].id;
+  ok("the run is mid-siege, not in the pick phase (test is not vacuous)",
+    keyed.run.phase === RUN.SIEGE && !keyed.run.picking,
+    `phase ${keyed.run.phase}`);
+  keyed.input.presses.add(CFG.economy.keys[0]);
+  const routed = routePurchaseInput({
+    economy: keyed.economy, run: keyed.run, bayOpen: false, input: keyed.input, dt: DT,
+  });
+  ok("a pending pick owns the number keys wherever the run happens to be",
+    routed.owner === "pick" && keyed.economy.stacks[wanted] === 1,
+    `owner ${routed.owner}, ${wanted} x${keyed.economy.stacks[wanted]}`);
+  ok("and it did not buy a refit with the same press",
+    keyed.economy.purchases === 1 && keyed.economy.salvage === 0,
+    `${keyed.economy.purchases} purchases, ${keyed.economy.salvage} salvage`);
 }
 
 ok("no boarder ever floated off the deck footprint", !sawFloatingBoarder);
