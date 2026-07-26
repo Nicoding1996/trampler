@@ -22,8 +22,8 @@ const paths = [
   "/node_modules/three/build/three.module.js",
   "/node_modules/three/examples/jsm/postprocessing/EffectComposer.js",
   "/node_modules/three/examples/jsm/postprocessing/UnrealBloomPass.js",
-  "/node_modules/three/examples/jsm/postprocessing/SMAAPass.js",
   "/node_modules/three/examples/jsm/postprocessing/OutputPass.js",
+  "/node_modules/three/examples/jsm/shaders/FXAAShader.js",
   "/node_modules/three/examples/jsm/loaders/RGBELoader.js",
   "/assets/manifest.json",
 ];

@@ -1263,12 +1263,44 @@ export const CFG = {
     // full-screen post pass pays for all of them.
     maxPixelRatio: 1.5,
 
-    // Adaptive resolution. The renderer measures its own frame time and walks the
-    // scale between these bounds to hold the target, in steps, on a slow cadence
-    // so it never oscillates visibly.
+    // Adaptive resolution. The renderer measures the raw frame interval and walks
+    // the scale between these bounds, in steps, on a slow cadence so it never
+    // oscillates visibly.
+    //
+    // The thresholds are RATIOS of the display's own refresh interval, not absolute
+    // milliseconds, and that is the whole point of them. They used to be a fixed
+    // 15.5 ms target with an 11.0 ms release: on a vsynced 60 Hz monitor a perfectly
+    // healthy frame is 16.7 ms, so every healthy 60 Hz machine read as "too slow"
+    // for ever. The scale walked down to 0.6 in four seconds, antialiasing switched
+    // itself off on the way, and it could never come back up because 11.0 ms needs
+    // 90 fps that vsync will not hand out. The result was a permanently soft image
+    // and four render-target reallocations, on hardware with nothing wrong with it.
     adaptive: {
-      targetMs: 15.5,     // a little under 16.7, so it settles rather than hunts
-      relaxMs: 11.0,      // comfortably fast: allowed to scale back up
+      // Scale down past 1.25x the refresh interval -- a frame that misses vsync
+      // outright is 2x, so this catches the miss without reacting to jitter.
+      downFactor: 1.25,
+      // And back up while comfortably inside it. Above 1.0 because a frame that
+      // exactly hits refresh is a frame that is keeping up.
+      upFactor: 1.10,
+      // There is no browser API for the refresh rate, so it is inferred from the
+      // fastest frame actually observed. Until one arrives, assume 60 Hz -- which is
+      // also the safe guess, since a machine that never produces a plausible sample
+      // is a machine that is not keeping up with 60 Hz either.
+      refreshFallbackMs: 16.7,
+      // Only intervals in this band are believed to be vsync. Without an upper
+      // bound a machine stuck at half rate would decide its monitor was 30 Hz and
+      // then happily conclude it was keeping up -- the scaler would stop reacting
+      // to load at all, which is the failure this whole block exists to avoid.
+      refreshSampleMin: 4.0,
+      refreshSampleMax: 20.5,
+      // Do not chase a frame time faster than this even on a 240 Hz panel. Without
+      // it, high-refresh hardware spends its resolution budget pursuing a rate
+      // nobody asked for.
+      refreshFloorMs: 8.3,
+      // One alt-tab is CLAMPED into the average rather than thrown away. Discarding
+      // outliers would also discard a genuine 5 fps frame, and then the worst load
+      // in the game would be the load the scaler ignored.
+      spikeClampMs: 100,
       minScale: 0.6,
       maxScale: 1.0,
       step: 0.1,

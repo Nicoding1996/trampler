@@ -248,8 +248,13 @@ function boot() {
   };
 
   function frame(now) {
+    // How long the frame ACTUALLY took, kept separate from the simulation's dt.
+    // The renderer's quality scaler needs this one: the clamp below reports every
+    // frame slower than 30 fps as exactly 33.3 ms, which hides the entire range a
+    // scaler is supposed to react to.
+    const frameMs = now - last;
     // Clamped so an alt-tab or a stall cannot tunnel the player through the hull.
-    const dt = Math.min((now - last) / 1000, 1 / 30);
+    const dt = Math.min(frameMs / 1000, 1 / 30);
     last = now;
 
     fpsAccum += dt;
@@ -373,7 +378,7 @@ function boot() {
     // Hurt tint on the grade pass rises as health falls. Post-processing, unlike
     // the HUD's damage flash, is about the world looking wrong rather than about a
     // number changing.
-    post.render(dt, Math.max(0, 1 - player.hp / player.maxHp) * 0.55);
+    post.render(dt, Math.max(0, 1 - player.hp / player.maxHp) * 0.55, frameMs);
     requestAnimationFrame(frame);
   }
 

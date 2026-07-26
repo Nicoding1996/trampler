@@ -82,11 +82,21 @@ What did it:
 - **Tightened the shadow camera** from ±80 m to ±46 m: sharper and cheaper at once,
   the same texel budget over a smaller area.
 - **Capped the pixel ratio at 1.5** and added adaptive resolution, which measures
-  its own frame time and walks the render scale between 0.6 and 1.0 in steps on a
-  one-second cadence. Deliberately slow and hysteretic — a scaler that reacts
+  the raw frame interval and walks the render scale between 0.6 and 1.0 in steps on
+  a one-second cadence. Deliberately slow and hysteretic — a scaler that reacts
   quickly oscillates, and visible oscillation is worse than a steady lower
-  resolution. Below full scale it drops SMAA, which is refining edges the upscale
-  would blur anyway.
+  resolution. Below full scale it drops antialiasing, which is refining edges the
+  upscale would blur anyway.
+
+  Its thresholds are **ratios of the display's refresh interval**, and the first
+  version's absolute ones were a bug worth recording: against a fixed 15.5 ms target
+  a healthy vsynced 60 Hz frame of 16.7 ms read as too slow, so every 60 Hz machine
+  walked down to 0.6, switched its antialiasing off on the way, and could never
+  recover because the 11.0 ms release needed 90 fps that vsync will not hand out. A
+  permanently soft image and four render-target reallocations, on hardware with
+  nothing wrong with it. The measurement was also taking the simulation's clamped
+  dt, which reports everything below 30 fps as 33.3 ms — the scaler could not
+  distinguish 30 fps from 5 fps.
 - **PCF instead of PCFSoft** shadows: four times fewer samples for a penumbra
   nobody is examining.
 
