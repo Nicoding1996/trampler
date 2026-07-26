@@ -1,6 +1,9 @@
 import * as THREE from "three";
-import { CFG, applyReleasePreset, applyEnemySpeedScale } from "./config.js";
+import {
+  CFG, applyReleasePreset, applyEnemySpeedScale, ENEMY_TYPE_KEYS,
+} from "./config.js";
 import { clamp } from "./util.js";
+import { Look } from "./look.js";
 import { Input } from "./input.js";
 import { World } from "./world.js";
 import { Trampler } from "./trampler.js";
@@ -12,25 +15,30 @@ import { Weapon } from "./weapon.js";
 import { Repair } from "./repair.js";
 import { DeckGun, handleStationInput } from "./deckgun.js";
 import { Emitters } from "./emitters.js";
-import { Economy } from "./economy.js";
+import { Economy, routePurchaseInput } from "./economy.js";
+import { Modules } from "./modules.js";
+import { Run } from "./run.js";
 import { Hud } from "./hud.js";
+import { createRenderer, Post, Shake } from "./render.js";
+import { Fx } from "./fx.js";
+import { ViewModel } from "./viewmodel.js";
+import { Audio } from "./audio.js";
 
 const canvas = document.getElementById("c");
 const gate = document.getElementById("gate");
 const gateErr = document.getElementById("gate-err");
 
+const _v = new THREE.Vector3();
+
 function boot() {
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-  renderer.setSize(innerWidth, innerHeight);
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.0;
+  const renderer = createRenderer(canvas);
 
   const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(85, innerWidth / innerHeight, 0.1, 1400);
+  const camera = new THREE.PerspectiveCamera(85, innerWidth / innerHeight, 0.1, 2000);
   camera.rotation.order = "YXZ";
+  // The viewmodel is parented to the camera, and children of a camera are only
+  // traversed if the camera itself is in the graph.
+  scene.add(camera);
 
   const world = new World(scene);
   const trampler = new Trampler(scene);
@@ -45,9 +53,15 @@ function boot() {
   const guns = CFG.deckGun.mounts.map((m) => new DeckGun(scene, trampler, m));
   const emitters = new Emitters(scene, trampler, horde);
 
-  // Constructed last because it reaches into most of the above to apply upgrades,
-  // and it hooks horde.onKill, which every damage source funnels through.
-  const economy = new Economy({ player, trampler, weapon, repair, horde, director });
+  // Modules before Economy: the economy owns the purse that buys them and calls
+  // modules.reset() from its own reset. Economy before Run: the run pays arrival
+  // bonuses into it. Constructed in dependency order so nothing has to be patched
+  // together afterwards.
+  const modules = new Modules({ trampler, horde, emitters, guns });
+  const economy = new Economy({
+    player, trampler, weapon, repair, horde, director, modules,
+  });
+  const run = new Run(director, horde, economy);
 
   // Whichever mount the HUD should be talking about: the manned one, else the
   // one you are standing next to.
@@ -56,6 +70,21 @@ function boot() {
 
   const input = new Input(canvas, gate);
   const hud = new Hud();
+  const post = new Post(renderer, scene, camera);
+  const shake = new Shake();
+  const fx = new Fx(scene, camera);
+  const viewmodel = new ViewModel(camera);
+  const audio = new Audio();
+
+  // Art is loaded asynchronously and applied to materials that already exist, so
+  // the first frames draw in flat colours and then dress themselves. A missing
+  // assets/ directory is a visual downgrade and nothing more.
+  Look.load(renderer, scene);
+
+  // Sound needs a real user gesture before a browser will allow an AudioContext,
+  // and the click-to-play gate is exactly that.
+  canvas.addEventListener("pointerdown", () => audio.start());
+  gate.addEventListener("click", () => audio.start());
 
   // Raycasting needs current world matrices. The renderer only refreshes them
   // at draw time, which is after the frame's grapple cast, so seed them once
@@ -65,14 +94,16 @@ function boot() {
   addEventListener("resize", () => {
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
-    renderer.setSize(innerWidth, innerHeight);
+    post.setSize(innerWidth, innerHeight);
   });
 
   function resetEncounter() {
     horde.clear();
     emitters.clear();
-    // Wipes both purses AND reverts every upgrade. Carrying stats across a restart
-    // would make each attempt quietly easier, which defeats the seeded fight.
+    // Wipes both purses AND reverts every upgrade, and calls modules.reset(), which
+    // strips the three hardpoints and restores every module multiplier. Carrying
+    // stats across a restart would make each attempt quietly easier, which defeats
+    // the seeded fight.
     economy.reset();
     trampler.repairAll();
     // Rewind the patrol too, not just the damage. Spawn bearings derive from the
@@ -80,6 +111,10 @@ function boot() {
     // from the same seed.
     trampler.resetPose();
     director.reset();
+    // After the director, because the run re-seeds its own road stream and then
+    // reconfigures the director's siege length for landmark one.
+    run.reset();
+    world.setFogScale(1);
     player.hp = player.maxHp;
     for (const g of guns) {
       g.dismount(player);
@@ -87,6 +122,7 @@ function boot() {
       g.overheated = false;
     }
     player.respawnOnDeck();
+    hud.closeBay();
     hud.hideBanner();
     lossTimer = 0;
   }
@@ -108,6 +144,27 @@ function boot() {
     // E is held for repair, so calling a wave early moved to Q.
     if (input.pressed("KeyQ")) director.callEarly();
     if (input.pressed("KeyK")) resetEncounter();
+    if (input.pressed("KeyN")) {
+      toast(`POST-PROCESSING ${post.toggle() ? "ON" : "OFF"}`, 1.2);
+    }
+    // Brightness, live. A playtest reported being flash-banged, and while the whole
+    // lighting chain came down in response, "too bright" is finally a
+    // monitor-and-eyes judgement that no measurement settles -- so it gets a knob
+    // and a readout, like enemy speed did.
+    if (input.pressed("Minus")) {
+      toast(`EXPOSURE ${post.adjustExposure(-CFG.render.exposureStep).toFixed(2)}`, 1.2);
+    }
+    if (input.pressed("Equal")) {
+      toast(`EXPOSURE ${post.adjustExposure(+CFG.render.exposureStep).toFixed(2)}`, 1.2);
+    }
+    if (input.pressed("KeyV")) {
+      post.adaptive = !post.adaptive;
+      toast(
+        `ADAPTIVE RESOLUTION ${post.adaptive ? "ON" : "OFF"}`
+        + `<small>currently ${post.status}</small>`,
+        1.8,
+      );
+    }
 
     const d = CFG.debug;
     if (input.pressed("BracketLeft")) {
@@ -136,12 +193,44 @@ function boot() {
     );
   }
 
+  /**
+   * Hand the number keys to whichever of the three competing panels owns them,
+   * then deal with the HUD and world side effects the router deliberately does not.
+   *
+   * The routing rule itself lives in economy.js so the harness can test it — the
+   * harness cannot import this file, so anything decided here is uncovered.
+   */
+  function handlePurchasing(dt) {
+    if (input.pressed(CFG.fortress.toggleKey)) hud.toggleBay();
+    // A road choice is a decision the run is blocked on, so the bay gets out of
+    // the way rather than sitting underneath it.
+    if (run.choosing) hud.closeBay();
+
+    const routed = routePurchaseInput({
+      economy, run, bayOpen: hud.bayOpen, input, dt,
+    });
+
+    if (routed.arrival) {
+      const a = routed.arrival;
+      world.setFogScale(run.fogScale);
+      toast(
+        `${a.name}<small>${a.detail} · +${a.salvage} salvage`
+        + ` · +${a.scrap} scrap${a.module ? " · a free module" : ""}`
+        + `${a.boss ? " <br>SOMETHING IS WAITING AT THIS ONE" : ""}</small>`,
+        4,
+      );
+    }
+  }
+
   // ---- loop ---------------------------------------------------------------
   let last = performance.now();
   let fpsAccum = 0;
   let fpsFrames = 0;
   let fps = 0;
   let lossTimer = 0;
+  let lastStepCount = 0;
+  let lastHurtCount = 0;
+  let lastKillRef = null;
 
   // The banner is otherwise driven by persistent states and cleared every frame,
   // so a transient message needs its own timer or the next frame erases it.
@@ -152,9 +241,10 @@ function boot() {
     toastTimer = seconds;
   }
 
-  const hudCtx = {
+  const ctx = {
     player, trampler, grapple, horde, director, weapon, repair, emitters, economy,
-    gun: null, fps: 0,
+    modules, run, guns, input, world, renderer, post,
+    gun: null, fps: 0, dt: 0,
   };
 
   function frame(now) {
@@ -177,6 +267,9 @@ function boot() {
     // effect on the frame it was pressed, the horde reads the hull's transform
     // after it has moved, and visuals update last against a fresh camera.
     trampler.update(dt);
+    // Immediately after the hull moves, so a foot that came down this frame
+    // resolves against where things actually are.
+    trampler.resolveStomps(horde, player);
 
     if (trampler.destroyed) {
       lossTimer += dt;
@@ -184,17 +277,29 @@ function boot() {
       if (lossTimer > 3.5) resetEncounter();
     } else {
       director.update(dt);
-      // A tuning toast briefly outranks the immobilised notice; losing the reactor
-      // outranks everything. Holding the siege outranks everything except a loss,
-      // and unlike the others it does NOT auto-reset -- finishing a run should be
-      // something you get to sit in, not something the game clears for you.
-      if (director.held) {
+      run.update();
+
+      // Banner priority, highest first: losing the reactor, finishing the run,
+      // being asked to choose a road, a tuning toast, being immobilised. Each one
+      // outranks the next because each is a state you can do less about.
+      if (run.done) {
         hud.showBanner(
-          `SIEGE HELD<small>${CFG.waves.siegeLength} waves · press K to run it again</small>`,
+          `BIOME CLEARED<small>${CFG.run.legs} landmarks and the siegebreaker`
+          + ` · press K to run it again</small>`,
         );
       } else if (toastTimer > 0) {
         toastTimer -= dt;
         hud.showBanner(toastHtml);
+      } else if (run.choosing) {
+        // Deliberately blank. The route panel and the contextual prompt both say
+        // what to do, and a banner would sit on top of the roads being chosen
+        // between.
+        //
+        // There is no `director.held` branch below this, and that is not an
+        // omission: run.update() runs earlier in this same frame and turns a held
+        // siege into either CHOOSING or DONE, so `director.held` is never reachable
+        // here. A branch for it looked sensible and was dead.
+        hud.hideBanner();
       } else if (trampler.immobilised) {
         hud.showBanner("TRAMPLER IMMOBILISED<small>repair a leg to get it walking again</small>");
       } else {
@@ -210,7 +315,7 @@ function boot() {
     repair.update(dt, input);
     emitters.update(dt, input, player);
     // After the director, so a wave resolved this frame pays this frame.
-    economy.update(dt, input);
+    handlePurchasing(dt);
     if (economy.lastEvent) {
       const ev = economy.lastEvent;
       toast(
@@ -224,12 +329,51 @@ function boot() {
     grapple.updateVisuals(dt);
 
     world.updateSun(player.position);
-    hudCtx.fps = fps;
-    hudCtx.gun = activeGun();
-    hud.update(hudCtx);
+
+    // ---- feel: shake, then everything that reads the camera --------------
+    //
+    // Shake is applied AFTER player.update, which writes the camera transform
+    // outright every frame. Anything added before it is discarded.
+    if (trampler.stepCount !== lastStepCount) {
+      // Attenuated by distance to the nearest foot that landed, so a leg astern
+      // does not shake the view as hard as the one you are standing beside.
+      for (const fall of trampler.footfalls) {
+        trampler.localToWorld(_v.copy(fall.local));
+        shake.addAt(_v, camera, CFG.render.shake.step * (player.base ? 2.2 : 1.4), 34);
+      }
+      lastStepCount = trampler.stepCount;
+    }
+    if (trampler.playerStomped) shake.add(CFG.render.shake.stomp);
+    if (player.hurtCount !== lastHurtCount) {
+      lastHurtCount = player.hurtCount;
+      shake.add(CFG.render.shake.hurt);
+    }
+    // Something big going down. Compared on object identity rather than on the
+    // kill counter, because a sapper's charge completing removes it without paying
+    // anybody and never touches killCount.
+    if (horde.lastKill && horde.lastKill !== lastKillRef) {
+      lastKillRef = horde.lastKill;
+      const key = ENEMY_TYPE_KEYS[lastKillRef.type];
+      if (key === "titan" || key === "bulwark") {
+        _v.set(lastKillRef.x, lastKillRef.y, lastKillRef.z);
+        shake.addAt(_v, camera, CFG.render.shake.titan, 60);
+      }
+    }
+    shake.update(dt, camera);
+
+    ctx.fps = fps;
+    ctx.dt = dt;
+    ctx.gun = activeGun();
+    viewmodel.update(dt, ctx);
+    fx.update(dt, ctx);
+    audio.update(dt, ctx);
+    hud.update(ctx);
 
     input.endFrame();
-    renderer.render(scene, camera);
+    // Hurt tint on the grade pass rises as health falls. Post-processing, unlike
+    // the HUD's damage flash, is about the world looking wrong rather than about a
+    // number changing.
+    post.render(dt, Math.max(0, 1 - player.hp / player.maxHp) * 0.55);
     requestAnimationFrame(frame);
   }
 

@@ -28,12 +28,40 @@ options. Options do not create gameplay; pressure does.
 
 ## Enemy roles
 
+Six types. Each one attacks the pillar from a different angle, and none of them is
+a health bar with a different colour on it. If a new type cannot be described as
+"the reason to be somewhere", it should not exist.
+
 - **Chewers** attack the legs from *inboard*, under the hull slab. The deck
   physically cannot see them. They are the reason to dismount.
 - **Climbers** board via authored routes and eat the reactor. They are the
   reason not to stay down there.
+- **Bulwarks** are armoured past the point where a rifle is a sensible answer —
+  five damage a shot against 300 health. They are the reason the deck gun still
+  matters after the first ten seconds of a wave, which it previously did not.
+- **Burrowers** travel underground, where they cannot be shot, and surface beneath
+  the hull. They are the reason camping a gun is not a strategy: every other ground
+  threat has an approach you can shoot at, so a player parked at the bow could farm
+  the horde and only ever lose to the boarders behind them.
+- **Sappers** deal no contact damage at all. They plant a charge worth exactly one
+  leg on a six-second fuse. They are the reason to go down there *right now*, and
+  the only enemy that is a timer rather than a damage race.
+- **The titan** is too tall to fit under the hull, so it works from outboard, in
+  the open, where both guns reach it. It is the one fight that inverts the pillar
+  and makes the deck the right place to be.
 
 Losing the reactor ends the run. Losing legs stops the fortress dead.
+
+## The run
+
+Four landmarks, a siege at each, and between them a choice of two roads. Every
+road carries a real cost — more enemies, tougher enemies, faster enemies, less
+visibility — and pays on arrival, so the money for choosing the hard road is
+spendable on surviving it. The quiet road exists and is deliberately the dull one:
+a menu where one option is strictly best is a menu, not a decision.
+
+The last landmark is the boss. About fifteen minutes for a biome, against a
+30-45 minute target for a full run — biomes are the unit that repeats.
 
 ## Design principles earned the hard way
 
@@ -51,11 +79,11 @@ upgrade slots, so a run has a readable silhouette, while personal upgrades stack
 without limit in the Risk of Rain style. Growth shows up as accretion on a fixed
 frame, not as infinite geometry.
 
-This is now expressed as *income*, not just as caps: personal salvage is earned
-alone, per kill, and buys the unbounded track; shared scrap is earned together, by
-resolving a wave, and buys the bounded one. Splitting the currency on day one was
-deliberate — one pooled pot generates a co-op argument every wave, and retrofitting
-a split means re-deriving every price and payout.
+This is expressed as *income*, not just as caps: personal salvage is earned alone
+and buys the unbounded track, shared scrap is earned by resolving a wave and buys
+the bounded one. Invariant 22 is the enforced form. Splitting the currency on day
+one was deliberate — one pooled pot generates a co-op argument every wave, and
+retrofitting a split means re-deriving every price and payout.
 
 **A risk with no upside is not a decision.** Calling a wave early existed for a
 long time with nothing to be greedy for, so nobody would ever press it. Any
@@ -95,6 +123,26 @@ shock emitters looked weak on paper (a third of a player's damage) and held the
 under-hull area indefinitely, because automation never aims, never dies, and
 never has to break off to repair something.
 
+**The fortress does not fight for you.** The strongest form of the rule above, and
+it was learned by breaking it. Leg stomps were added to make the under-hull arena
+feel dangerous, and they were deliberately too weak to kill a chewer on their own,
+which seemed like protection enough. It was not: undefended survival rose by a
+fifth and the fixed-force emitter test hit its ceiling.
+
+Nothing looked wrong. The fortress simply defended itself, and the reason to be
+down there evaporated. Two automated damage sources cannot be attributed — you can
+no longer tell which one is carrying the fight — which is also why an automated
+deck turret has been shelved three times. The feet now hurt the player and shove
+bodies aside, and settle nothing. Invariant 2c holds the measurements and the two
+things that protect it.
+
+**Add to the roster, not to the count.** New enemy types substitute for existing
+ones inside a wave rather than growing it, because the wave-size curve was tuned
+against measured pacing and moving size and composition together means no later
+difficulty change can be attributed to either. Invariant 19e is the enforced form.
+The same discipline governs fixes and edits — see "One change at a time" in
+`tech.md`.
+
 **Separate "impossible" from "too demanding" before tuning anything.** Wave 3 was
 called a wall three times and three different fixes were aimed at it. The useful
 move was an **oracle defender** — teleports, never misses, never takes damage,
@@ -115,23 +163,36 @@ not a difficulty slider.
 
 ## Current state
 
-Steps 1-4 of the prove-it plan are complete: moving deck, grapple boarding,
-enemies creating both pressures, spatial damage with repair, two manned guns, and
-deployable shock emitters.
+Everything planned below the netcode tier is built and measured: the moving deck,
+grapple boarding, six enemy types creating pressure in every direction, spatial
+damage with repair, two manned guns, deployable shock emitters, a finish line, two
+purses, unbounded personal stacks, three bounded hardpoints, a four-landmark
+journey with branching roads, and a boss that inverts the pillar for one fight.
+
+Sound is synthesised at runtime. The art is eight CC0 texture sets and one CC0
+HDRI, vendored, and entirely optional — everything else is generated in code.
 
 **The pillar is confirmed.** A solo playtest reported the intended rhythm —
 picking off the approach from a gun, dropping down to fight and repair under the
 hull, going back up when boarders reach the reactor. Roles emerged on their own,
 which is the signal that co-op will work.
 
-Open: whether the recovery loop now holds up under wave 3+ pressure. See
-ROADMAP.md.
+What is open is no longer arithmetic. Whether three hardpoints is an interesting
+choice, whether the greedy road is ever tempting, whether the boss is an exam or a
+wall, and whether being pinned at a gun feels powerful or trapped — none of that
+can be measured, and all of it needs hands on the controls. See ROADMAP.md.
 
 ## Scope discipline
 
-This is a grey-box feel test, not a game. Deliberately absent: art, audio,
-netcode, run structure, economy, modules, meta-progression. Do not add polish to
-systems whose design question is still open.
+This is still a feel test, not a shippable game. What exists is there to answer a
+design question; what does not exist is there because its question is not open yet.
 
-The prototype de-risks **feel only**. Networked players on a moving platform is
-the largest engineering risk in the project and is completely untouched.
+Deliberately absent: netcode, meta-progression, a second biome, PvP, extraction,
+and any polish on a system whose design question is still open. The art that does
+exist is the minimum needed to stop a grey box reading as a grey box, because a
+grey box distorts feel judgements too — sound was silent for months and was
+demonstrably skewing them.
+
+The prototype de-risks **feel only**. Networked players on a moving platform is the
+largest engineering risk in the project, is completely untouched, and structurally
+cannot be answered here. It needs a spike in the target engine.

@@ -1,0 +1,48 @@
+
+> trampler-feel-test@0.1.0 smoke
+> node tools/smoke-serve.mjs
+
+ok   200     24 KB  text/html; charset=utf-8           /
+ok   200     15 KB  text/javascript; charset=utf-8     /src/main.js
+ok   200     18 KB  text/javascript; charset=utf-8     /src/look.js
+ok   200     12 KB  text/javascript; charset=utf-8     /src/render.js
+ok   200     14 KB  text/javascript; charset=utf-8     /src/fx.js
+ok   200     11 KB  text/javascript; charset=utf-8     /src/audio.js
+ok   200      7 KB  text/javascript; charset=utf-8     /src/viewmodel.js
+ok   200   1284 KB  text/javascript; charset=utf-8     /node_modules/three/build/three.module.js
+ok   200      5 KB  text/javascript; charset=utf-8     /node_modules/three/examples/jsm/postprocessing/EffectComposer.js
+ok   200     12 KB  text/javascript; charset=utf-8     /node_modules/three/examples/jsm/postprocessing/UnrealBloomPass.js
+ok   200     48 KB  text/javascript; charset=utf-8     /node_modules/three/examples/jsm/postprocessing/SMAAPass.js
+ok   200      2 KB  text/javascript; charset=utf-8     /node_modules/three/examples/jsm/postprocessing/OutputPass.js
+ok   200     11 KB  text/javascript; charset=utf-8     /node_modules/three/examples/jsm/loaders/RGBELoader.js
+ok   200      3 KB  application/json; charset=utf-8    /assets/manifest.json
+ok   200   1191 KB  image/vnd.radiance                 /assets/hdri/wasteland_clouds_puresky_1k.hdr
+ok   200    958 KB  image/jpeg                         /assets/textures/sand_02/sand_02_diff_1k.jpg
+ok   200   1084 KB  image/jpeg                         /assets/textures/sand_02/sand_02_nor_gl_1k.jpg
+ok   200    521 KB  image/jpeg                         /assets/textures/sand_02/sand_02_arm_1k.jpg
+ok   200    552 KB  image/jpeg                         /assets/textures/rusty_metal_02/rusty_metal_02_diff_1k.jpg
+ok   200    394 KB  image/jpeg                         /assets/textures/rusty_metal_02/rusty_metal_02_nor_gl_1k.jpg
+ok   200    149 KB  image/jpeg                         /assets/textures/rusty_metal_02/rusty_metal_02_arm_1k.jpg
+ok   200    676 KB  image/jpeg                         /assets/textures/metal_plate/metal_plate_diff_1k.jpg
+ok   200    752 KB  image/jpeg                         /assets/textures/metal_plate/metal_plate_nor_gl_1k.jpg
+ok   200    981 KB  image/jpeg                         /assets/textures/metal_plate/metal_plate_arm_1k.jpg
+ok   200    825 KB  image/jpeg                         /assets/textures/rust_coarse_01/rust_coarse_01_diff_1k.jpg
+ok   200    745 KB  image/jpeg                         /assets/textures/rust_coarse_01/rust_coarse_01_nor_gl_1k.jpg
+ok   200    814 KB  image/jpeg                         /assets/textures/rust_coarse_01/rust_coarse_01_arm_1k.jpg
+ok   200    703 KB  image/jpeg                         /assets/textures/corrugated_iron/corrugated_iron_diff_1k.jpg
+ok   200    737 KB  image/jpeg                         /assets/textures/corrugated_iron/corrugated_iron_nor_gl_1k.jpg
+ok   200    501 KB  image/jpeg                         /assets/textures/corrugated_iron/corrugated_iron_arm_1k.jpg
+ok   200    908 KB  image/jpeg                         /assets/textures/metal_grate_rusty/metal_grate_rusty_diff_1k.jpg
+ok   200    857 KB  image/jpeg                         /assets/textures/metal_grate_rusty/metal_grate_rusty_nor_gl_1k.jpg
+ok   200    944 KB  image/jpeg                         /assets/textures/metal_grate_rusty/metal_grate_rusty_arm_1k.jpg
+ok   200    839 KB  image/jpeg                         /assets/textures/rock_boulder_dry/rock_boulder_dry_diff_1k.jpg
+ok   200    784 KB  image/jpeg                         /assets/textures/rock_boulder_dry/rock_boulder_dry_nor_gl_1k.jpg
+ok   200    766 KB  image/jpeg                         /assets/textures/rock_boulder_dry/rock_boulder_dry_arm_1k.jpg
+ok   200    639 KB  image/jpeg                         /assets/textures/concrete_wall_007/concrete_wall_007_diff_1k.jpg
+ok   200    588 KB  image/jpeg                         /assets/textures/concrete_wall_007/concrete_wall_007_nor_gl_1k.jpg
+ok   200    642 KB  image/jpeg                         /assets/textures/concrete_wall_007/concrete_wall_007_arm_1k.jpg
+ok   404 refused as expected  /%2e%2e%2f%2e%2e%2f%2e%2e%2fWindows/win.ini
+ok   404 refused as expected  /%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fUsers/nicov/.npmrc
+ok   404 refused as expected  /nope.js
+
+42/42 served correctly

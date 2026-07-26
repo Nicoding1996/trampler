@@ -115,7 +115,7 @@ export class Repair {
       }
     }
 
-    if (!t.destroyed && t.reactorHp < CFG.trampler.reactorHp) {
+    if (!t.destroyed && t.reactorHp < t.maxReactorHp) {
       t.reactorSurfaceWorld(this.player.position, _p);
       const d = this.player.position.distanceTo(_p);
       if (d < bestDist) {
@@ -143,7 +143,7 @@ export class Repair {
     const tgt = this.target;
     this.progress = tgt.kind === "leg"
       ? t.legHp[tgt.index] / CFG.trampler.legHp
-      : t.reactorHp / CFG.trampler.reactorHp;
+      : t.reactorHp / t.maxReactorHp;
 
     // Work only happens while genuinely in range. Grace keeps the prompt alive
     // through brief drift, never the progress.

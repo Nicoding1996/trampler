@@ -36,8 +36,11 @@ export class Weapon {
 
     this.raycaster = new THREE.Raycaster();
 
-    // Multiplier on outgoing damage, owned by the economy. 1 means no upgrades.
+    // Multipliers owned by the economy. 1 means no upgrades. Instance fields
+    // rather than CFG edits, so a run's build cannot leak into global config or
+    // into the next attempt at the same seeded wave.
     this.damageScale = 1;
+    this.fireRateScale = 1;
 
     // Cone spread is seeded, like every other stochastic part of the sim. At
     // 0.007 rad it scatters a shot by ~0.2 m at 30 m, which was enough to make a
@@ -112,7 +115,7 @@ export class Weapon {
 
     if (input.locked && input.mouseDown(0) && this.cooldown <= 0) {
       this.fire();
-      this.cooldown = 1 / CFG.combat.weapon.fireRate;
+      this.cooldown = 1 / (CFG.combat.weapon.fireRate * this.fireRateScale);
     }
   }
 

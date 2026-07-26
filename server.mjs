@@ -17,6 +17,11 @@ const MIME = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".glb": "model/gltf-binary",
+  // Radiance HDR, for the environment map. Without an entry it would still be
+  // served as octet-stream and RGBELoader would still parse it -- it reads an
+  // ArrayBuffer -- but being explicit stops it looking like an accident.
+  ".hdr": "image/vnd.radiance",
+  ".exr": "image/aces",
 };
 
 const server = createServer(async (req, res) => {

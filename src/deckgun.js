@@ -70,6 +70,12 @@ export class DeckGun {
     this.cooldown = 0;
     this.shots = 0;
 
+    // Owned by the AMMO HOIST module. Heat is what stops the gun being the answer
+    // to everything, so this is the one module that makes the manned position
+    // stronger -- automation is the floor, manned action is the ceiling.
+    this.heatScale = 1;
+    this.coolScale = 1;
+
     this.#build();
   }
 
@@ -196,7 +202,7 @@ export class DeckGun {
   update(dt, input, player, weapon) {
     const g = CFG.deckGun;
 
-    this.heat = Math.max(0, this.heat - g.coolRate * dt);
+    this.heat = Math.max(0, this.heat - g.coolRate * this.coolScale * dt);
     if (this.overheated && this.heat <= g.resumeHeat) this.overheated = false;
     this.cooldown = Math.max(0, this.cooldown - dt);
 
@@ -207,7 +213,7 @@ export class DeckGun {
     if (input.locked && input.mouseDown(0) && !this.overheated && this.cooldown <= 0) {
       this.#fire(player, weapon);
       this.cooldown = 1 / g.fireRate;
-      this.heat += g.heatPerShot;
+      this.heat += g.heatPerShot * this.heatScale;
       if (this.heat >= 1) {
         this.heat = 1;
         this.overheated = true;

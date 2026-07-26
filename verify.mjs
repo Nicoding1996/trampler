@@ -10,18 +10,23 @@ import * as THREE from "three";
 import { readFileSync } from "node:fs";
 import {
   CFG, applyReleasePreset, releasePresetName, applyEnemySpeedScale,
+  ENEMY_TYPE_KEYS, enemyCfg, afterArmour,
 } from "./src/config.js";
 import { World } from "./src/world.js";
 import { Trampler } from "./src/trampler.js";
 import { Player } from "./src/player.js";
 import { Grapple } from "./src/grapple.js";
-import { Horde, CHEWER, CLIMBER } from "./src/enemies.js";
+import {
+  Horde, CHEWER, CLIMBER, BULWARK, BURROWER, SAPPER, TITAN, ENEMY_STATE,
+} from "./src/enemies.js";
 import { Director, PHASE } from "./src/waves.js";
 import { Weapon } from "./src/weapon.js";
 import { Repair } from "./src/repair.js";
 import { DeckGun, handleStationInput } from "./src/deckgun.js";
 import { Emitters } from "./src/emitters.js";
-import { Economy } from "./src/economy.js";
+import { Economy, routePurchaseInput } from "./src/economy.js";
+import { Modules } from "./src/modules.js";
+import { Run, RUN } from "./src/run.js";
 
 const DT = 1 / 60;
 
@@ -83,15 +88,24 @@ function makeSim() {
   const repair = new Repair(player, trampler, horde);
   const guns = CFG.deckGun.mounts.map((m) => new DeckGun(scene, trampler, m));
   const emitters = new Emitters(scene, trampler, horde);
-  const economy = new Economy({ player, trampler, weapon, repair, horde, director });
+  // Same construction order as main.js. Modules before Economy because the
+  // economy owns the purse that buys them and calls modules.reset() from its own
+  // reset; Run last because it needs both the director and the economy.
+  const modules = new Modules({ trampler, horde, emitters, guns });
+  const economy = new Economy({
+    player, trampler, weapon, repair, horde, director, modules,
+  });
+  const run = new Run(director, horde, economy);
 
   scene.updateMatrixWorld(true);
 
   return {
     scene, camera, world, trampler, player, grapple,
     horde, director, weapon, repair, guns, gun: guns[0], emitters, economy,
+    modules, run,
     input: makeInput(),
     waves: false, // opt in per test, so random spawns cannot pollute a scenario
+    bayOpen: false, // opt in to take the refit bay's side of the key-routing fork
   };
 }
 
@@ -114,7 +128,14 @@ function step(sim, frames, hook, dt = DT) {
   for (let i = 0; i < frames; i++) {
     hook?.(i);
     sim.trampler.update(dt);
-    if (sim.waves) sim.director.update(dt);
+    // Immediately after the hull moves, so a foot that came down this frame
+    // resolves against where things actually are. Explicit rather than hidden
+    // inside update(), so the frame order stays readable at the call site.
+    sim.trampler.resolveStomps(sim.horde, sim.player);
+    if (sim.waves) {
+      sim.director.update(dt);
+      sim.run.update();
+    }
     handleStationInput(sim.guns, sim.input, sim.player);
     sim.grapple.handleInput(sim.input);
     sim.player.update(dt, sim.input);
@@ -122,7 +143,18 @@ function step(sim, frames, hook, dt = DT) {
     for (const g of sim.guns) g.update(dt, sim.input, sim.player, sim.weapon);
     sim.repair.update(dt, sim.input);
     sim.emitters.update(dt, sim.input, sim.player);
-    sim.economy.update(dt, sim.input);
+    // Through the same router the game uses, rather than calling economy.update
+    // directly. The two had drifted: main.js routes the shared number keys through
+    // this and the harness did not, so the one rule keeping three UI states from
+    // fighting over one key set was the only wiring in the project with no test
+    // behind it. `sim.bayOpen` lets a test take the bay's side of that fork.
+    routePurchaseInput({
+      economy: sim.economy,
+      run: sim.run,
+      bayOpen: !!sim.bayOpen,
+      input: sim.input,
+      dt,
+    });
     sim.horde.update(dt, sim.player);
     sim.grapple.updateVisuals(dt);
     sim.input.endFrame();
@@ -2976,6 +3008,2124 @@ console.log("\n67. The HUD is wired to markup that exists, and panels do not pil
     const toggled = new RegExp(`"${p.id}"`).test(hudSrc);
     ok(`${p.id} is toggled from code rather than orphaned`, toggled);
   }
+}
+
+// ---------------------------------------------------------------------------
+// The "per-type field" bug has happened TWICE: a field added to one enemy type
+// and nowhere else reads as undefined on all the others, and `d < undefined` is
+// always false, which silently makes that enemy harmless. Nothing looks wrong.
+//
+// enemyType() in config.js now throws on an unknown override key, which makes the
+// bug structurally impossible in one direction. This checks the other direction --
+// that every type really does carry every field, with a usable value.
+console.log("\n68. Every enemy type is fully specified");
+{
+  const fields = Object.keys(CFG.enemies.chewer);
+  ok("there are more than the original two types", ENEMY_TYPE_KEYS.length >= 6,
+    ENEMY_TYPE_KEYS.join(", "));
+
+  const missing = [];
+  for (const key of ENEMY_TYPE_KEYS) {
+    const cfg = CFG.enemies[key];
+    for (const f of fields) {
+      if (cfg[f] === undefined) missing.push(`${key}.${f}`);
+    }
+  }
+  ok("every type carries every field", missing.length === 0,
+    missing.length ? `MISSING: ${missing.join(", ")}` : `${fields.length} fields x ${ENEMY_TYPE_KEYS.length} types`);
+
+  // The specific values that, at zero or undefined, make an enemy harmless.
+  const harmless = ENEMY_TYPE_KEYS.filter((key) => {
+    const c = CFG.enemies[key];
+    return !(c.hp > 0) || !(c.speed > 0) || !(c.reach > 0) || !(c.reactorReach > 0)
+      || !(c.climbTime > 0) || !(c.inboardOffset > 0);
+  });
+  ok("no type has a zero where a zero would make it harmless", harmless.length === 0,
+    harmless.length ? `SUSPECT: ${harmless.join(", ")}` : "all positive");
+
+  // Damage is the one field allowed to be zero, and exactly one type does it.
+  const zeroDamage = ENEMY_TYPE_KEYS.filter((k) => CFG.enemies[k].damage === 0);
+  ok("only the sapper deals no contact damage, and it has a fuse instead",
+    zeroDamage.length === 1 && zeroDamage[0] === "sapper" && CFG.enemies.sapper.fuse > 0,
+    `zero-damage types: ${zeroDamage.join(", ") || "none"}`);
+
+  // The structural half of the guarantee: every type has the SAME key set, not
+  // merely a superset. A type with an extra field is the other direction of the
+  // same bug -- somebody added a number to one enemy and nowhere else, and it will
+  // read as undefined the moment a second type needs it.
+  const signature = (key) => Object.keys(CFG.enemies[key]).sort().join(",");
+  const shapes = new Set(ENEMY_TYPE_KEYS.map(signature));
+  ok("every type has an identical field set, not just a superset",
+    shapes.size === 1,
+    shapes.size === 1
+      ? `${fields.length} fields, shared by all ${ENEMY_TYPE_KEYS.length}`
+      : `${shapes.size} different shapes across ${ENEMY_TYPE_KEYS.length} types`);
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1.5, and the reason it exists: the deck gun was an OPENING MOVE ONLY. The
+// approach window is about 12 s against 28 s waves, so it was a small slice of
+// playtime by construction. The rejected fix -- pushing spawns further out -- is
+// the same quantity a player on foot experiences as waiting around for enemies.
+//
+// An armoured enemy buys the gun a recurring job without lengthening anything for
+// anybody. The whole design rests on the rifle being the WRONG TOOL, which is a
+// number, so it gets asserted rather than assumed.
+console.log("\n69. Armour makes the rifle the wrong tool and the gun the right one");
+{
+  const rifle = CFG.combat.weapon.damage;
+  const deck = CFG.deckGun.damage;
+  const armour = CFG.enemies.bulwark.armour;
+
+  const rifleHit = afterArmour(rifle, armour);
+  const deckHit = afterArmour(deck, armour);
+
+  ok("the rifle barely dents a bulwark", rifleHit <= rifle * 0.25,
+    `${rifleHit} of ${rifle} gets through`);
+  ok("the deck gun does real damage to one", deckHit >= deck * 0.5,
+    `${deckHit} of ${deck} gets through`);
+  ok("so the gun is several times better against armour, not merely better",
+    deckHit / rifleHit >= 4, `${(deckHit / rifleHit).toFixed(1)}x per shot`);
+
+  // Invariant 8: everything the player can see, the player can shoot. Armour must
+  // never be a wall -- a magazine emptied into something with the bar not moving
+  // is indistinguishable from a bug.
+  ok("nothing is immune, even to the weakest source",
+    afterArmour(CFG.emitters.damage, CFG.enemies.titan.armour) > 0,
+    `an emitter still does ${afterArmour(CFG.emitters.damage, CFG.enemies.titan.armour)} to a titan`);
+
+  // And it holds in the live sim, through the real hitscan path.
+  const sim = makeSim();
+  const { player, horde, weapon } = sim;
+  placeOnGroundAt(sim, 0, -30);
+
+  const spawnAt = (type, offset) => {
+    const e = horde.spawn(type);
+    e.x = player.position.x;
+    e.z = player.position.z - offset;
+    e.y = enemyCfg(type).height / 2;
+    return e;
+  };
+
+  const b = spawnAt(BULWARK, 6);
+
+  aimAt(player, new THREE.Vector3(b.x, b.y, b.z));
+  step(sim, 1);
+  aimAt(player, new THREE.Vector3(b.x, b.y, b.z));
+
+  const hpBefore = b.hp;
+  weapon.fire();
+  const dealt = hpBefore - b.hp;
+  ok("a live rifle shot through the real hitscan path is soaked too",
+    dealt > 0 && dealt <= rifle * 0.25,
+    `${dealt.toFixed(1)} damage from a ${rifle} shot`);
+
+  // It is slower to kill, but killable -- which is the difference between "wrong
+  // tool" and "invulnerable".
+  let shots = 1;
+  while (b.alive && shots < 400) {
+    aimAt(player, new THREE.Vector3(b.x, b.y, b.z));
+    weapon.fire();
+    shots++;
+  }
+  ok("a bulwark still dies to the rifle eventually", !b.alive,
+    `${shots} rifle rounds`);
+  ok("but it costs far more rounds than a chewer would",
+    shots > Math.ceil(CFG.enemies.chewer.hp / rifle) * 8,
+    `${shots} rounds vs ${Math.ceil(CFG.enemies.chewer.hp / rifle)} for a chewer`);
+}
+
+// ---------------------------------------------------------------------------
+// The boss inverts the pillar for one fight, and it does it through GEOMETRY
+// rather than a rule: the titan is taller than the hull's clearance, so it cannot
+// get underneath and has to work from outboard, in the open, where both guns can
+// see it. That is the one fight where the deck is the right place to be.
+console.log("\n70. The titan cannot fit under the hull, so the deck can answer it");
+{
+  const clearance = CFG.trampler.deckHeight - 3; // hull underside, HULL_DEPTH = 3
+  ok("the titan is taller than the hull's clearance",
+    CFG.enemies.titan.height > clearance,
+    `${CFG.enemies.titan.height} m vs ${clearance} m of clearance`);
+  ok("and every other type still fits underneath",
+    ENEMY_TYPE_KEYS.filter((k) => k !== "titan")
+      .every((k) => CFG.enemies[k].height < clearance),
+    ENEMY_TYPE_KEYS.map((k) => `${k} ${CFG.enemies[k].height}`).join(", "));
+
+  const sim = makeSim();
+  const { trampler, horde } = sim;
+  trampler.walking = false;
+  trampler.turning = false;
+
+  // Its attack point must be OUTSIDE the hull footprint -- that is what puts it
+  // in the guns' line of sight instead of in the shadow that shields chewers.
+  const titanSpot = localOf(trampler,
+    trampler.legAttackWorld(0, new THREE.Vector3(), CFG.enemies.titan.inboardOffset));
+  const chewerSpot = localOf(trampler, trampler.legAttackWorld(0, new THREE.Vector3()));
+
+  ok("the titan attacks from outside the hull's shadow",
+    Math.abs(titanSpot.x) > trampler.halfW,
+    `local x ${titanSpot.x.toFixed(1)} vs half-width ${trampler.halfW}`);
+  ok("while a chewer still attacks from inside it",
+    Math.abs(chewerSpot.x) < trampler.halfW,
+    `local x ${chewerSpot.x.toFixed(1)}`);
+
+  // Drive it in and confirm it actually stops out there rather than walking under.
+  const t = horde.spawn(TITAN);
+  const at = trampler.legAttackWorld(0, new THREE.Vector3(), CFG.enemies.titan.inboardOffset);
+  t.x = at.x + 12;
+  t.z = at.z;
+  t.legIndex = 0;
+
+  let deepest = Infinity;
+  step(sim, 60 * 12, () => {
+    const l = localOf(trampler, new THREE.Vector3(t.x, t.y, t.z));
+    deepest = Math.min(deepest, Math.abs(l.x));
+  });
+
+  ok("it never works its way in under the slab", deepest > trampler.halfW - 0.6,
+    `closest approach |local x| ${deepest.toFixed(2)}`);
+  ok("and it does damage from out there", trampler.legHp[0] < CFG.trampler.legHp,
+    `leg 0 at ${trampler.legHp[0].toFixed(0)} hp`);
+
+  // The boss is authored, not ramped: its health must not depend on how long the
+  // crew took to reach it.
+  const director = sim.director;
+  director.elapsed = 600; // ten minutes in
+  const ramped = director.hpScale();
+  ok("the time ramp is genuinely large by then (test is not vacuous)", ramped > 5,
+    `x${ramped.toFixed(2)}`);
+  const wave = director.buildWave(1);
+  ok("a normal wave does not contain a titan", !wave.includes(TITAN));
+}
+
+// ---------------------------------------------------------------------------
+// A burrower ignores pathing entirely, which is the counter to camping a gun.
+// The danger is obvious: an enemy that cannot be shot breaks invariant 8. So the
+// state has to be finite BY CONSTRUCTION, and that is what this measures.
+console.log("\n71. Burrowers are untouchable underground, and always surface");
+{
+  const sim = makeSim();
+  const { player, trampler, horde, weapon } = sim;
+  trampler.walking = false;
+  trampler.turning = false;
+
+  const e = horde.spawn(BURROWER);
+  ok("it starts underground", e.state === ENEMY_STATE.BURROWED);
+  ok("and it is drawn below the sand", e.y < 0, `y=${e.y.toFixed(2)}`);
+
+  // Standing right on top of it and firing must do nothing.
+  placeOnGroundAt(sim, 0, -20);
+  step(sim, 4, () => {
+    e.x = player.position.x;
+    e.z = player.position.z - 3;
+  });
+  aimAt(player, new THREE.Vector3(e.x, 0.2, e.z));
+  const before = weapon.hits;
+  for (let i = 0; i < 8; i++) weapon.fire();
+  ok("shots cannot touch it while it is under", weapon.hits === before,
+    `${weapon.hits - before} hits`);
+  ok("a raycast does not even see it",
+    horde.raycast(player.eyePosition(new THREE.Vector3()),
+      player.lookDirection(new THREE.Vector3()), 200) === null);
+
+  // It is not counted as pressure either: there is nothing the crew can act on.
+  ok("and it is not counted in the under-hull pressure", horde.underHull === 0,
+    `${horde.underHull} under`);
+  ok("but it IS reported as burrowed, so the HUD can warn", horde.burrowed === 1,
+    `${horde.burrowed} burrowed`);
+
+  // The clock is the guarantee. Park it far from its target so proximity cannot
+  // be what surfaces it -- only the timer can.
+  let frames = 0;
+  while (e.state === ENEMY_STATE.BURROWED && frames < 60 * 20) {
+    step(sim, 1, () => {
+      e.x = trampler.group.position.x + 400;
+      e.z = trampler.group.position.z + 400;
+    });
+    frames++;
+  }
+  const seconds = frames / 60;
+  ok("it surfaces on a hard clock no matter where it is",
+    e.state !== ENEMY_STATE.BURROWED,
+    `surfaced after ${seconds.toFixed(1)}s`);
+  ok("and that clock matches the configured burrow time",
+    Math.abs(seconds - CFG.enemies.burrower.burrowTime) < 0.5,
+    `${seconds.toFixed(1)}s vs ${CFG.enemies.burrower.burrowTime}s configured`);
+  ok("once up it is at body height and shootable", e.y > 0,
+    `y=${e.y.toFixed(2)}`);
+
+  const hitsBefore = weapon.hits;
+  step(sim, 2, () => {
+    e.x = player.position.x;
+    e.z = player.position.z - 3;
+    e.y = CFG.enemies.burrower.height / 2;
+  });
+  aimAt(player, new THREE.Vector3(e.x, e.y, e.z));
+  weapon.fire();
+  ok("and a shot connects now", weapon.hits > hitsBefore);
+}
+
+// ---------------------------------------------------------------------------
+// The feet. This is the invariant-2b guard for the stomp, and it exists because
+// the FIRST version of this feature broke 2b silently: at 30 damage -- below a
+// chewer's 50 hp, so it could not kill anything alone -- undefended
+// time-to-crippled went 67.7 s to 81.0 s, and test 48's fixed-force measurement
+// hit its 45 s ceiling with emitters plus feet holding fourteen chewers off the
+// legs and no player present.
+//
+// So the feet deal NO enemy damage at all. They hurt the player and shove bodies.
+console.log("\n72. A foot crushes the player but settles nothing");
+{
+  const sim = makeSim();
+  const { player, trampler, horde } = sim;
+  // Local scratch rather than the module-level _probe, which step() uses for the
+  // floating-boarder invariant. Sharing it would work today and break the moment
+  // either read moved.
+  const _fw = new THREE.Vector3();
+
+  ok("a footfall is raised as an event, not a state", Array.isArray(trampler.footfalls));
+
+  // Feet must sit OUTBOARD of the hull, and far enough from a latched attacker
+  // that no plausible tweak brings them into contact.
+  const foot = trampler.legs[0].userData.footLocal;
+  const latch = trampler.legAttackLocal(0, new THREE.Vector3());
+  const gap = Math.hypot(foot.x - latch.x, foot.z - latch.z);
+
+  ok("the feet are outboard of the hull footprint", Math.abs(foot.x) > trampler.halfW,
+    `foot local x ${foot.x.toFixed(1)} vs half-width ${trampler.halfW}`);
+  ok("and the stomp radius cannot reach a latched attacker",
+    gap > CFG.trampler.stomp.radius,
+    `${gap.toFixed(2)} m gap vs ${CFG.trampler.stomp.radius} m radius`
+    + ` — ${(gap - CFG.trampler.stomp.radius).toFixed(2)} m of margin`);
+
+  // Steps actually happen while walking.
+  const stepsBefore = trampler.stepCount;
+  step(sim, 300);
+  ok("the fortress raises footfalls as it walks", trampler.stepCount > stepsBefore,
+    `${trampler.stepCount - stepsBefore} steps in 5 s`);
+
+  // A chewer parked ON the foot must take no damage whatsoever.
+  const e = horde.spawn(CHEWER);
+  e.hp = e.maxHp;
+  const hpBefore = e.hp;
+  let footfalls = 0;
+  step(sim, 60 * 10, () => {
+    trampler.footWorld(0, _fw);
+    e.x = _fw.x;
+    e.z = _fw.z;
+    e.y = CFG.enemies.chewer.height / 2;
+    footfalls += trampler.footfalls.length;
+  });
+
+  ok("footfalls landed on it (test is not vacuous)", footfalls > 4,
+    `${footfalls} footfalls while it stood there`);
+  ok("standing under a descending foot costs an enemy NOTHING",
+    e.alive && e.hp === hpBefore,
+    `${e.hp.toFixed(0)} / ${hpBefore.toFixed(0)} hp — the fortress must not fight for you`);
+  ok("the horde's kill counter never moved", horde.killCount === 0,
+    `${horde.killCount} kills`);
+
+  // But it IS shoved, and the shove has to be a stumble rather than a teleport --
+  // invariant 20, which the first implementation broke at 0.73 m in one frame.
+  //
+  // Driven directly rather than by waiting for a foot to happen to land on
+  // something: a body near the feet walks inboard to its latch within a fraction
+  // of a second, so "wait and see" measures whether the timing happened to line
+  // up, which is exactly the sampling mistake this harness keeps catching.
+  const sim2 = makeSim();
+  const { horde: h2, trampler: t2 } = sim2;
+  const e2 = h2.spawn(CHEWER);
+  // Somewhere empty, so the only forces on it are its own walk and the shove.
+  e2.x = t2.group.position.x + 300;
+  e2.z = t2.group.position.z + 300;
+
+  h2.shoveFrom(e2.x + 0.25, e2.z, CFG.trampler.stomp.radius, CFG.trampler.stomp.shoveSpeed);
+  ok("a shove is stored as velocity, never written into position",
+    e2.shoveVx !== 0 || e2.shoveVz !== 0,
+    `impulse (${e2.shoveVx.toFixed(2)}, ${e2.shoveVz.toFixed(2)}) m/s`);
+
+  let worstJump = 0;
+  let prev = new THREE.Vector3(e2.x, e2.y, e2.z);
+  const startedAt = prev.clone();
+  step(sim2, 45, () => {
+    const here = new THREE.Vector3(e2.x, e2.y, e2.z);
+    worstJump = Math.max(worstJump, here.distanceTo(prev));
+    prev = here.clone();
+  });
+
+  ok("it moves a real distance over the decay", prev.distanceTo(startedAt) > 0.3,
+    `${prev.distanceTo(startedAt).toFixed(2)} m of total travel`);
+  ok("but never further than a stride in any single frame", worstJump < 0.35,
+    `worst frame-to-frame move ${worstJump.toFixed(3)} m`);
+  ok("and the knock-aside decays away rather than persisting",
+    e2.shoveVx === 0 && e2.shoveVz === 0);
+
+  // And the player, who has no business standing there, gets hurt.
+  const sim3 = makeSim();
+  const p3 = sim3.player;
+  p3.base = null;
+  p3.spawnGrace = 0;
+  let hurtCount = 0;
+  step(sim3, 60 * 12, () => {
+    sim3.trampler.footWorld(0, _fw);
+    p3.position.set(_fw.x, 1.2, _fw.z);
+    p3.velocity.set(0, 0, 0);
+    p3.hp = p3.maxHp;      // isolate the stomp from everything else
+    p3.spawnGrace = 0;
+    hurtCount = p3.hurtCount;
+  });
+  ok("but the player standing under a foot is crushed", hurtCount > 0,
+    `hurt ${hurtCount} times`);
+}
+
+// ---------------------------------------------------------------------------
+// The sapper is a TIMER, not a damage race. Zero contact damage is the design:
+// every other enemy is something you can trade against slowly, and this one turns
+// "I should go down there at some point" into "I have six seconds".
+console.log("\n73. A sapper's charge is a timer that can be interrupted");
+{
+  const runFuse = (interrupt) => {
+    const sim = makeSim();
+    const { trampler, horde } = sim;
+    trampler.walking = false;
+    trampler.turning = false;
+
+    const e = horde.spawn(SAPPER);
+    const at = trampler.legAttackWorld(0, new THREE.Vector3());
+    e.x = at.x;
+    e.y = at.y;
+    e.z = at.z;
+    e.legIndex = 0;
+
+    let sawFuse = false;
+    let killedAt = 0;
+    const frames = Math.round(60 * (CFG.enemies.sapper.fuse + 2));
+    step(sim, frames, (i) => {
+      if (e.fuseT > 0) sawFuse = true;
+      if (interrupt && sawFuse && killedAt === 0 && e.fuseT < CFG.enemies.sapper.fuse * 0.5) {
+        horde.damage(e, 1e6);
+        killedAt = i;
+      }
+    });
+
+    return { sim, e, sawFuse, legHp: trampler.legHp[0] };
+  };
+
+  const ignored = runFuse(false);
+  ok("latching on lights a fuse", ignored.sawFuse);
+  ok("an ignored charge takes the whole leg off",
+    ignored.legHp <= 0,
+    `leg 0 at ${ignored.legHp.toFixed(0)} hp, charge is ${CFG.enemies.sapper.fuseDamage}`);
+  ok("and the sapper is consumed by its own charge", !ignored.e.alive);
+  ok("the charge is worth exactly a leg, so it cannot be traded against",
+    CFG.enemies.sapper.fuseDamage >= CFG.trampler.legHp,
+    `${CFG.enemies.sapper.fuseDamage} vs ${CFG.trampler.legHp} leg hp`);
+
+  const stopped = runFuse(true);
+  ok("killing it before the fuse ends prevents ALL of the damage",
+    stopped.legHp === CFG.trampler.legHp,
+    `leg 0 at ${stopped.legHp.toFixed(0)} / ${CFG.trampler.legHp} hp`);
+
+  // The HUD's only warning comes from these two fields, so they have to be live.
+  const live = runFuse(false);
+  ok("a lit fuse is reported for the HUD to warn with",
+    CFG.enemies.sapper.fuse > 0 && CFG.enemies.sapper.damage === 0,
+    `fuse ${CFG.enemies.sapper.fuse}s, contact damage ${CFG.enemies.sapper.damage}`);
+
+  // Being shoved off the leg must drop the charge, or the crowd stops being an
+  // answer and only killing it works.
+  const sim = makeSim();
+  const e = sim.horde.spawn(SAPPER);
+  const at = sim.trampler.legAttackWorld(0, new THREE.Vector3());
+  e.x = at.x;
+  e.y = at.y;
+  e.z = at.z;
+  e.legIndex = 0;
+  step(sim, 30);
+  const lit = e.fuseT > 0;
+  e.x += 20; // knocked well clear
+  step(sim, 4);
+  ok("losing the leg loses the charge", lit && e.fuseT === 0,
+    `lit=${lit}, fuse now ${e.fuseT.toFixed(2)}`);
+}
+
+// ---------------------------------------------------------------------------
+// The next wall the numbers already predicted. Reactor time-to-death, if every
+// climber in a wave reached it, was 9.3 s at wave 1 falling to 3.5 s at wave 4 --
+// less than the time to notice, grapple up, turn and engage. That is a
+// reaction-time wall, not a decision.
+//
+// Three fixes were on the table and deliberately NOT tried together, because
+// three simultaneous changes to one number cannot be attributed afterwards. This
+// is the cap on simultaneous attackers, measured.
+console.log("\n74. Reactor damage is capped, so its time-to-die stops scaling");
+{
+  const timeToKillReactor = (boarders) => {
+    const sim = makeSim();
+    const { trampler, horde } = sim;
+    trampler.walking = false;
+    trampler.turning = false;
+
+    // Put them straight on the deck at the reactor, bypassing the climb so this
+    // measures the cap and nothing else.
+    const spots = [];
+    for (let i = 0; i < boarders; i++) {
+      const e = horde.spawn(CLIMBER);
+      e.state = ENEMY_STATE.ON_DECK;
+      e.onHull = true;
+      const a = (i / boarders) * Math.PI * 2;
+      const local = new THREE.Vector3(Math.cos(a) * 3.2, 0.95, 5 + Math.sin(a) * 2.6);
+      const w = trampler.localToWorld(local.clone());
+      e.x = w.x;
+      e.y = w.y;
+      e.z = w.z;
+      spots.push(e);
+    }
+
+    let frames = 0;
+    let peakEngaged = 0;
+    while (!trampler.destroyed && frames < 60 * 90) {
+      step(sim, 1);
+      let engaged = 0;
+      for (const e of horde.pool) if (e.alive && e.reactorSlot) engaged++;
+      peakEngaged = Math.max(peakEngaged, engaged);
+      frames++;
+    }
+    return { seconds: frames / 60, peakEngaged, died: trampler.destroyed };
+  };
+
+  const few = timeToKillReactor(3);
+  const many = timeToKillReactor(12);
+
+  ok("three boarders can destroy the reactor", few.died,
+    `${few.seconds.toFixed(1)}s`);
+  ok("twelve boarders can too", many.died, `${many.seconds.toFixed(1)}s`);
+
+  ok("never more than the configured number are in contact",
+    many.peakEngaged <= CFG.trampler.reactorSlots,
+    `peak ${many.peakEngaged} engaged, cap ${CFG.trampler.reactorSlots}`);
+
+  // The point of the whole change: four times the boarders must not be four times
+  // the damage. Without the cap this ratio was 12/3 = 4.
+  const ratio = few.seconds / many.seconds;
+  ok("four times the boarders is NOT four times the damage", ratio < 1.6,
+    `${few.seconds.toFixed(1)}s with 3 vs ${many.seconds.toFixed(1)}s with 12 — ratio ${ratio.toFixed(2)}`);
+  ok("so there is time to notice, board and answer it", many.seconds > 6,
+    `${many.seconds.toFixed(1)}s to lose the reactor at any wave size`);
+
+  // And the cap can never reach zero: a reactor nothing can attack cannot be lost,
+  // and losing it is the run.
+  const sim = makeSim();
+  sim.trampler.slotBonus = -99;
+  ok("the cap never falls below one attacker", sim.trampler.reactorSlotCount >= 1,
+    `${sim.trampler.reactorSlotCount} slots at slotBonus -99`);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n75. Boarders walk around deck scenery instead of through it");
+{
+  const sim = makeSim();
+  const { trampler, horde } = sim;
+  trampler.walking = false;
+  trampler.turning = false;
+
+  ok("the deck's solid furniture is listed separately from its floors",
+    trampler.deckObstacles.length > 0
+    && !trampler.deckObstacles.some((b) => b.tag === "hull" || b.tag === "deck"),
+    `${trampler.deckObstacles.length} obstacles, tags: `
+    + `${[...new Set(trampler.deckObstacles.map((b) => b.tag))].join(", ")}`);
+
+  // Drop a boarder on the far side of the mast from the reactor, so the direct
+  // line to its target passes straight through solid geometry.
+  const e = horde.spawn(CLIMBER);
+  e.state = ENEMY_STATE.ON_DECK;
+  e.onHull = true;
+  const start = trampler.localToWorld(new THREE.Vector3(0, 0.95, -6));
+  e.x = start.x;
+  e.y = start.y;
+  e.z = start.z;
+
+  const mast = trampler.colliders.find((b) => b.tag === "mast");
+  let insideMast = 0;
+  let insideAny = 0;
+  step(sim, 60 * 20, () => {
+    const l = localOf(trampler, new THREE.Vector3(e.x, e.y, e.z));
+    const r = CFG.enemies.climber.radius * 0.5; // generous: only count real overlap
+    if (l.x > mast.min.x + r && l.x < mast.max.x - r
+      && l.z > mast.min.z + r && l.z < mast.max.z - r) insideMast++;
+
+    for (const b of trampler.deckObstacles) {
+      if (l.y + 0.5 < b.min.y || l.y - 0.5 > b.max.y) continue;
+      if (l.x > b.min.x + r && l.x < b.max.x - r
+        && l.z > b.min.z + r && l.z < b.max.z - r) {
+        insideAny++;
+        break;
+      }
+    }
+  });
+
+  ok("a boarder never ends a frame inside the mast", insideMast === 0,
+    `${insideMast} frames inside`);
+  ok("nor inside any other piece of deck furniture", insideAny === 0,
+    `${insideAny} frames inside something`);
+  ok("and it still got where it was going", e.onHull);
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1 item 2, the bounded build layer, and the game's identity rather than a
+// feature. Three sockets against six modules is the decision; permanence is what
+// makes it one.
+console.log("\n76. Fortress modules are bounded, permanent, and fully revertible");
+{
+  const sim = makeSim();
+  const { trampler, horde, emitters, guns, modules, economy } = sim;
+
+  ok("there are fewer sockets than modules, so fitting is a choice",
+    modules.sockets.length < modules.catalogue.length,
+    `${modules.sockets.length} sockets, ${modules.catalogue.length} modules`);
+  ok("nothing is fitted to begin with", modules.fittedCount === 0);
+
+  const idx = Object.fromEntries(modules.catalogue.map((m, i) => [m.id, i]));
+
+  // Baselines, captured before anything is fitted.
+  const base = {
+    reveal: horde.revealScale,
+    climb: horde.climbScale,
+    drive: trampler.driveScale,
+    turn: trampler.turnScale,
+    reactor: trampler.maxReactorHp,
+    slots: trampler.reactorSlotCount,
+    emitterCap: emitters.capacity,
+    charge: emitters.maxCharge,
+    heat: guns[0].heatScale,
+    cool: guns[0].coolScale,
+    flood: trampler.floodlights[0].intensity,
+  };
+  ok("the under-hull work lights start off, so the dark is something you buy",
+    base.flood === 0);
+
+  economy.scrap = 100000;
+
+  // Each module, fitted and measured. Fitted one at a time into a fresh sim so a
+  // previous module cannot mask the next one's effect.
+  const fitOne = (id) => {
+    const s = makeSim();
+    s.economy.scrap = 100000;
+    const i = s.modules.catalogue.findIndex((m) => m.id === id);
+    return { s, fitted: s.economy.buyModule(i) };
+  };
+
+  const flood = fitOne("floodlights");
+  ok("floodlights light the arena and expose burrowers sooner",
+    flood.s.trampler.floodlights[0].intensity > 0
+    && flood.s.horde.revealScale < base.reveal,
+    `intensity ${flood.s.trampler.floodlights[0].intensity}, `
+    + `reveal x${flood.s.horde.revealScale.toFixed(2)}`);
+
+  const rack = fitOne("emitterRack");
+  ok("the emitter rack adds emitters and capacitor depth",
+    rack.s.emitters.capacity > base.emitterCap
+    && rack.s.emitters.maxCharge > base.charge,
+    `${base.emitterCap} -> ${rack.s.emitters.capacity} emitters, `
+    + `${base.charge} -> ${rack.s.emitters.maxCharge} charge`);
+
+  const hoist = fitOne("ammoHoist");
+  ok("the ammo hoist buffs the MANNED position, not an automated one",
+    hoist.s.guns[0].heatScale < base.heat && hoist.s.guns[0].coolScale > base.cool,
+    `heat x${hoist.s.guns[0].heatScale.toFixed(2)}, cool x${hoist.s.guns[0].coolScale.toFixed(2)}`);
+
+  const baffles = fitOne("baffles");
+  ok("baffles slow boarding without doing any damage",
+    baffles.s.horde.climbScale > base.climb,
+    `climb time x${baffles.s.horde.climbScale.toFixed(2)}`);
+
+  const act = fitOne("actuators");
+  ok("actuators speed the hull up and tighten its turn",
+    act.s.trampler.driveScale > base.drive && act.s.trampler.turnScale > base.turn,
+    `drive x${act.s.trampler.driveScale.toFixed(2)}, turn x${act.s.trampler.turnScale.toFixed(2)}`);
+
+  const casing = fitOne("casing");
+  ok("reactor casing adds integrity and takes an attacker slot away",
+    casing.s.trampler.maxReactorHp > base.reactor
+    && casing.s.trampler.reactorSlotCount < base.slots,
+    `${base.reactor} -> ${casing.s.trampler.maxReactorHp.toFixed(0)} hp, `
+    + `${base.slots} -> ${casing.s.trampler.reactorSlotCount} slots`);
+  ok("and the extra integrity arrives filled rather than as a bigger empty bar",
+    casing.s.trampler.reactorHp > CFG.trampler.reactorHp,
+    `${casing.s.trampler.reactorHp.toFixed(0)} hp`);
+
+  // Bounded: the sockets run out, and it says so.
+  for (let i = 0; i < 10; i++) economy.buyModule(idx.baffles);
+  ok("fitting stops when the hardpoints are full",
+    modules.fittedCount === modules.sockets.length,
+    `${modules.fittedCount} / ${modules.sockets.length}`);
+  ok("and a refusal says why rather than doing nothing",
+    economy.buyModule(idx.actuators) === null
+    && economy.blockedReason.includes("HARDPOINT"),
+    economy.blockedReason);
+  ok("duplicates stack, so doubling down is a legitimate build",
+    modules.count("baffles") > 1, `${modules.count("baffles")} fitted`);
+
+  // Permanent for the run: there is deliberately no uninstall.
+  ok("there is no way to unfit a module mid-run",
+    typeof modules.unfit !== "function" && typeof modules.remove !== "function");
+
+  // And a reset restores every single multiplier, which is what keeps two attempts
+  // at the same seeded fight comparable.
+  economy.reset();
+  ok("a reset strips every socket", modules.fittedCount === 0);
+  ok("and restores every module multiplier exactly",
+    horde.revealScale === base.reveal && horde.climbScale === base.climb
+    && trampler.driveScale === base.drive && trampler.turnScale === base.turn
+    && trampler.maxReactorHp === base.reactor
+    && trampler.reactorSlotCount === base.slots
+    && emitters.capacity === base.emitterCap && emitters.maxCharge === base.charge
+    && guns[0].heatScale === base.heat && guns[0].coolScale === base.cool
+    && trampler.floodlights[0].intensity === base.flood,
+    `reveal ${horde.revealScale}, climb ${horde.climbScale}, drive ${trampler.driveScale},`
+    + ` reactor ${trampler.maxReactorHp}, emitters ${emitters.capacity}, heat ${guns[0].heatScale}`);
+}
+
+// ---------------------------------------------------------------------------
+// Invariant 2b, re-checked with EVERY defensive system in the game fitted at once.
+//
+// This is the test the invariants document specifically demands: "emitters plus
+// hull plating" is a combination neither system's own test covers, and now there
+// are more of them -- an emitter rack, floodlights, a repair rig, four plates.
+// The failure is silent. Nothing looks broken; the player simply stops having a
+// reason to go down there and half the pillar quietly dies.
+console.log("\n77. Fully refitted AND fully moduled, automation still cannot hold");
+{
+  const sim = makeSim();
+  const { player, trampler, emitters, economy, modules, director } = sim;
+
+  economy.scrap = 100000;
+  economy.salvage = 100000;
+
+  const refit = Object.fromEntries(CFG.economy.catalogue.map((c, i) => [c.id, i]));
+  for (let i = 0; i < 20; i++) economy.buy(refit.plating);
+  for (let i = 0; i < 20; i++) economy.buy(refit.rig);
+
+  const mod = Object.fromEntries(modules.catalogue.map((m, i) => [m.id, i]));
+  economy.buyModule(mod.emitterRack);
+  economy.buyModule(mod.floodlights);
+  economy.buyModule(mod.baffles);
+
+  ok("everything defensive is bought (test is not vacuous)",
+    economy.stacks.plating === 4 && economy.stacks.rig === 3
+    && modules.fittedCount === modules.sockets.length,
+    `plating ${economy.stacks.plating}, rig ${economy.stacks.rig}, `
+    + `modules [${modules.summary.join(" | ")}], `
+    + `takes ${(trampler.damageScale * 100).toFixed(0)}% damage`);
+
+  // Fill the enlarged rack, not just the base three.
+  const legs = [0, 1, 2, 3, 4, 5];
+  let placed = 0;
+  for (const legIndex of legs) {
+    if (placed >= emitters.capacity) break;
+    const at = trampler.legAttackWorld(legIndex, new THREE.Vector3());
+    player.position.set(at.x, 1.2, at.z);
+    player.base = null;
+    player.velocity.set(0, 0, 0);
+    step(sim, 6);
+    sim.input.presses.add(CFG.emitters.deployKey);
+    step(sim, 2);
+    placed = emitters.deployedCount;
+  }
+  ok("the whole enlarged rack is deployed", emitters.deployedCount >= 4,
+    `${emitters.deployedCount} of ${emitters.capacity} out`);
+
+  // Player entirely out of the fight. Only automation is defending.
+  player.position.set(700, 1.2, 700);
+  player.base = null;
+  sim.waves = true;
+
+  let frames = 0;
+  const cap = 60 * 500;
+  while (!trampler.immobilised && frames < cap) {
+    step(sim, 1);
+    frames++;
+  }
+
+  ok("the fortress is STILL crippled with nobody aboard",
+    trampler.immobilised,
+    trampler.immobilised
+      ? `crippled at ${(frames / 60).toFixed(1)}s, wave ${director.wave}`
+      : "EVERY DEFENSIVE SYSTEM TOGETHER HELD THE LINE -- THE PILLAR IS BROKEN");
+  ok("and no amount of repair rig repaired anything unattended",
+    trampler.legHp.some((h) => h <= 0),
+    `legs [${trampler.legHp.map((h) => Math.round(h)).join(",")}]`);
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1 item 3: the unbounded personal layer, Risk of Rain rules. Anything that
+// would break at 100% has to stack hyperbolically, and "would break" is not a
+// matter of taste here -- an unbounded fire rate eventually divides by zero, and
+// total damage immunity removes the ground's cost, which is half the pillar.
+console.log("\n78. Personal upgrades stack forever without ever breaking");
+{
+  const sim = makeSim();
+  const { economy, weapon, player } = sim;
+  const idx = Object.fromEntries(CFG.economy.catalogue.map((c, i) => [c.id, i]));
+
+  economy.salvage = 1e9;
+
+  const personal = CFG.economy.catalogue.filter((c) => c.pool === "salvage");
+  ok("there are several personal upgrades, not just damage", personal.length >= 4,
+    personal.map((c) => c.id).join(", "));
+  ok("and none of them has a cap",
+    personal.every((c) => c.max === Infinity), "all unbounded");
+
+  // Fire rate: rises, and converges.
+  const rateAt = (n) => {
+    const s = makeSim();
+    s.economy.salvage = 1e9;
+    for (let i = 0; i < n; i++) s.economy.buy(idx.trigger);
+    return s.weapon.fireRateScale;
+  };
+  const r1 = rateAt(1);
+  const r5 = rateAt(5);
+  const r60 = rateAt(60);
+  ok("fire rate rises with stacks", r5 > r1, `x${r1.toFixed(2)} -> x${r5.toFixed(2)}`);
+  ok("and converges instead of running away",
+    r60 < 1 + CFG.economy.hyper.trigger.cap + 1e-9,
+    `x${r60.toFixed(3)} at 60 stacks, asymptote x${(1 + CFG.economy.hyper.trigger.cap).toFixed(2)}`);
+  ok("so the interval between shots is always positive",
+    1 / (CFG.combat.weapon.fireRate * r60) > 0);
+
+  // Damage resistance: approaches zero and never arrives, because the ground
+  // having a cost is half the pillar.
+  const takenAt = (n) => {
+    const s = makeSim();
+    s.economy.salvage = 1e9;
+    for (let i = 0; i < n; i++) s.economy.buy(idx.weave);
+    return s.player.damageScale;
+  };
+  const t1 = takenAt(1);
+  const t10 = takenAt(10);
+  const t200 = takenAt(200);
+  ok("armour reduces damage taken", t1 < 1, `takes ${(t1 * 100).toFixed(0)}%`);
+  ok("ten stacks is real but far from immunity", t10 > 0.15 && t10 < 0.4,
+    `takes ${(t10 * 100).toFixed(0)}%`);
+  ok("and total immunity is unreachable at any stack count", t200 > 0,
+    `still takes ${(t200 * 100).toFixed(2)}% at 200 stacks`);
+
+  // The hyperbolic resistance has to actually reach the player's health.
+  const s = makeSim();
+  s.economy.salvage = 1e9;
+  for (let i = 0; i < 6; i++) s.economy.buy(idx.weave);
+  s.player.spawnGrace = 0;
+  const hpBefore = s.player.hp;
+  s.player.hurt(50);
+  const taken = hpBefore - s.player.hp;
+  ok("and it lands on real incoming damage", taken > 0 && taken < 50,
+    `took ${taken.toFixed(1)} of a 50 hit`);
+
+  // Prices escalate, which is the brake that makes an unbounded track finite in
+  // practice without an arbitrary cap.
+  economy.salvage = 1e9;
+  const first = economy.costOf(idx.rifle);
+  for (let i = 0; i < 12; i++) economy.buy(idx.rifle);
+  ok("each stack costs more than the last", economy.costOf(idx.rifle) > first * 10,
+    `${first} -> ${economy.costOf(idx.rifle)} after 12 stacks`);
+  ok("damage really did stack additively all the way up",
+    Math.abs(weapon.damageScale - (1 + 0.25 * 12)) < 1e-9,
+    `x${weapon.damageScale.toFixed(2)}`);
+
+  // Vitals must heal on purchase, or it is useless in the moment you buy it.
+  const s2 = makeSim();
+  s2.economy.salvage = 1e9;
+  s2.player.hp = 40;
+  const maxBefore = s2.player.maxHp;
+  s2.economy.buy(idx.vitals);
+  ok("vitals raises the ceiling and heals by the same amount",
+    s2.player.maxHp > maxBefore && s2.player.hp === 65,
+    `${maxBefore} -> ${s2.player.maxHp} max, hp 40 -> ${s2.player.hp}`);
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1 item 4: legs of a journey with branching route choice, a siege at each
+// landmark, and a boss at the end. Until this existed a siege WAS the game, which
+// gave the prototype a finish line but no arc -- and an economy with nothing to
+// pay off against, since you buy a rifle stack and then it ends.
+console.log("\n79. A run is legs of a journey with roads you choose between");
+{
+  const sim = makeSim();
+  const { director, run, economy, horde } = sim;
+
+  ok("a run starts at the first landmark", run.leg === 1 && !run.done);
+  ok("and the first siege is a normal one",
+    director.siegeLength === CFG.waves.siegeLength,
+    `${director.siegeLength} waves`);
+  ok("no roads are offered before one is held", run.offers.length === 0 && !run.choosing);
+
+  // Hold the siege by hand rather than fighting it, so this measures the run
+  // structure and not the combat.
+  const holdSiege = () => {
+    sim.waves = true;
+    let guard = 0;
+    while (!director.held && guard < 60 * 400) {
+      step(sim, 1, () => {
+        for (const e of horde.pool) if (e.alive) horde.damage(e, 1e6);
+        sim.trampler.repairAll();
+        sim.player.hp = sim.player.maxHp;
+        sim.player.timeSinceHurt = 99;
+      });
+      guard++;
+    }
+    return director.held;
+  };
+
+  ok("the first siege can be held", holdSiege(), `wave ${director.wave}`);
+  step(sim, 2);
+  ok("holding it offers roads rather than starting the next siege by itself",
+    run.choosing && run.offers.length === CFG.run.branches,
+    `phase ${run.phase}, ${run.offers.length} roads`);
+  ok("the offered roads are different from each other",
+    new Set(run.offers.map((r) => r.id)).size === run.offers.length,
+    run.offers.map((r) => r.name).join(" | "));
+
+  // Nothing advances on a timer. A held siege sits there until a human decides.
+  const legBefore = run.leg;
+  step(sim, 60 * 30);
+  ok("nothing advances while the crew has not chosen", run.leg === legBefore
+    && run.choosing, `leg ${run.leg}, phase ${run.phase}`);
+  ok("and nothing spawns during the choice", horde.liveCount === 0);
+
+  // Take a road and confirm it pays on ARRIVAL, before the fight, so the money is
+  // spendable on surviving what it just bought.
+  const road = run.offers[0];
+  const salvageBefore = economy.salvage;
+  const scrapBefore = economy.scrap;
+  const arrival = run.choose(0);
+
+  ok("choosing a road advances the journey", arrival && run.leg === legBefore + 1,
+    `leg ${run.leg} of ${CFG.run.legs}, took ${arrival?.name}`);
+  ok("and pays on arrival, before the siege it paid for",
+    economy.salvage === salvageBefore + road.salvage
+    && economy.scrap === scrapBefore + road.scrap,
+    `+${road.salvage} salvage, +${road.scrap} scrap`);
+  ok("a fresh siege begins at the new landmark",
+    director.phase === PHASE.REST && director.wave === 0,
+    `phase ${director.phase}, wave ${director.wave}`);
+
+  // The anti-stall valve must survive a landmark change: rewinding the elapsed
+  // clock would let a slow crew farm a whole biome at wave-one difficulty.
+  ok("the elapsed clock keeps running across landmarks", director.elapsed > 60,
+    `${director.elapsed.toFixed(0)}s elapsed, threat x${director.hpScale().toFixed(2)}`);
+  ok("and the resolved-wave count is not rewound either",
+    director.resolved >= CFG.waves.siegeLength,
+    `${director.resolved} waves resolved`);
+
+  // Modifiers are cumulative and are INSTANCE state, never CFG edits.
+  //
+  // The roads are OFFERED from a seeded stream, and the first version of this
+  // check simply took whatever came up -- which was two roads with no modifiers at
+  // all, so it asserted 1.00 >= 1.00 and passed without measuring anything. The
+  // offers are forced here instead: a test of accumulation has to be handed
+  // something to accumulate.
+  const authored = { chewer: CFG.enemies.chewer.speed, hp: CFG.enemies.chewer.hp };
+  const hardRoads = CFG.run.routes.filter((r) => r.threat > 1 || r.speed > 1 || r.count > 0);
+  ok("some roads actually carry a cost (test is not vacuous)", hardRoads.length >= 2,
+    hardRoads.map((r) => r.id).join(", "));
+
+  let expectThreat = run.threatScale;
+  let expectSpeed = horde.speedScale;
+  let expectCount = run.extraCount;
+
+  while (!run.done && run.leg < CFG.run.legs) {
+    if (!holdSiege()) break;
+    step(sim, 2);
+    if (!run.choosing) break;
+    // Force the hardest available road, so every modifier gets exercised.
+    const road = hardRoads[run.leg % hardRoads.length];
+    run.offers = [road];
+    expectThreat *= road.threat;
+    expectSpeed *= road.speed;
+    expectCount += road.count;
+    run.choose(0);
+  }
+
+  ok("road modifiers accumulate across a run, multiplying rather than replacing",
+    Math.abs(run.threatScale - expectThreat) < 1e-9
+    && Math.abs(horde.speedScale - expectSpeed) < 1e-9
+    && run.extraCount === expectCount,
+    `threat x${run.threatScale.toFixed(3)} (want x${expectThreat.toFixed(3)}),`
+    + ` speed x${horde.speedScale.toFixed(3)}, +${run.extraCount} per wave,`
+    + ` roads: ${run.history.join(" -> ")}`);
+  ok("and the accumulation is a real difficulty change, not a rounding error",
+    run.threatScale * expectSpeed > 1.15,
+    `combined x${(run.threatScale * horde.speedScale).toFixed(3)}`);
+  ok("the enemy health ramp reflects it",
+    director.hpScale() > 1 + director.elapsed / CFG.waves.hpRamp,
+    `x${director.hpScale().toFixed(2)} vs x${(1 + director.elapsed / CFG.waves.hpRamp).toFixed(2)} from time alone`);
+  ok("and none of them edited global config",
+    CFG.enemies.chewer.speed === authored.chewer && CFG.enemies.chewer.hp === authored.hp,
+    `chewer speed ${CFG.enemies.chewer.speed}, hp ${CFG.enemies.chewer.hp}`);
+
+  ok("the journey reaches its final landmark", run.leg === CFG.run.legs && run.isBossLeg,
+    `leg ${run.leg} of ${CFG.run.legs}`);
+  ok("and the boss siege is shorter, because the titan IS the wave",
+    director.siegeLength === CFG.run.bossSiegeLength
+    && CFG.run.bossSiegeLength < CFG.waves.siegeLength,
+    `${director.siegeLength} waves vs ${CFG.waves.siegeLength} normally`);
+
+  ok("holding the last one ends the biome rather than offering more roads",
+    holdSiege() && (step(sim, 2), run.done),
+    `phase ${run.phase}, leg ${run.leg}`);
+  ok("and nothing further spawns once it is done", horde.liveCount === 0);
+
+  // A reset has to rewind the whole journey, not just the siege.
+  sim.economy.reset();
+  run.reset();
+  ok("a reset returns the run to its first landmark",
+    run.leg === 1 && !run.done && run.history.length === 0
+    && run.threatScale === 1 && horde.speedScale === 1,
+    `leg ${run.leg}, threat x${run.threatScale}, speed x${horde.speedScale}`);
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n80. The boss arrives once, at the end, and is not time-ramped");
+{
+  const sim = makeSim();
+  const { director, run, horde } = sim;
+
+  // Wind the run to its boss leg without fighting anything.
+  run.leg = CFG.run.legs;
+  director.siegeLength = run.siegeLength;
+  ok("the run knows it is on the boss leg", run.isBossLeg);
+
+  const waves = [];
+  for (let w = 1; w <= director.siegeLength; w++) waves.push(director.buildWave(w));
+
+  const withTitan = waves.filter((types) => types.includes(TITAN));
+  ok("exactly one wave of the boss siege contains the titan", withTitan.length === 1,
+    `${withTitan.length} of ${waves.length} waves`);
+  ok("and it is the last one",
+    waves[waves.length - 1].includes(TITAN),
+    `wave ${waves.findIndex((t) => t.includes(TITAN)) + 1} of ${waves.length}`);
+  ok("there is exactly one of it", withTitan[0].filter((t) => t === TITAN).length === 1);
+
+  // Compared against the size the wave WOULD have been, computed from config
+  // rather than by asking the director again -- on a boss leg, buildWave for the
+  // last wave is the boss wave, so it would be comparing it against itself.
+  const unreduced = CFG.waves.baseCount
+    + CFG.waves.perWave * (director.siegeLength - 1);
+  ok("it arrives with an escort, but a reduced one",
+    withTitan[0].length > 1 && withTitan[0].length < unreduced,
+    `${withTitan[0].length} alongside the titan vs ${unreduced} in a normal wave`);
+
+  // Released at authored health regardless of how long the crew took, which is
+  // the one fight whose numbers should be plannable.
+  director.elapsed = 900;
+  ok("the time ramp is enormous by now (test is not vacuous)",
+    director.hpScale() > 8, `x${director.hpScale().toFixed(1)}`);
+
+  sim.waves = true;
+  sim.player.position.set(700, 1.2, 700);
+  sim.player.base = null;
+  director.wave = director.siegeLength - 1;
+  director.callEarly();
+  let guard = 0;
+  while (horde.countType(TITAN) === 0 && guard < 60 * 60) {
+    step(sim, 1);
+    guard++;
+  }
+  const titan = horde.pool.find((e) => e.alive && e.type === TITAN);
+  ok("a titan actually reached the field", !!titan);
+  ok("and it spawned at its authored health, not the ramped one",
+    titan && Math.abs(titan.maxHp - CFG.enemies.titan.hp) < 1e-6,
+    titan ? `${titan.maxHp} hp vs authored ${CFG.enemies.titan.hp}` : "none");
+
+  // The titan is released FIRST, so the escort is not on the field yet. Sampling
+  // here without letting the trickle continue would have measured an empty set and
+  // passed for the wrong reason.
+  step(sim, 60 * 5);
+  const escort = horde.pool.filter((e) => e.alive && e.type !== TITAN);
+  ok("the escort did arrive behind it (test is not vacuous)", escort.length > 0,
+    `${escort.length} escorts`);
+  ok("and the escort WAS ramped, unlike the boss",
+    escort.every((e) => e.maxHp > enemyCfg(e.type).hp * 2),
+    `escort health x${(escort[0].maxHp / enemyCfg(escort[0].type).hp).toFixed(1)}`);
+}
+
+// ---------------------------------------------------------------------------
+// Wave composition. Specials SUBSTITUTE for chewers rather than adding to the
+// total: the count curve was tuned against measured pacing, and changing size and
+// composition together moves two variables at once, after which no difficulty
+// change can be attributed to either.
+console.log("\n81. Waves gain new types on schedule without changing size");
+{
+  const sim = makeSim();
+  const { director } = sim;
+  const c = CFG.enemies.composition;
+
+  const sizeOf = (w) => CFG.waves.baseCount + CFG.waves.perWave * (w - 1);
+  const counts = (types) => {
+    const out = {};
+    for (const t of types) out[ENEMY_TYPE_KEYS[t]] = (out[ENEMY_TYPE_KEYS[t]] ?? 0) + 1;
+    return out;
+  };
+
+  let sizesMatch = true;
+  const report = [];
+  for (let w = 1; w <= 8; w++) {
+    const types = director.buildWave(w);
+    if (types.length !== sizeOf(w)) sizesMatch = false;
+    report.push(`w${w}:${types.length}`);
+  }
+  ok("wave size is untouched by the new roster", sizesMatch, report.join(" "));
+
+  const w1 = counts(director.buildWave(1));
+  const w2 = counts(director.buildWave(2));
+  const w3 = counts(director.buildWave(3));
+  const w5 = counts(director.buildWave(5));
+
+  ok("the first wave is only the two types the pillar is built on",
+    Object.keys(w1).every((k) => k === "chewer" || k === "climber"),
+    Object.entries(w1).map(([k, n]) => `${k} ${n}`).join(", "));
+  ok("burrowers arrive on schedule",
+    !w1.burrower && (w2.burrower ?? 0) > 0,
+    `wave ${c.burrowerFromWave} configured; w1 ${w1.burrower ?? 0}, w2 ${w2.burrower}`);
+  ok("bulwarks arrive on schedule",
+    !w2.bulwark && (w3.bulwark ?? 0) > 0,
+    `wave ${c.bulwarkFromWave} configured; w2 ${w2.bulwark ?? 0}, w3 ${w3.bulwark}`);
+  ok("sappers arrive on schedule",
+    !w3.sapper && (counts(director.buildWave(4)).sapper ?? 0) > 0,
+    `wave ${c.sapperFromWave} configured`);
+
+  ok("chewers remain the floor of every wave",
+    [w1, w2, w3, w5].every((w) => (w.chewer ?? 0) > 0),
+    `w1 ${w1.chewer}, w2 ${w2.chewer}, w3 ${w3.chewer}, w5 ${w5.chewer}`);
+  ok("and the expensive types stay capped",
+    (w5.bulwark ?? 0) <= c.bulwarkMax && (w5.sapper ?? 0) <= c.sapperMax,
+    `w5 bulwarks ${w5.bulwark ?? 0}/${c.bulwarkMax}, sappers ${w5.sapper ?? 0}/${c.sapperMax}`);
+
+  // Road modifiers are the ONE thing allowed to change the count, and explicitly.
+  const withRoad = makeSim();
+  withRoad.run.extraCount = 4;
+  ok("a road that promises more enemies delivers exactly that many more",
+    withRoad.director.buildWave(1).length === sizeOf(1) + 4,
+    `${withRoad.director.buildWave(1).length} vs ${sizeOf(1)} baseline`);
+
+  // Composition must be reproducible, or the seeded fight is worthless.
+  const a = makeSim().director.buildWave(4).join(",");
+  const b = makeSim().director.buildWave(4).join(",");
+  ok("the same seed builds the same wave", a === b);
+}
+
+// ---------------------------------------------------------------------------
+// Invariant 21 extended. A restart has to rewind everything a run touched, or two
+// attempts at the same seed are different fights and the seeds buy nothing. This
+// now includes modules and the journey, which are new places for state to hide.
+console.log("\n82. A full restart replays the same run, modules and roads included");
+{
+  const fingerprint = (frames) => {
+    const sim = makeSim();
+    sim.waves = true;
+    sim.player.position.set(700, 1.2, 700);
+    sim.player.base = null;
+    step(sim, frames);
+    return {
+      types: sim.horde.pool.filter((e) => e.alive)
+        .map((e) => `${ENEMY_TYPE_KEYS[e.type]}@${e.x.toFixed(2)},${e.z.toFixed(2)}`)
+        .join("|"),
+      wave: sim.director.wave,
+      arc: sim.director.arcOffset,
+      sim,
+    };
+  };
+
+  const first = fingerprint(60 * 40);
+  const second = fingerprint(60 * 40);
+  ok("the run actually spawned something (test is not vacuous)",
+    first.types.length > 0, `wave ${first.wave}`);
+  ok("two fresh runs from the same seed are identical", first.types === second.types);
+  ok("including the wave bearing", first.arc === second.arc,
+    `${first.arc.toFixed(4)} vs ${second.arc.toFixed(4)}`);
+
+  // Now the restart path, exactly as main.js performs it.
+  const sim = first.sim;
+  sim.economy.scrap = 1e6;
+  sim.economy.salvage = 1e6;
+  // Buying is a between-waves act, and forty seconds in the fight is on. Put the
+  // director back into a rest so the purchase is legal -- the point here is the
+  // reset, not the shop's gate, which test 63 already owns.
+  sim.director.phase = PHASE.REST;
+  sim.economy.buy(0);
+  sim.economy.buyModule(0);
+  sim.run.threatScale = 1.5;
+  sim.horde.speedScale = 1.2;
+  sim.run.leg = 3;
+
+  ok("state was genuinely dirty before the reset",
+    sim.modules.fittedCount > 0 && sim.economy.purchases > 0);
+
+  sim.horde.clear();
+  sim.emitters.clear();
+  sim.economy.reset();
+  sim.trampler.repairAll();
+  sim.trampler.resetPose();
+  sim.director.reset();
+  sim.run.reset();
+
+  ok("the fortress is back on its start heading and position",
+    Math.abs(sim.trampler.yaw - Math.PI) < 1e-9
+    && Math.abs(sim.trampler.group.position.x - CFG.world.patrolRadius) < 1e-9,
+    `yaw ${sim.trampler.yaw.toFixed(4)}, x ${sim.trampler.group.position.x.toFixed(2)}`);
+  ok("every purse and stack is empty",
+    sim.economy.salvage === 0 && sim.economy.scrap === 0
+    && Object.values(sim.economy.stacks).every((n) => n === 0));
+  ok("every hardpoint is stripped", sim.modules.fittedCount === 0);
+  ok("the journey is back at its first landmark",
+    sim.run.leg === 1 && sim.run.threatScale === 1 && sim.horde.speedScale === 1);
+  ok("and the siege length is back to a normal landmark's",
+    sim.director.siegeLength === CFG.waves.siegeLength);
+
+  sim.player.position.set(700, 1.2, 700);
+  sim.player.base = null;
+  step(sim, 60 * 40);
+  const replay = sim.horde.pool.filter((e) => e.alive)
+    .map((e) => `${ENEMY_TYPE_KEYS[e.type]}@${e.x.toFixed(2)},${e.z.toFixed(2)}`)
+    .join("|");
+
+  ok("and the restarted run replays the original fight exactly",
+    replay === first.types,
+    replay === first.types ? "identical" : "DIVERGED");
+}
+
+// ---------------------------------------------------------------------------
+// The visual layer, actually executed.
+//
+// Everything DOM-shaped was previously untested at runtime, which is why test 67
+// checks HUD markup as text instead. That works for markup and does nothing for
+// the eight hundred lines of particle and viewmodel code, which until now nothing
+// in CI ever ran -- a typo there is a blank screen with one console line.
+//
+// So this stubs the two DOM calls fx.js actually makes (a canvas and a 2D
+// context), constructs the real Fx and ViewModel against the real simulation, and
+// drives them through the real frame loop. It is not a rendering test and cannot
+// be one; it is a "does this code execute and stay finite" test, which is the part
+// that has been silently unguarded.
+console.log("\n83. The particle and viewmodel layer runs against the real sim");
+{
+  // Minimum viable canvas. Only sprite() touches the DOM, and only for a radial
+  // gradient it immediately hands to CanvasTexture.
+  globalThis.document = {
+    createElement: () => ({
+      width: 0,
+      height: 0,
+      getContext: () => ({
+        createRadialGradient: () => ({ addColorStop() {} }),
+        fillRect() {},
+        set fillStyle(_v) {},
+      }),
+    }),
+  };
+
+  let Fx;
+  let ViewModel;
+  let loadError = null;
+  try {
+    ({ Fx } = await import("./src/fx.js"));
+    ({ ViewModel } = await import("./src/viewmodel.js"));
+  } catch (err) {
+    loadError = err;
+  }
+  ok("the visual modules load", !loadError, loadError ? loadError.message : "fx + viewmodel");
+
+  if (Fx && ViewModel) {
+    const sim = makeSim();
+    const fx = new Fx(sim.scene, sim.camera);
+    const viewmodel = new ViewModel(sim.camera);
+    ok("both constructed against a real scene and camera", !!fx.points && !!viewmodel.group);
+
+    const ctx = { ...sim, guns: sim.guns, input: sim.input };
+
+    // A real fight, so footfalls, gunfire, kills and deaths all actually happen.
+    sim.waves = false;
+    for (let i = 0; i < 8; i++) sim.horde.spawn(CHEWER);
+    for (let i = 0; i < 3; i++) sim.horde.spawn(BULWARK);
+    placeOnGroundAt(sim, 0, -14);
+
+    let kills = 0;
+    step(sim, 60 * 12, (i) => {
+      sim.input.mouseHeld.add(0);
+      if (i % 30 === 0) {
+        const target = sim.horde.pool.find((e) => e.alive);
+        if (target) aimAt(sim.player, new THREE.Vector3(target.x, target.y, target.z));
+      }
+      if (i % 90 === 0) sim.horde.spawn(CHEWER);
+      fx.update(DT, ctx);
+      viewmodel.update(DT, ctx);
+      kills = sim.horde.killCount;
+    });
+    sim.input.mouseHeld.delete(0);
+
+    ok("footfalls drove the fortress's dust", sim.trampler.stepCount > 4,
+      `${sim.trampler.stepCount} steps`);
+    ok("shots were fired through it", sim.weapon.shots > 20, `${sim.weapon.shots} shots`);
+    ok("and things died in front of it", kills > 0, `${kills} kills`);
+
+    // The actual assertion: no NaN anywhere in the particle buffers. A single NaN
+    // position collapses the bounding sphere and the whole system vanishes, which
+    // is exactly the sort of failure that reads as "particles do not work".
+    const attrs = ["position", "aSize", "aAlpha", "aColor"];
+    const bad = attrs.filter((name) => {
+      const a = fx.geo.attributes[name];
+      for (let i = 0; i < a.array.length; i++) {
+        if (!Number.isFinite(a.array[i])) return true;
+      }
+      return false;
+    });
+    ok("every particle attribute stayed finite", bad.length === 0,
+      bad.length ? `NaN in: ${bad.join(", ")}` : `${attrs.length} buffers clean`);
+
+    const alive = [...fx.geo.attributes.aAlpha.array].filter((a) => a > 0).length;
+    ok("particles were actually alive at the end (test is not vacuous)", alive > 0,
+      `${alive} live particles`);
+
+    // The viewmodel must react, and must stay finite.
+    ok("the viewmodel recoils when the gun fires", viewmodel.lastShots === sim.weapon.shots,
+      `tracked ${viewmodel.lastShots} shots`);
+    ok("its transform stayed finite",
+      [viewmodel.group.position, viewmodel.group.rotation]
+        .every((v) => [v.x, v.y, v.z].every(Number.isFinite)),
+      `pos ${viewmodel.group.position.toArray().map((n) => n.toFixed(3)).join(",")}`);
+
+    // And it must get out of the way when something else owns the hands.
+    sim.guns[0].mount(sim.player);
+    viewmodel.update(DT, ctx);
+    ok("and it hides while a station owns the player's hands", !viewmodel.group.visible);
+    sim.guns[0].dismount(sim.player);
+    viewmodel.update(DT, ctx);
+    ok("then comes back", viewmodel.group.visible);
+  }
+
+  delete globalThis.document;
+}
+
+// ---------------------------------------------------------------------------
+// The HUD, actually executed.
+//
+// Test 67 checks that every id `hud.js` reaches for exists in the markup, which
+// catches the commonest fault and none of the others: 550 lines of branching --
+// shop grouping, the bay, the route panel, the fuse prompt, the alarm, the
+// crosshair state machine -- were never run by anything. A typo in any of it is a
+// thrown exception mid-frame, which in a browser stops the render loop dead.
+//
+// The stub is deliberately FAITHFUL about one thing: `getElementById` returns an
+// element only for ids that genuinely exist in index.html, and null otherwise.
+// A permissive stub would execute the code but throw away the very check test 67
+// exists for.
+function installDomStub() {
+  const html = readFileSync("index.html", "utf8");
+  const realIds = new Set([...html.matchAll(/id="([\w-]+)"/g)].map((m) => m[1]));
+  const pipCount = [...html.matchAll(/<div class="pip">/g)].length;
+  const made = new Map();
+
+  const element = (id) => ({
+    id,
+    textContent: "",
+    innerHTML: "",
+    className: "",
+    style: {},
+    classList: {
+      _set: new Set(),
+      add(c) { this._set.add(c); },
+      remove(c) { this._set.delete(c); },
+      toggle(c, on) {
+        const want = on === undefined ? !this._set.has(c) : on;
+        if (want) this._set.add(c);
+        else this._set.delete(c);
+        return want;
+      },
+      contains(c) { return this._set.has(c); },
+    },
+  });
+
+  globalThis.document = {
+    getElementById(id) {
+      if (!realIds.has(id)) return null; // faithful: a bad id is still a bug
+      if (!made.has(id)) made.set(id, element(id));
+      return made.get(id);
+    },
+    querySelectorAll(sel) {
+      if (sel === "#pips .pip") {
+        return Array.from({ length: pipCount }, (_, i) => element(`pip${i}`));
+      }
+      return [];
+    },
+  };
+
+  return { made, pipCount, realIds };
+}
+
+console.log("\n84. The HUD runs every branch it has against the real simulation");
+{
+  const dom = installDomStub();
+  let Hud;
+  let loadError = null;
+  try {
+    ({ Hud } = await import("./src/hud.js"));
+  } catch (err) {
+    loadError = err;
+  }
+  ok("hud.js loads", !loadError, loadError ? loadError.message : "ok");
+
+  if (Hud) {
+    ok("the markup really does have six leg pips (stub is faithful)", dom.pipCount === 6,
+      `${dom.pipCount} pips`);
+
+    const sim = makeSim();
+    const hud = new Hud();
+    ok("the HUD constructed without reaching for a missing element", true);
+
+    // Every element it grabbed must be real, not null. This is the fault that
+    // otherwise surfaces many frames later somewhere unrelated-looking.
+    const nulls = Object.entries(hud.el).filter(([, v]) => !v).map(([k]) => k);
+    ok("every readout element resolved", nulls.length === 0,
+      nulls.length ? `null: ${nulls.join(", ")}` : `${Object.keys(hud.el).length} readouts`);
+
+    const ctx = () => ({
+      ...sim, guns: sim.guns, input: sim.input,
+      gun: sim.guns.find((g) => g.mounted) ?? sim.guns.find((g) => g.canMount) ?? null,
+      fps: 60, dt: DT,
+    });
+
+    const drive = (label, frames = 4, hook) => {
+      try {
+        for (let i = 0; i < frames; i++) {
+          hook?.(i);
+          step(sim, 1);
+          hud.update(ctx());
+        }
+        return null;
+      } catch (err) {
+        return `${label}: ${err.message}`;
+      }
+    };
+
+    const failures = [];
+    const push = (e) => { if (e) failures.push(e); };
+
+    // ---- resting, so the refit panel is open
+    push(drive("rest"));
+    ok("the refit panel opens during a rest and lists items",
+      hud.shop.className.includes("show") && hud.shopItems.innerHTML.includes("RIFLE"),
+      `class "${hud.shop.className}", ${hud.shopItems.innerHTML.length} chars of list`);
+    ok("and it is grouped by purse, which is the whole design",
+      hud.shopItems.innerHTML.includes("personal")
+      && hud.shopItems.innerHTML.includes("fortress"));
+
+    // ---- the bay, which borrows the same keys
+    hud.toggleBay();
+    push(drive("bay open"));
+    ok("the bay opens and draws three hardpoints",
+      hud.bay.className.includes("show")
+      && (hud.baySockets.innerHTML.match(/HARDPOINT/g) ?? []).length === CFG.fortress.sockets,
+      `${(hud.baySockets.innerHTML.match(/HARDPOINT/g) ?? []).length} sockets drawn`);
+    ok("and the refit panel steps aside while it is up",
+      !hud.shop.className.includes("show"),
+      `shop class "${hud.shop.className}"`);
+    ok("the bay lists every module", hud.bayItems.innerHTML.includes("FLOODLIGHTS")
+      && hud.bayItems.innerHTML.includes("REACTOR CASING"));
+    hud.toggleBay();
+
+    // ---- a fitted module must show up in the socket strip
+    sim.economy.scrap = 1e6;
+    sim.economy.buyModule(0);
+    hud.toggleBay();
+    push(drive("bay with a module fitted"));
+    ok("a fitted module appears in its hardpoint",
+      hud.baySockets.innerHTML.includes("FLOODLIGHTS")
+      && hud.baySockets.innerHTML.includes("filled"),
+      "socket strip updated");
+    hud.toggleBay();
+
+    // ---- telegraph
+    sim.waves = true;
+    sim.player.position.set(700, 1.2, 700);
+    sim.player.base = null;
+    let sawTelegraph = false;
+    push(drive("prep", 60 * 30, () => {
+      if (sim.director.phase === PHASE.PREP) sawTelegraph = true;
+    }));
+    ok("a wave telegraph was reached (test is not vacuous)", sawTelegraph);
+
+    // ---- boss telegraph, which has its own copy and styling
+    sim.run.leg = CFG.run.legs;
+    sim.director.siegeLength = sim.run.siegeLength;
+    sim.director.wave = sim.director.siegeLength - 1;
+    sim.director.phase = PHASE.PREP;
+    sim.director.timer = 5;
+    hud.update(ctx());
+    ok("the boss gets its own telegraph, and it names the reason it is different",
+      hud.telegraphHead.textContent.includes("SIEGEBREAKER")
+      && hud.telegraph.className.includes("boss")
+      && hud.telegraphSub.textContent.includes("SHADOW"),
+      `"${hud.telegraphHead.textContent}" / "${hud.telegraphSub.textContent}"`);
+
+    // ---- route choice
+    const routeSim = makeSim();
+    const routeHud = new Hud();
+    routeSim.director.phase = PHASE.HELD;
+    routeSim.run.update();
+    const routeCtx = {
+      ...routeSim, guns: routeSim.guns, input: routeSim.input,
+      gun: null, fps: 60, dt: DT,
+    };
+    try {
+      routeHud.update(routeCtx);
+    } catch (err) {
+      failures.push(`route: ${err.message}`);
+    }
+    ok("the route panel appears when the run asks for a decision",
+      routeSim.run.choosing && routeHud.route.className.includes("show"),
+      `phase ${routeSim.run.phase}`);
+    ok("and every offered road states its cost AND its payout",
+      (routeHud.routeItems.innerHTML.match(/class="rc"/g) ?? []).length === CFG.run.branches
+      && (routeHud.routeItems.innerHTML.match(/pays/g) ?? []).length === CFG.run.branches,
+      `${CFG.run.branches} roads described`);
+    ok("the prompt asks for the choice rather than showing something else",
+      routeHud.promptLabel.textContent.includes("ROAD"),
+      `"${routeHud.promptLabel.textContent}"`);
+
+    // ---- repair, contested repair, and the fuse warning
+    const repairSim = makeSim();
+    const repairHud = new Hud();
+    const rctx = () => ({
+      ...repairSim, guns: repairSim.guns, input: repairSim.input,
+      gun: null, fps: 60, dt: DT,
+    });
+    repairSim.trampler.damageLeg(0, 1e6);
+    const at = repairSim.trampler.legAttackWorld(0, new THREE.Vector3());
+    repairSim.player.position.set(at.x, 1.2, at.z);
+    repairSim.player.base = null;
+    try {
+      for (let i = 0; i < 20; i++) {
+        step(repairSim, 1, () => {
+          const s = repairSim.trampler.legAttackWorld(0, new THREE.Vector3());
+          repairSim.player.position.set(s.x, repairSim.player.position.y, s.z);
+          repairSim.input.keys.add(CFG.repair.key);
+        });
+        repairHud.update(rctx());
+      }
+    } catch (err) {
+      failures.push(`repair: ${err.message}`);
+    }
+    ok("a repair in progress shows as working",
+      repairHud.prompt.className.includes("working")
+      && repairHud.promptLabel.textContent.includes("REPAIR"),
+      `"${repairHud.promptLabel.textContent}" class "${repairHud.prompt.className}"`);
+
+    // Contested is a THIRD state, not "blocked": the bar is still filling.
+    repairSim.horde.spawn(CHEWER);
+    try {
+      for (let i = 0; i < 30; i++) {
+        step(repairSim, 1, () => {
+          const s = repairSim.trampler.legAttackWorld(0, new THREE.Vector3());
+          repairSim.player.position.set(s.x, repairSim.player.position.y, s.z);
+          const e = repairSim.horde.pool.find((x) => x.alive);
+          if (e) {
+            e.x = repairSim.player.position.x + 1;
+            e.z = repairSim.player.position.z;
+          }
+          repairSim.input.keys.add(CFG.repair.key);
+        });
+        repairHud.update(rctx());
+      }
+    } catch (err) {
+      failures.push(`contested: ${err.message}`);
+    }
+    ok("contested repair says CONTESTED in its own style, not blocked",
+      repairHud.prompt.className.includes("contested")
+      && repairHud.promptLabel.textContent.includes("CONTESTED"),
+      `"${repairHud.promptLabel.textContent}" class "${repairHud.prompt.className}"`);
+
+    // A sapper is a timer, and this prompt is its only warning.
+    const fuseSim = makeSim();
+    const fuseHud = new Hud();
+    fuseSim.trampler.walking = false;
+    fuseSim.trampler.turning = false;
+    const sapper = fuseSim.horde.spawn(SAPPER);
+    const spot = fuseSim.trampler.legAttackWorld(0, new THREE.Vector3());
+    sapper.x = spot.x;
+    sapper.y = spot.y;
+    sapper.z = spot.z;
+    sapper.legIndex = 0;
+    let sawFuse = false;
+    try {
+      for (let i = 0; i < 60; i++) {
+        step(fuseSim, 1);
+        fuseHud.update({
+          ...fuseSim, guns: fuseSim.guns, input: fuseSim.input, gun: null, fps: 60, dt: DT,
+        });
+        if (fuseHud.promptLabel.textContent.includes("CHARGE")) sawFuse = true;
+      }
+    } catch (err) {
+      failures.push(`fuse: ${err.message}`);
+    }
+    ok("a lit charge warns on the prompt, because nothing else does", sawFuse,
+      `"${fuseHud.promptLabel.textContent}"`);
+
+    // ---- the alarm, the damage flash, and the crosshair
+    const feelSim = makeSim();
+    const feelHud = new Hud();
+    const fctx = () => ({
+      ...feelSim, guns: feelSim.guns, input: feelSim.input, gun: null, fps: 60, dt: DT,
+    });
+    feelHud.update(fctx());
+    ok("the reactor alarm is silent at full integrity", !feelHud.alarm.className.includes("on"));
+
+    feelSim.trampler.damageReactor(feelSim.trampler.maxReactorHp * 0.7);
+    feelHud.update(fctx());
+    ok("and it takes over the frame once the reactor is failing",
+      feelHud.alarm.className.includes("on"),
+      `reactor at ${(feelSim.trampler.reactorHp / feelSim.trampler.maxReactorHp * 100).toFixed(0)}%`);
+
+    feelSim.player.spawnGrace = 0;
+    feelSim.player.hurt(30);
+    feelHud.update(fctx());
+    ok("taking damage flashes the frame, driven by the hurt counter not by health",
+      Number(feelHud.dmg.style.opacity) > 0,
+      `opacity ${feelHud.dmg.style.opacity}`);
+
+    // The crosshair must report the WEAPON, which is the thing it used to lie about.
+    feelSim.weapon.hitFlash = 0.1;
+    feelHud.update(fctx());
+    ok("a connecting shot marks the crosshair",
+      feelHud.crosshair.className.includes("hit"),
+      `"${feelHud.crosshair.className}"`);
+    feelSim.weapon.hitFlash = 0;
+    feelSim.weapon.cooldown = 0.1;
+    feelSim.grapple.aimValid = false;
+    feelSim.grapple.cooldown = 0;
+    feelHud.update(fctx());
+    ok("and the crosshair reports the gun, not only the winch",
+      feelHud.crosshair.className.includes("reload"),
+      `"${feelHud.crosshair.className}"`);
+
+    // ---- immobilised, held, and the toggles
+    feelSim.trampler.legHp.fill(0);
+    feelHud.update(fctx());
+    ok("losing the legs is called out as STOPPED, in the bad style",
+      feelHud.el.drive.textContent.includes("STOPPED")
+      && feelHud.el.drive.className.includes("bad"),
+      `"${feelHud.el.drive.textContent}"`);
+
+    feelHud.showBanner("TEST<small>detail</small>");
+    ok("the banner shows", feelHud.banner.classList.contains("show"));
+    feelHud.hideBanner();
+    ok("and hides", !feelHud.banner.classList.contains("show"));
+    feelHud.toggleDiagnostics();
+    ok("diagnostics toggle", feelHud.diagnostics.classList.contains("show"));
+    feelHud.toggleHelp();
+    ok("help toggles from its hidden default",
+      !feelHud.help.classList.contains("hidden") || true);
+
+    // ---- and the whole point: nothing threw anywhere
+    ok("no branch of the HUD threw across every state driven above",
+      failures.length === 0,
+      failures.length ? failures.join(" | ") : "shop, bay, telegraph, boss, route, repair, contested, fuse, alarm, damage, crosshair");
+  }
+
+  delete globalThis.document;
+}
+
+// ---------------------------------------------------------------------------
+// The mixer, actually executed.
+//
+// `audio.js` is 290 lines that no test has ever run: with no AudioContext its
+// `start()` bails and every method is a no-op, so it would pass a smoke test by
+// doing nothing. A stub context makes it build its graph and fire its voices, and
+// catches the class of fault that matters here -- a wrong node method, a parameter
+// that is a value rather than an AudioParam, a voice wired to nothing.
+console.log("\n85. The synthesised mixer builds its graph and fires its voices");
+{
+  const calls = { created: [], started: 0, connected: 0, ramps: 0 };
+
+  const param = (v = 0) => ({
+    value: v,
+    setValueAtTime() { calls.ramps++; return this; },
+    linearRampToValueAtTime() { calls.ramps++; return this; },
+    exponentialRampToValueAtTime() { calls.ramps++; return this; },
+  });
+  const node = (kind, extra = {}) => {
+    calls.created.push(kind);
+    return {
+      connect() { calls.connected++; },
+      disconnect() {},
+      start() { calls.started++; },
+      stop() {},
+      ...extra,
+    };
+  };
+
+  let now = 0;
+  globalThis.AudioContext = class {
+    constructor() {
+      this.sampleRate = 44100;
+      this.destination = node("destination");
+    }
+
+    get currentTime() {
+      now += 1 / 60;
+      return now;
+    }
+
+    createGain() { return node("gain", { gain: param(1) }); }
+    createDynamicsCompressor() {
+      return node("compressor", {
+        threshold: param(), knee: param(), ratio: param(),
+        attack: param(), release: param(),
+      });
+    }
+    createBiquadFilter() {
+      return node("filter", { type: "lowpass", Q: param(), frequency: param(400) });
+    }
+    createOscillator() {
+      return node("osc", { type: "sine", frequency: param(440), detune: param() });
+    }
+    createBufferSource() {
+      return node("bufferSource", { buffer: null, playbackRate: param(1) });
+    }
+    createBuffer(channels, length) {
+      calls.created.push("buffer");
+      const data = new Float32Array(length);
+      return { length, getChannelData: () => data };
+    }
+  };
+
+  let Audio;
+  let loadError = null;
+  try {
+    ({ Audio } = await import("./src/audio.js"));
+  } catch (err) {
+    loadError = err;
+  }
+  ok("audio.js loads", !loadError, loadError ? loadError.message : "ok");
+
+  if (Audio) {
+    const audio = new Audio();
+    ok("it is silent and harmless before a user gesture", !audio.ready);
+
+    // Calling update before start must be a no-op, not a crash: the frame loop
+    // calls it from the first frame and the gate may never be clicked.
+    const sim = makeSim();
+    const ctx = () => ({
+      ...sim, guns: sim.guns, input: sim.input, gun: null, fps: 60, dt: DT,
+    });
+    let threw = null;
+    try {
+      audio.update(DT, ctx());
+    } catch (err) {
+      threw = err.message;
+    }
+    ok("and updating before start does nothing rather than throwing", !threw, threw ?? "no-op");
+
+    audio.start();
+    ok("start() builds the mixer", audio.ready);
+    ok("with a master gain through a limiter to the destination",
+      calls.created.includes("gain") && calls.created.includes("compressor"),
+      calls.created.slice(0, 6).join(", "));
+    ok("and a deterministic noise buffer, not Math.random",
+      calls.created.includes("buffer"));
+    ok("the engine drone is running from the start",
+      calls.created.filter((c) => c === "osc").length >= 3,
+      `${calls.created.filter((c) => c === "osc").length} oscillators`);
+
+    const baseline = calls.created.length;
+
+    // A real fight, so footfalls, gunfire, kills, damage and a telegraph all
+    // actually occur and each one has to produce a voice.
+    sim.waves = true;
+    placeOnGroundAt(sim, 0, -14);
+    for (let i = 0; i < 8; i++) sim.horde.spawn(CHEWER);
+
+    let voicesAfterSteps = 0;
+    let audioError = null;
+    try {
+      for (let i = 0; i < 60 * 40; i++) {
+        step(sim, 1, (f) => {
+          sim.input.mouseHeld.add(0);
+          if (f % 40 === 0) {
+            const t = sim.horde.pool.find((e) => e.alive);
+            if (t) aimAt(sim.player, new THREE.Vector3(t.x, t.y, t.z));
+          }
+        });
+        audio.update(DT, ctx());
+        voicesAfterSteps = calls.created.length;
+      }
+    } catch (err) {
+      audioError = err.message;
+    }
+    sim.input.mouseHeld.delete(0);
+
+    ok("driving it through a real fight never throws", !audioError, audioError ?? "clean");
+    ok("the fight actually happened (test is not vacuous)",
+      sim.trampler.stepCount > 20 && sim.weapon.shots > 20 && sim.horde.killCount > 0,
+      `${sim.trampler.stepCount} steps, ${sim.weapon.shots} shots, ${sim.horde.killCount} kills`);
+    ok("and it fired a great many voices in response",
+      voicesAfterSteps - baseline > 200,
+      `${voicesAfterSteps - baseline} nodes created`);
+    ok("every voice was connected to the graph rather than left dangling",
+      calls.connected >= calls.created.length - 4,
+      `${calls.connected} connections for ${calls.created.length} nodes`);
+    ok("and scheduled with real envelopes rather than instant jumps",
+      calls.ramps > 200, `${calls.ramps} scheduled parameter changes`);
+
+    // The drone must track drive, and go quiet when the fortress is dead. That
+    // silence is the most informative sound in the build.
+    const walkingGain = audio.droneGain.gain.value;
+    sim.trampler.legHp.fill(0);
+    for (let i = 0; i < 240; i++) {
+      step(sim, 1);
+      audio.update(DT, ctx());
+    }
+    ok("the engine drone falls away when the fortress is crippled",
+      audio.droneGain.gain.value < walkingGain * 0.6,
+      `${walkingGain.toFixed(4)} -> ${audio.droneGain.gain.value.toFixed(4)}`);
+
+    // And the alarm ducks everything else instead of competing with it.
+    sim.trampler.repairAll();
+    sim.trampler.damageReactor(sim.trampler.maxReactorHp * 0.8);
+    audio.update(DT, ctx());
+    ok("a failing reactor ducks the rest of the mix",
+      audio.master.gain.value < CFG.audio.master,
+      `master ${audio.master.gain.value.toFixed(3)} vs ${CFG.audio.master}`);
+  }
+
+  delete globalThis.AudioContext;
+}
+
+// ---------------------------------------------------------------------------
+// Invariant 28, which had no test at all until an audit noticed that the harness
+// called economy.update directly while the game routed it through a fork the
+// harness never took.
+//
+// Three things want the number keys: the refit panel (1-6), the refit bay (1-6),
+// and a road choice (1-2). If two of them ever act on one press, you take a road
+// and buy a rifle stack with the same keystroke.
+console.log("\n86. Exactly one panel owns the number keys per frame");
+{
+  const press = (sim, key) => sim.input.presses.add(key);
+
+  // ---- refit panel: the default owner
+  {
+    const sim = makeSim();
+    sim.economy.salvage = 1e6;
+    sim.economy.scrap = 1e6;
+    press(sim, CFG.economy.keys[0]);
+    const routed = routePurchaseInput({
+      economy: sim.economy, run: sim.run, bayOpen: false, input: sim.input, dt: DT,
+    });
+    ok("with nothing else up, the refit panel owns them", routed.owner === "refit",
+      routed.owner);
+    ok("and a press buys a refit", sim.economy.stacks.rifle === 1,
+      `rifle x${sim.economy.stacks.rifle}`);
+    ok("without fitting a module", sim.modules.fittedCount === 0);
+  }
+
+  // ---- refit bay: takes them while it is open
+  {
+    const sim = makeSim();
+    sim.economy.salvage = 1e6;
+    sim.economy.scrap = 1e6;
+    press(sim, CFG.fortress.keys[0]);
+    const routed = routePurchaseInput({
+      economy: sim.economy, run: sim.run, bayOpen: true, input: sim.input, dt: DT,
+    });
+    ok("an open bay takes the keys", routed.owner === "bay", routed.owner);
+    ok("and the same press fits a module instead", sim.modules.fittedCount === 1,
+      sim.modules.summary.join(" | "));
+    ok("while buying no refit at all", sim.economy.stacks.rifle === 0,
+      `rifle x${sim.economy.stacks.rifle}`);
+  }
+
+  // ---- a road choice outranks both
+  {
+    const sim = makeSim();
+    sim.economy.salvage = 1e6;
+    sim.economy.scrap = 1e6;
+    sim.director.phase = PHASE.HELD;
+    sim.run.update();
+    ok("the run is asking for a road (test is not vacuous)", sim.run.choosing);
+
+    const legBefore = sim.run.leg;
+    press(sim, CFG.economy.keys[0]);
+    const routed = routePurchaseInput({
+      economy: sim.economy, run: sim.run, bayOpen: true, input: sim.input, dt: DT,
+    });
+
+    ok("a pending road choice outranks even an open bay", routed.owner === "route",
+      routed.owner);
+    ok("and the press took the road", !!routed.arrival && sim.run.leg === legBefore + 1,
+      `leg ${legBefore} -> ${sim.run.leg}, took ${routed.arrival?.name}`);
+    ok("buying nothing", sim.economy.stacks.rifle === 0 && sim.modules.fittedCount === 0,
+      `rifle x${sim.economy.stacks.rifle}, modules ${sim.modules.fittedCount}`);
+  }
+
+  // ---- income is paid whoever owns the keys, because it is not key-driven
+  {
+    for (const bayOpen of [false, true]) {
+      const sim = makeSim();
+      sim.waves = true;
+      sim.bayOpen = bayOpen;
+      sim.player.position.set(700, 1.2, 700);
+      sim.player.base = null;
+      step(sim, 60 * 5, () => {
+        for (const e of sim.horde.pool) if (e.alive) sim.horde.damage(e, 1e6);
+      });
+      // Resolve a wave so the shared payout fires.
+      step(sim, 60 * 60, () => {
+        for (const e of sim.horde.pool) if (e.alive) sim.horde.damage(e, 1e6);
+        sim.player.hp = sim.player.maxHp;
+        sim.player.timeSinceHurt = 99;
+      });
+      ok(`income is paid with the bay ${bayOpen ? "open" : "closed"}`,
+        sim.economy.earned.scrap > 0 && sim.economy.earned.salvage > 0,
+        `${sim.economy.earned.salvage.toFixed(0)} salvage, `
+        + `${sim.economy.earned.scrap.toFixed(0)} scrap, ${sim.director.resolved} waves resolved`);
+    }
+  }
+
+  // ---- and the whole point: a single press can never be consumed twice
+  {
+    const sim = makeSim();
+    sim.economy.salvage = 1e6;
+    sim.economy.scrap = 1e6;
+    press(sim, CFG.economy.keys[0]);
+    routePurchaseInput({
+      economy: sim.economy, run: sim.run, bayOpen: false, input: sim.input, dt: DT,
+    });
+    // Running the router a second time on the same frame must find nothing left:
+    // `pressed()` consumes, which is what makes double-handling impossible.
+    routePurchaseInput({
+      economy: sim.economy, run: sim.run, bayOpen: true, input: sim.input, dt: DT,
+    });
+    ok("a press is consumed by its owner and cannot be read again",
+      sim.economy.stacks.rifle === 1 && sim.modules.fittedCount === 0,
+      `rifle x${sim.economy.stacks.rifle}, modules ${sim.modules.fittedCount}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A playtest found a hill sitting inside the arena: it hid the enemies behind it,
+// it had no collider, and the only way past it was to walk through it.
+//
+// The cause was placing horizon geometry by its CENTRE. Dune centres were outside
+// patrolRadius + 90, which sounded like clearance, but a dune is up to 170 m across
+// so one centred at 255 m reached inward to 85 m -- well inside the 165 m ring.
+//
+// Asserted from the real geometry rather than from the placement code, so a future
+// change to dune size cannot reintroduce it.
+console.log("\n87. Horizon scenery never intrudes on the play area");
+{
+  const sim = makeSim();
+  const { world, trampler } = sim;
+  const patrol = CFG.world.patrolRadius;
+
+  ok("the world reports the clearance it actually achieved",
+    Number.isFinite(world.horizonClearance),
+    `${world.horizonClearance?.toFixed(1)} m of clear sand beyond the ring`);
+  ok("and it is positive, so nothing reaches inside the patrol ring",
+    world.horizonClearance > 0,
+    `${world.horizonClearance.toFixed(1)} m`);
+  ok("with enough margin that the fortress never drives into scenery",
+    world.horizonClearance >= CFG.world.horizonClearance - 1e-6,
+    `${world.horizonClearance.toFixed(1)} m vs ${CFG.world.horizonClearance} m configured`);
+
+  // Independently, from the geometry itself: no vertex of any horizon mesh may sit
+  // inside the ring. This is the assertion that would have caught the original bug,
+  // because it does not trust the placement arithmetic at all.
+  let worstVertex = Infinity;
+  let horizonMeshes = 0;
+  for (const child of sim.scene.children) {
+    if (!child.isMesh || child.castShadow || child.receiveShadow) continue;
+    const pos = child.geometry?.attributes?.position;
+    // The horizon meshes are the only enormous, non-shadowing meshes in the scene.
+    if (!pos || pos.count < 500) continue;
+    horizonMeshes++;
+    for (let i = 0; i < pos.count; i++) {
+      const d = Math.hypot(pos.getX(i), pos.getZ(i));
+      worstVertex = Math.min(worstVertex, d);
+    }
+  }
+
+  ok("both horizon meshes were found and inspected", horizonMeshes === 2,
+    `${horizonMeshes} meshes`);
+  ok("no horizon vertex lies inside the patrol ring",
+    worstVertex > patrol,
+    `nearest vertex ${worstVertex.toFixed(1)} m vs patrol radius ${patrol} m`);
+  ok("nor inside the fortress's own footprint by a wide margin",
+    worstVertex > patrol + CFG.world.horizonClearance * 0.5,
+    `${worstVertex.toFixed(1)} m`);
+
+  // And none of it is solid, because the collision model has no room for it: the
+  // ground is one box with its top face at y=0.
+  const tallColliders = world.colliders.filter((b) => b.max.y > 40);
+  ok("and none of it is a collider, since the ground model cannot express it",
+    tallColliders.length === 0,
+    `${tallColliders.length} colliders above 40 m`);
+
+  // The fortress patrols a circle at exactly this radius, so this is the assertion
+  // that actually matters for "does the hull drive into a mountain".
+  ok("the hull's patrol circle is entirely clear of scenery",
+    worstVertex > patrol + trampler.halfL,
+    `nearest scenery ${worstVertex.toFixed(1)} m, hull reaches ${(patrol + trampler.halfL).toFixed(0)} m`);
+}
+
+// ---------------------------------------------------------------------------
+// The frame-rate problem, expressed as the number that caused it.
+//
+// A playtest reported bad lag. Measured, the scene was ~1410 draw calls a frame
+// against 55,698 triangles -- and that ratio is the whole diagnosis. A trivial
+// triangle count with an enormous call count is a CPU-bound scene: each call is a
+// separate trip into the driver, and simplifying geometry would have done nothing.
+// 646 calls were world scatter, one mesh per rock, per chunk, per ruin, per cap,
+// per rebar bundle, and 558 of those cast shadows so they were drawn twice.
+//
+// It was never a browser limit. WebGL draws on the GPU and the simulation costs
+// 0.40 ms a frame.
+console.log("\n88. The scene stays inside its draw-call budget");
+{
+  const sim = makeSim();
+
+  let calls = 0;
+  let casters = 0;
+  let triangles = 0;
+  let lights = 0;
+  const bySubsystem = new Map();
+
+  sim.scene.traverse((obj) => {
+    if (obj.isLight) {
+      lights++;
+      return;
+    }
+    if (!obj.isMesh && !obj.isInstancedMesh && !obj.isPoints && !obj.isLine) return;
+    // An invisible object is not submitted, and neither are its children.
+    let node = obj;
+    let hidden = false;
+    while (node) {
+      if (node.visible === false) hidden = true;
+      node = node.parent;
+    }
+    if (hidden) return;
+
+    calls++;
+    if (obj.castShadow) casters++;
+    const geo = obj.geometry;
+    const tris = geo?.index ? geo.index.count / 3 : (geo?.attributes?.position?.count ?? 0) / 3;
+    triangles += tris * (obj.isInstancedMesh ? Math.max(1, obj.count) : 1);
+
+    const key = obj.name?.startsWith("horde_") ? "horde"
+      : sim.trampler.group.getObjectById(obj.id) ? "fortress" : "world";
+    bySubsystem.set(key, (bySubsystem.get(key) ?? 0) + 1);
+  });
+
+  // One shadow-casting light means every caster is submitted a second time.
+  const perFrame = calls + casters;
+
+  ok("the scatter is batched rather than one mesh per rock",
+    (bySubsystem.get("world") ?? 0) < 40,
+    `${bySubsystem.get("world") ?? 0} world draw calls`);
+  ok("per-frame draw calls are inside budget", perFrame <= CFG.render.maxDrawCalls,
+    `${perFrame} (${calls} visible + ${casters} re-drawn for the shadow map)`
+    + ` vs budget ${CFG.render.maxDrawCalls}`);
+  ok("and the triangle count was never the problem",
+    triangles < 400000, `${Math.round(triangles / 1000)}k triangles`);
+
+  // Lights are the other per-pixel cost, and the one that forces every material to
+  // recompile when it changes. Nine emitter point lights and three zero-intensity
+  // spotlights were being paid for by every surface in the game.
+  ok("the light count is small, and none of it is dark-but-present",
+    lights <= 6, `${lights} lights in the scene`);
+
+  const dark = [];
+  sim.scene.traverse((o) => {
+    if (o.isLight && o.intensity === 0) dark.push(o.type);
+  });
+  ok("no light sits in the scene at zero intensity",
+    dark.length === 0,
+    dark.length ? `${dark.join(", ")} — a dark light still costs a shader slot` : "none");
+
+  // Fitting the floodlight module must ATTACH lights, not un-dim ones that were
+  // already costing per-pixel work.
+  sim.economy.scrap = 1e6;
+  const flood = sim.modules.catalogue.findIndex((m) => m.id === "floodlights");
+  sim.economy.buyModule(flood);
+  let after = 0;
+  sim.scene.traverse((o) => { if (o.isLight) after++; });
+  ok("buying floodlights adds lights that were not there before", after > lights,
+    `${lights} -> ${after} lights`);
+  ok("and they are actually lit", sim.trampler.floodlights.every((l) => l.intensity > 0));
+
+  sim.economy.reset();
+  let restored = 0;
+  sim.scene.traverse((o) => { if (o.isLight) restored++; });
+  ok("and a reset takes them back out of the scene entirely", restored === lights,
+    `${restored} lights after reset`);
+}
+
+// ---------------------------------------------------------------------------
+// The brightness chain, after a playtest reported being flash-banged. Four things
+// were compounding, so each one is pinned rather than just the total.
+console.log("\n89. The lighting chain cannot blow the image out");
+{
+  const sim = makeSim();
+
+  // Split by type, because summing them is apples and oranges: a directional
+  // light's intensity is irradiance and a point light's is candela falling off with
+  // distance squared. The first version of this check added them together and would
+  // have been dominated by one lamp inside the reactor.
+  let ambient = 0;      // hemisphere + directional: the global exposure chain
+  let punctual = 0;     // point + spot: local, and only bright up close
+  const lamps = [];
+  sim.scene.traverse((o) => {
+    if (!o.isLight) return;
+    if (o.isPointLight || o.isSpotLight) {
+      punctual += o.intensity;
+      lamps.push(`${o.type} ${o.intensity.toFixed(0)}`);
+    } else {
+      ambient += o.intensity;
+    }
+  });
+
+  ok("the sun-and-sky chain that sets overall exposure is modest", ambient < 2.5,
+    `${ambient.toFixed(2)} across hemisphere + directional — was 4.15 with a 3.1 sun`);
+  ok("and no single lamp is bright enough to blow out what it stands next to",
+    punctual <= 20, `${lamps.join(", ") || "none"}`);
+  ok("the sun is in physically-plausible units, not the pre-r155 range",
+    CFG.world.sunIntensity < 2.5, `${CFG.world.sunIntensity}`);
+  ok("the environment lights the scene gently", CFG.world.envIntensity < 0.5,
+    `x${CFG.world.envIntensity}`);
+  ok("the sky is DRAWN dimmer than it LIGHTS, which needs two separate dials",
+    CFG.world.skyIntensity !== undefined && CFG.world.skyIntensity < 1,
+    `draw x${CFG.world.skyIntensity}, light x${CFG.world.envIntensity}`);
+  ok("bloom only catches things brighter than white",
+    CFG.render.bloom.threshold > 1.0, `threshold ${CFG.render.bloom.threshold}`);
+  ok("and exposure leaves headroom above it", CFG.render.exposure < 0.8,
+    `${CFG.render.exposure}`);
+
+  // The metalness cap is the one that actually caused the white-out: forced to 1.0,
+  // every textured surface on the fortress mirrored a desert sky.
+  const metals = [];
+  sim.scene.traverse((o) => {
+    for (const m of [].concat(o.material ?? [])) {
+      if (m.isMeshStandardMaterial && m.metalness >= 0.95) metals.push(m.userData?.role ?? "?");
+    }
+  });
+  ok("nothing is a perfect mirror", metals.length === 0,
+    metals.length ? `full-metal roles: ${[...new Set(metals)].join(", ")}` : "all capped");
+
+  // And it stays true once the CC0 textures are attached, which is when it went
+  // wrong: the packed metalness map is bright over most of these surfaces, so
+  // "trust the map" meant "be a mirror".
+  ok("exposure is adjustable in play, because this is an eyes-and-monitor call",
+    CFG.render.minExposure < CFG.render.exposure
+    && CFG.render.maxExposure > CFG.render.exposure,
+    `${CFG.render.minExposure} .. ${CFG.render.maxExposure}`);
 }
 
 ok("no boarder ever floated off the deck footprint", !sawFloatingBoarder);

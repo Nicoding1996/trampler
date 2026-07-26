@@ -1,0 +1,76 @@
+{
+  "source": "polyhaven.com",
+  "license": "CC0",
+  "hdris": {
+    "sky": {
+      "slug": "wasteland_clouds_puresky",
+      "file": "assets/hdri/wasteland_clouds_puresky_1k.hdr"
+    }
+  },
+  "textures": {
+    "sand": {
+      "slug": "sand_02",
+      "maps": {
+        "diff": "assets/textures/sand_02/sand_02_diff_1k.jpg",
+        "nor_gl": "assets/textures/sand_02/sand_02_nor_gl_1k.jpg",
+        "arm": "assets/textures/sand_02/sand_02_arm_1k.jpg"
+      }
+    },
+    "hull": {
+      "slug": "rusty_metal_02",
+      "maps": {
+        "diff": "assets/textures/rusty_metal_02/rusty_metal_02_diff_1k.jpg",
+        "nor_gl": "assets/textures/rusty_metal_02/rusty_metal_02_nor_gl_1k.jpg",
+        "arm": "assets/textures/rusty_metal_02/rusty_metal_02_arm_1k.jpg"
+      }
+    },
+    "deck": {
+      "slug": "metal_plate",
+      "maps": {
+        "diff": "assets/textures/metal_plate/metal_plate_diff_1k.jpg",
+        "nor_gl": "assets/textures/metal_plate/metal_plate_nor_gl_1k.jpg",
+        "arm": "assets/textures/metal_plate/metal_plate_arm_1k.jpg"
+      }
+    },
+    "rust": {
+      "slug": "rust_coarse_01",
+      "maps": {
+        "diff": "assets/textures/rust_coarse_01/rust_coarse_01_diff_1k.jpg",
+        "nor_gl": "assets/textures/rust_coarse_01/rust_coarse_01_nor_gl_1k.jpg",
+        "arm": "assets/textures/rust_coarse_01/rust_coarse_01_arm_1k.jpg"
+      }
+    },
+    "panel": {
+      "slug": "corrugated_iron",
+      "maps": {
+        "diff": "assets/textures/corrugated_iron/corrugated_iron_diff_1k.jpg",
+        "nor_gl": "assets/textures/corrugated_iron/corrugated_iron_nor_gl_1k.jpg",
+        "arm": "assets/textures/corrugated_iron/corrugated_iron_arm_1k.jpg"
+      }
+    },
+    "grate": {
+      "slug": "metal_grate_rusty",
+      "maps": {
+        "diff": "assets/textures/metal_grate_rusty/metal_grate_rusty_diff_1k.jpg",
+        "nor_gl": "assets/textures/metal_grate_rusty/metal_grate_rusty_nor_gl_1k.jpg",
+        "arm": "assets/textures/metal_grate_rusty/metal_grate_rusty_arm_1k.jpg"
+      }
+    },
+    "rock": {
+      "slug": "rock_boulder_dry",
+      "maps": {
+        "diff": "assets/textures/rock_boulder_dry/rock_boulder_dry_diff_1k.jpg",
+        "nor_gl": "assets/textures/rock_boulder_dry/rock_boulder_dry_nor_gl_1k.jpg",
+        "arm": "assets/textures/rock_boulder_dry/rock_boulder_dry_arm_1k.jpg"
+      }
+    },
+    "ruin": {
+      "slug": "concrete_wall_007",
+      "maps": {
+        "diff": "assets/textures/concrete_wall_007/concrete_wall_007_diff_1k.jpg",
+        "nor_gl": "assets/textures/concrete_wall_007/concrete_wall_007_nor_gl_1k.jpg",
+        "arm": "assets/textures/concrete_wall_007/concrete_wall_007_arm_1k.jpg"
+      }
+    }
+  }
+}

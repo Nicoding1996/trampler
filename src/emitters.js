@@ -31,6 +31,14 @@ export class Emitters {
     this.slots = [];
     this.blockReason = "";
 
+    // Owned by the EMITTER RACK module. More emitters and deeper capacitors, but
+    // still finite and still hand-placed -- invariant 2b says automation may delay
+    // the fortress being crippled and must never prevent it, so nothing here ever
+    // removes the recharge limit that makes them a burst of cover rather than a
+    // permanent garrison.
+    this.bonusSlots = 0;
+    this.bonusCharge = 0;
+
     const leg = new THREE.MeshStandardMaterial({
       color: 0x39414a, roughness: 0.6, metalness: 0.5,
     });
@@ -38,7 +46,12 @@ export class Emitters {
       color: 0x123945, emissive: 0x49d8ff, emissiveIntensity: 1.4, roughness: 0.4,
     });
 
-    for (let i = 0; i < CFG.emitters.max; i++) {
+    // Enough hardware for a fully racked fortress, built up front. Allocating
+    // meshes when a module is fitted would mean touching the scene graph mid-run
+    // from a purchase path, which is exactly where a leak hides.
+    const built = CFG.emitters.max + CFG.fortress.sockets * CFG.fortress.emitterSlots;
+
+    for (let i = 0; i < built; i++) {
       const group = new THREE.Group();
 
       const base = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.5, 0.18, 10), leg);
@@ -50,9 +63,26 @@ export class Emitters {
       post.castShadow = true;
       group.add(post);
 
-      const head = new THREE.Mesh(new THREE.SphereGeometry(0.26, 12, 8), coil);
+      // Cloned per emitter, not shared. Coil brightness is this emitter's own
+      // charge readout, and on a shared material the last one written every frame
+      // set the brightness for all of them -- so a dry emitter looked full if any
+      // other one was.
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.26, 12, 8), coil.clone());
       head.position.y = 1.5;
       group.add(head);
+
+      // No real light per emitter, and that is a measured decision rather than a
+      // shortcut.
+      //
+      // A point light each looked right and cost badly: nine of them, and every
+      // light in the scene is per-pixel work in EVERY MeshStandardMaterial shader,
+      // while changing how many exist forces every material to recompile -- so
+      // deploying an emitter caused a visible hitch as well as a permanent frame
+      // cost. Sixteen lights was most of why the first build ran slowly.
+      //
+      // The coil is emissive and the bloom pass turns that into a glow, which is
+      // how this is normally done and costs nothing per pixel. The player still
+      // sees where their cover is; the sand under it just is not literally lit.
 
       group.visible = false;
       trampler.group.add(group);
@@ -88,8 +118,18 @@ export class Emitters {
     return n;
   }
 
+  /** How many the crew can have out at once, including the rack module. */
+  get capacity() {
+    return CFG.emitters.max + this.bonusSlots;
+  }
+
+  /** Capacitor depth per emitter, including the rack module. */
+  get maxCharge() {
+    return CFG.emitters.charge + this.bonusCharge;
+  }
+
   get available() {
-    return CFG.emitters.max - this.deployedCount;
+    return this.capacity - this.deployedCount;
   }
 
   /** World position of a live emitter's coil. */
@@ -147,7 +187,7 @@ export class Emitters {
     slot.group.visible = true;
     slot.live = true;
     slot.cd = 0;
-    slot.charge = CFG.emitters.charge; // deploys with a full bank
+    slot.charge = this.maxCharge; // deploys with a full bank
     return slot;
   }
 
@@ -199,10 +239,10 @@ export class Emitters {
       if (!slot.live) continue;
 
       slot.cd -= dt;
-      slot.charge = Math.min(cfg.charge, slot.charge + cfg.recharge * dt);
+      slot.charge = Math.min(this.maxCharge, slot.charge + cfg.recharge * dt);
 
       // Coil brightness is the charge readout: bright and full, dim and dry.
-      slot.head.material.emissiveIntensity = 0.25 + (slot.charge / cfg.charge) * 1.5;
+      slot.head.material.emissiveIntensity = 0.25 + (slot.charge / this.maxCharge) * 1.5;
 
       if (slot.cd > 0 || slot.charge < 1) continue;
 

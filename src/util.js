@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { tileBoxUVs } from "./look.js";
 
 /** Axis-aligned box collider. Used in world space or in Trampler-local space. */
 export function box(minX, minY, minZ, maxX, maxY, maxZ, tag = "") {
@@ -9,10 +10,21 @@ export function box(minX, minY, minZ, maxX, maxY, maxZ, tag = "") {
   };
 }
 
-/** Build a mesh that exactly matches a collider box. */
-export function boxToMesh(b, material) {
+/**
+ * Build a mesh that exactly matches a collider box.
+ *
+ * `tile` is the size in metres of one repeat of whatever texture the material
+ * carries. It matters more than it looks: BoxGeometry maps every face to 0..1, so
+ * without this a 26 m hull and a 1.2 m crate sharing a material show the same
+ * number of texture repeats -- the hull smeared, the crate a photograph. Passing
+ * the real dimensions through makes texel density constant across the whole
+ * fortress, which is most of the difference between "textured" and "finished".
+ */
+export function boxToMesh(b, material, tile = 2.0) {
   const size = new THREE.Vector3().subVectors(b.max, b.min);
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(size.x, size.y, size.z), material);
+  const geo = new THREE.BoxGeometry(size.x, size.y, size.z);
+  tileBoxUVs(geo, size.x, size.y, size.z, tile);
+  const mesh = new THREE.Mesh(geo, material);
   mesh.position.set(
     (b.min.x + b.max.x) / 2,
     (b.min.y + b.max.y) / 2,

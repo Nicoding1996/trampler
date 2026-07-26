@@ -75,6 +75,14 @@ export class Player {
     this.timeSinceHurt = 99;
     this.spawnGrace = 0;
     this.deaths = 0;
+    // Incoming damage multiplier, owned by the economy's kinetic weave. 1 is
+    // unarmoured. Hyperbolic on the economy's side so it can never reach zero:
+    // the ground having a cost is half the pillar.
+    this.damageScale = 1;
+    // Counters for the mixer and the camera. Polled rather than pushed, so the
+    // controller stays unaware that either exists.
+    this.hurtCount = 0;
+    this.lastHurt = 0;
 
     this.grapple = null;   // assigned by main, checked for velocity override
     this.station = null;   // a manned mount takes over movement and the trigger
@@ -473,9 +481,12 @@ export class Player {
 
   hurt(amount) {
     if (this.hp <= 0 || this.spawnGrace > 0) return;
-    this.hp -= amount;
+    const taken = amount * this.damageScale;
+    this.hp -= taken;
     this.timeSinceHurt = 0;
     this.dip = Math.max(this.dip, 0.1);
+    this.hurtCount++;
+    this.lastHurt = taken;
 
     if (this.hp <= 0) {
       // Instant respawn on the deck, deliberately cheap for a feel test. A real

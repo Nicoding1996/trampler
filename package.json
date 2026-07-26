@@ -3,10 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Grey-box prototype: walking on a moving kinematic platform, and grappling back onto it.",
+  "description": "First-person prototype: a crew, a walking fortress, and a roguelike siege you can ride or fight beneath.",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check src/main.js"
+    "check": "node --check src/main.js",
+    "verify": "node verify.mjs",
+    "audit": "node tools/audit.mjs",
+    "cost": "node tools/scene-cost.mjs",
+    "imports": "node tools/check-imports.mjs",
+    "smoke": "node tools/smoke-serve.mjs",
+    "diff": "node tools/diff-runs.mjs",
+    "assets": "node tools/fetch-assets.mjs"
   },
   "dependencies": {
     "three": "0.170.0"

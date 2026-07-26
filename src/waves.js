@@ -1,5 +1,5 @@
 import { CFG } from "./config.js";
-import { CHEWER, CLIMBER } from "./enemies.js";
+import { CHEWER, CLIMBER, BULWARK, BURROWER, SAPPER, TITAN } from "./enemies.js";
 import { makeRandom } from "./util.js";
 
 // Wave director, built on the pacing model Left 4 Dead uses: build up, sustain
@@ -36,6 +36,11 @@ export class Director {
     this.player = player;
     this.seed = seed;
 
+    // Set by the Run when there is one. Absent, the director behaves exactly as it
+    // did before the run structure existed -- one siege, no modifiers, no boss --
+    // which is what keeps it usable on its own in a test.
+    this.run = null;
+
     this.reset();
   }
 
@@ -45,21 +50,40 @@ export class Director {
     // stream would make two attempts at "wave 4" different fights.
     this.random = makeRandom(this.seed);
 
-    this.wave = 0;
     this.elapsed = 0;
-    this.phase = PHASE.REST;
-    this.timer = CFG.waves.firstDelay;
-    this.queue = 0;
-    this.queueClimbers = 0;
-    this.spawnAccum = 0;
-    this.arcOffset = 0;
-    this.forced = false;
 
     // How many waves the crew has actually SEEN OFF. Not the same as `wave`:
     // stacking a new wave onto an unresolved one with Q means the first never
     // resolves on its own, so it never pays. The economy polls this counter rather
     // than being handed a callback, so the director stays unaware it exists.
+    //
+    // Deliberately NOT rewound by resetSiege: it accumulates across a whole run,
+    // because the economy pays per resolved wave and rewinding it would pay for
+    // the same waves twice at every landmark.
     this.resolved = 0;
+
+    // Overridable by the Run, since the boss landmark is a shorter siege.
+    this.siegeLength = CFG.waves.siegeLength;
+
+    this.resetSiege(CFG.waves.firstDelay);
+  }
+
+  /**
+   * Start a fresh siege, keeping the elapsed clock and the resolved count.
+   *
+   * The clock keeps running on purpose. Difficulty scales with elapsed time as the
+   * anti-stall valve, and rewinding it at every landmark would let a slow crew
+   * farm a whole biome at wave-one difficulty.
+   */
+  resetSiege(firstDelay = CFG.waves.minRest) {
+    this.wave = 0;
+    this.phase = PHASE.REST;
+    this.timer = firstDelay;
+    this.queueTypes = [];
+    this.queue = 0;
+    this.spawnAccum = 0;
+    this.arcOffset = 0;
+    this.forced = false;
 
     // Was the wave currently in play summoned early? Stays true until the next
     // wave begins, so the payout for resolving it still counts as part of the
@@ -89,9 +113,13 @@ export class Director {
       && this.horde.liveCount <= CFG.waves.holdUntilCleared;
   }
 
-  /** Enemy health multiplier from time survived. The anti-stall valve. */
+  /**
+   * Enemy health multiplier: time survived, times whatever roads the crew took to
+   * get here. The road term is cumulative across a run, so an early greedy choice
+   * is a commitment for the rest of the biome rather than one hard wave.
+   */
   hpScale() {
-    return 1 + this.elapsed / CFG.waves.hpRamp;
+    return (1 + this.elapsed / CFG.waves.hpRamp) * (this.run?.threatScale ?? 1);
   }
 
   get spawning() {
@@ -115,16 +143,21 @@ export class Director {
     return this.arcOffset > 0 ? "OFF THE STARBOARD BOW" : "OFF THE PORT BOW";
   }
 
-  /**
-   * Bring the next wave now. Available from any phase except mid-release, and it
-   * deliberately skips the preparation window -- getting no time to set up is the
-   * price of choosing to stack.
-   */
   /** Has the siege been held to its full length? */
   get held() {
     return this.phase === PHASE.HELD;
   }
 
+  /** Is the wave about to arrive the boss? Used by the telegraph. */
+  get nextIsBoss() {
+    return !!this.run?.isBossWave(this.wave + 1);
+  }
+
+  /**
+   * Bring the next wave now. Available from any phase except mid-release, and it
+   * deliberately skips the preparation window -- getting no time to set up is the
+   * price of choosing to stack.
+   */
   callEarly() {
     if (this.phase === PHASE.SPAWNING || this.phase === PHASE.HELD) return false;
     this.forced = true;
@@ -145,17 +178,78 @@ export class Director {
     this.#pickBearing();
   }
 
-  #startWave() {
+  /** Deterministic Fisher-Yates, so a wave's arrival order replays exactly. */
+  #shuffle(list) {
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = (this.random() * (i + 1)) | 0;
+      const t = list[i];
+      list[i] = list[j];
+      list[j] = t;
+    }
+    return list;
+  }
+
+  /**
+   * Decide exactly what a wave is made of.
+   *
+   * Specials SUBSTITUTE for chewers rather than adding to the total. The wave-size
+   * curve was tuned against measured pacing, and growing it at the same time as
+   * changing its composition moves two variables at once -- after which no
+   * difficulty change can be attributed to either. Road modifiers are the one
+   * thing allowed to change the count, and they are explicit about it.
+   *
+   * Waves one and two are chewers and climbers only. Those are the two pressures
+   * the whole design rests on and they deserve to be learned without noise.
+   */
+  buildWave(wave) {
     const w = CFG.waves;
+    const c = CFG.enemies.composition;
+    const count = Math.max(
+      1,
+      w.baseCount + w.perWave * (wave - 1) + (this.run?.extraCount ?? 0),
+    );
+
+    const types = [];
+    const push = (type, n) => {
+      for (let i = 0; i < n; i++) types.push(type);
+    };
+
+    const ramp = (from, every, max) =>
+      wave < from ? 0 : Math.min(max, 1 + Math.floor((wave - from) / every));
+
+    push(CLIMBER, Math.round(count * w.climberShare));
+    push(BURROWER, wave >= c.burrowerFromWave ? Math.round(count * c.burrowerShare) : 0);
+    push(BULWARK, ramp(c.bulwarkFromWave, c.bulwarkEvery, c.bulwarkMax));
+    push(SAPPER, ramp(c.sapperFromWave, c.sapperEvery, c.sapperMax));
+    // Chewers make up the remainder. They are the floor of the wave, so if the
+    // specials ever grew past the count this would go to zero rather than
+    // negative -- and the wave would stop containing the type the under-hull
+    // arena is built around, which is why the ramps above are capped.
+    push(CHEWER, Math.max(0, count - types.length));
+
+    this.#shuffle(types);
+
+    if (this.run?.isBossWave(wave)) {
+      // The titan IS the wave. Keeping the full escort alongside it turns the
+      // climax into a crowd-control problem you cannot see through, and dropping
+      // the escort entirely turns it into a duel that throws away every system
+      // except shooting.
+      types.length = Math.max(1, Math.round(types.length * CFG.run.bossWaveScale));
+      types.push(TITAN); // released first, since the queue pops from the end
+    }
+
+    return types;
+  }
+
+  #startWave() {
     // Captured before `forced` is cleared: this is what the economy pays a bonus
     // against, and it is the only record that this wave was a gamble.
     this.calledEarly = this.forced;
     this.forced = false;
     this.wave++;
 
-    const count = w.baseCount + w.perWave * (this.wave - 1);
-    this.queueClimbers = Math.round(count * w.climberShare);
-    this.queue = count;
+    this.queueTypes = this.buildWave(this.wave);
+    this.queue = this.queueTypes.length;
     this.spawnAccum = 0;
     this.phase = PHASE.SPAWNING;
   }
@@ -163,20 +257,28 @@ export class Director {
   #release(dt) {
     this.spawnAccum += dt * CFG.waves.spawnRate;
 
-    while (this.spawnAccum >= 1 && this.queue > 0) {
+    while (this.spawnAccum >= 1 && this.queueTypes.length > 0) {
       this.spawnAccum -= 1;
 
-      // Interleave climbers through the wave so both pressures arrive together.
-      const wantClimber = this.queueClimbers > 0
-        && this.random() < this.queueClimbers / this.queue;
+      const type = this.queueTypes[this.queueTypes.length - 1];
+      // The boss is authored, not ramped. A boss whose health scales with how
+      // long you took makes both stalling and rushing wrong for unrelated
+      // reasons, and it is the one fight whose numbers should be legible enough
+      // to plan a build around.
+      const scale = type === TITAN ? 1 : this.hpScale();
 
-      if (wantClimber) {
-        if (this.horde.spawn(CLIMBER, this.hpScale(), this.arcOffset)) this.queueClimbers--;
+      if (this.horde.spawn(type, scale, this.arcOffset)) {
+        this.queueTypes.pop();
       } else {
-        this.horde.spawn(CHEWER, this.hpScale(), this.arcOffset);
+        // Pool full. Hand the budget back and try again next frame rather than
+        // silently dropping an enemy, which would make wave size depend on how
+        // crowded the field happened to be.
+        this.spawnAccum += 1;
+        break;
       }
-      this.queue--;
     }
+
+    this.queue = this.queueTypes.length;
   }
 
   update(dt) {
@@ -201,7 +303,7 @@ export class Director {
 
       case PHASE.SPAWNING:
         this.#release(dt);
-        if (this.queue <= 0) this.phase = PHASE.ENGAGED;
+        if (this.queueTypes.length <= 0) this.phase = PHASE.ENGAGED;
         break;
 
       case PHASE.ENGAGED:
@@ -218,7 +320,7 @@ export class Director {
           // Resolving the last wave of the siege ends it. Without a finish line
           // this is an endless fight, and losing on wave 4 reads as failure rather
           // than as nearly holding -- there is nothing being reached.
-          if (this.wave >= w.siegeLength) {
+          if (this.wave >= this.siegeLength) {
             this.phase = PHASE.HELD;
             this.timer = 0;
           } else {
@@ -229,7 +331,9 @@ export class Director {
         break;
 
       case PHASE.HELD:
-        // Terminal. The siege is won; nothing else is coming.
+        // Terminal until something outside asks for another siege. The Run offers
+        // roads here; nothing advances on a timer, because finishing should be a
+        // state you get to sit in rather than one the game clears for you.
         break;
     }
   }
