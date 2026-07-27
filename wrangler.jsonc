@@ -1,0 +1,18 @@
+{
+  // A static-assets-only Worker: no "main", because there is no server-side code
+  // to run. Cloudflare serves the files and nothing else executes.
+  "name": "trampler",
+  "compatibility_date": "2026-07-27",
+
+  // The repo root, because index.html lives there and the importmap resolves
+  // "/vendor/..." and "/assets/..." against the site root. Serving a subdirectory
+  // would break both, and there is no build step to assemble one.
+  //
+  // This does publish the whole tree -- the harness, the steering notes, the
+  // config -- which is the same property the local server has and the reason that
+  // one is bound to loopback. It is fine here only because the repo is already
+  // public and carries no secrets.
+  "assets": {
+    "directory": "./"
+  }
+}
