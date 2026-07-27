@@ -5237,6 +5237,32 @@ console.log("\n83. The particle and viewmodel layer runs against the real sim");
     sim.guns[0].dismount(sim.player);
     viewmodel.update(DT, ctx);
     ok("then comes back", viewmodel.group.visible);
+
+    // One model per carried weapon, exactly one drawn, and a swap changes WHICH one.
+    //
+    // This matters more than it looks. The silhouette in the player's hands is the
+    // only readout for which weapon is up -- there is deliberately no HUD row, because
+    // invariant 27 is about panels accumulating and a shape is a better teacher than a
+    // label anyway. So a swap that changed the numbers and not the model would be a
+    // lie with nothing else in the game to contradict it, and the harness cannot see a
+    // rendered frame. Counting visibility flags is the closest honest proxy.
+    ok("there is a model for every carried weapon",
+      viewmodel.models.length === CFG.combat.loadout.carried.length,
+      `${viewmodel.models.length} models for ${CFG.combat.loadout.carried.length} carried`);
+    const drawn = () => viewmodel.models.filter((m) => m.visible).length;
+    ok("exactly one of them is drawn", drawn() === 1, `${drawn()} visible`);
+
+    const wasShowing = viewmodel.models.findIndex((m) => m.visible);
+    sim.weapon.swap();
+    viewmodel.update(DT, ctx);
+    const nowShowing = viewmodel.models.findIndex((m) => m.visible);
+    ok("and swapping the weapon swaps the silhouette, not just the numbers",
+      nowShowing !== wasShowing && nowShowing === sim.weapon.slot && drawn() === 1,
+      `model ${wasShowing} -> ${nowShowing}, holding ${sim.weapon.weaponName}`);
+    ok("the swapped-to weapon has a name and a line the toast can print",
+      typeof sim.weapon.weaponName === "string" && sim.weapon.weaponName.length > 0
+      && typeof sim.weapon.profile.detail === "string",
+      `"${sim.weapon.weaponName}" — ${sim.weapon.profile.detail}`);
   }
 
   delete globalThis.document;
@@ -7680,6 +7706,545 @@ console.log("\n99. A pick arrives often enough to actually reach");
   ok("and it did not buy a refit with the same press",
     keyed.economy.purchases === 1 && keyed.economy.salvage === 0,
     `${keyed.economy.purchases} purchases, ${keyed.economy.salvage} salvage`);
+}
+
+// ---------------------------------------------------------------------------
+/**
+ * Cycle the carried weapon until `profile` is in hand, and clear the swap's
+ * cooldown so a test measuring damage is not also measuring the swap.
+ *
+ * Deliberately drives the real `swap()` rather than assigning `weapon.profile`,
+ * because a test that sets the field itself would pass even if the cycle could
+ * never reach the second weapon -- which is the whole mechanism.
+ */
+function hold(weapon, profile) {
+  for (let i = 0; i <= weapon.profiles.length && weapon.profile !== profile; i++) {
+    weapon.swap();
+  }
+  weapon.cooldown = 0;
+  return weapon.profile === profile;
+}
+
+// ---------------------------------------------------------------------------
+// The second weapon, and the claim it has to earn: it is a POSITION, not a tier.
+//
+// The failure mode a weapon axis invites is power creep wearing a costume -- add a
+// gun that is simply better and the "choice" is a formality, exactly as four numeric
+// multipliers were a formality before the salvage table. So the assertions here are
+// mostly about what the sweeper is WORSE at, because that is the half that makes
+// carrying it a decision.
+//
+// The falloff is measured rather than declared, and it is measured through the real
+// hitscan path at three ranges with the rifle firing at the same target first. That
+// last part is the non-vacuity guard and it is not optional: "few pellets landed at
+// 26 m" would pass just as happily if a rock were in the way, and this scene has
+// merged scatter geometry in it.
+console.log("\n100. The sweeper is a POSITION, not an upgrade");
+{
+  const rifleP = CFG.combat.weapon;
+  const sweepP = CFG.combat.scatter;
+
+  {
+    const sim = makeSim();
+    const { weapon } = sim;
+    ok("the operative carries more than one weapon (test is not vacuous)",
+      weapon.profiles.length >= 2 && weapon.profile === rifleP,
+      `${weapon.profiles.length} carried, starting on ${weapon.weaponName}`);
+    ok("the swap cycle actually reaches the second one", hold(weapon, sweepP),
+      `now holding ${weapon.weaponName}`);
+
+    // A free instant swap is what would make "carry both" strictly better than
+    // choosing, so the swap borrows the fire cooldown.
+    weapon.cooldown = 0;
+    weapon.swap();
+    ok("and a swap is not free -- it borrows the fire cooldown",
+      weapon.cooldown >= CFG.combat.loadout.swapTime - 1e-9,
+      `${weapon.cooldown.toFixed(2)} s before the next shot`);
+
+    // The consequence worth pinning: you cannot fire the slow weapon and then dodge
+    // its recovery by switching off it.
+    weapon.cooldown = 1 / sweepP.fireRate;
+    const carried = weapon.cooldown;
+    weapon.swap();
+    ok("and switching does not shake off the slow weapon's recovery",
+      weapon.cooldown >= carried - 1e-9,
+      `${weapon.cooldown.toFixed(2)} s carried across the swap`);
+  }
+
+  // ---- the falloff, through the real shot path
+  const atRange = (range) => {
+    const s = makeSim();
+    placeOnGroundAt(s, 0, -40);
+    const e = s.horde.spawn(CHEWER);
+    e.x = s.player.position.x;
+    e.z = s.player.position.z - range;
+    e.y = enemyCfg(CHEWER).height / 2;
+    e.hp = 1e7; // keep it alive so every pellet of every blast is counted
+    aimAt(s.player, new THREE.Vector3(e.x, e.y, e.z));
+
+    const mean = (profile, pulls) => {
+      hold(s.weapon, profile);
+      let dealt = 0;
+      for (let i = 0; i < pulls; i++) {
+        const before = e.hp;
+        s.weapon.fire();
+        dealt += before - e.hp;
+      }
+      return dealt / pulls;
+    };
+    const rifle = mean(rifleP, 8);
+    const sweeper = mean(sweepP, 24);
+    return { rifle, sweeper, pellets: sweeper / sweepP.damage };
+  };
+
+  const near = atRange(4);
+  const mid = atRange(12);
+  const far = atRange(26);
+
+  for (const [label, m] of [["4 m", near], ["12 m", mid], ["26 m", far]]) {
+    ok(`the line of fire is genuinely clear at ${label} (test is not vacuous)`,
+      m.rifle > 0, `a rifle round still deals ${m.rifle.toFixed(1)} there`);
+  }
+
+  // Measured 9.0 -> 5.8 -> 1.1 pellets. The middle one is bounded on BOTH sides on
+  // purpose: the under-hull arena is roughly 16 m across, so a weapon meant to own
+  // that space has to still work at 12 m, and a weapon that works too well at 12 m
+  // has stopped being position-coded and become a rifle with a bigger number.
+  //
+  // The first version of this asserted mid < near * 0.6 on the strength of arithmetic
+  // I did in my head, and it failed at 5.8 against a 5.4 bar. The falloff was real;
+  // the estimate of a chewer's hit box was not. Recording that because the temptation
+  // was to move the bar to 0.65 and call it green.
+  ok("point blank, nearly the whole pattern lands",
+    near.pellets >= sweepP.pellets * 0.75,
+    `${near.pellets.toFixed(1)} of ${sweepP.pellets} pellets at 4 m`);
+  ok("it still works across the width of the under-hull arena",
+    mid.pellets >= sweepP.pellets * 0.4 && mid.pellets <= sweepP.pellets * 0.8,
+    `${mid.pellets.toFixed(1)} of ${sweepP.pellets} pellets at 12 m`);
+  ok("and out where the deck fights it is plainly the wrong tool",
+    far.pellets <= sweepP.pellets * 0.25,
+    `${far.pellets.toFixed(1)} of ${sweepP.pellets} pellets at 26 m`);
+  ok("so the pattern opens monotonically rather than falling off a cliff",
+    near.pellets > mid.pellets && mid.pellets > far.pellets,
+    `${near.pellets.toFixed(1)} -> ${mid.pellets.toFixed(1)} -> ${far.pellets.toFixed(1)}`);
+
+  // ---- and it is not a straight upgrade even at contact range
+  const rifleDps = rifleP.damage * rifleP.fireRate;
+  const sweepDps = sweepP.damage * sweepP.pellets * sweepP.fireRate;
+  ok("single-target throughput does NOT beat the rifle, even point blank",
+    sweepDps < rifleDps,
+    `${sweepDps.toFixed(0)} dps against the rifle's ${rifleDps.toFixed(0)}`);
+
+
+  // ---- what it actually buys, which is NOT crowd clear
+  //
+  // The obvious claim for a shotgun is that one pull kills several bodies, and it was
+  // asserted here first and FAILED: two chewers a metre apart at 5 m, one died. The
+  // cone is 0.55 m across at that range and a chewer's hit box is about 1.06 m, so the
+  // two overlapped and the near one shadowed the far one. A nine-pellet cone at
+  // contact range is narrower than a single target.
+  //
+  // That is worth keeping as a comment because the intuition is so strong and so
+  // wrong, and because the config comment had already been written on the strength of
+  // it -- a number defended only by prose is not defended.
+  //
+  // So the advantage is measured where it actually lives: how far off-centre you can
+  // be and still connect. That is the thing that matters with something chewing on
+  // you, and it is the honest reason to bring this down a ladder.
+  const slack = (profile) => {
+    const s = makeSim();
+    placeOnGroundAt(s, 0, -40);
+    hold(s.weapon, profile);
+    const e = s.horde.spawn(CHEWER);
+    e.x = s.player.position.x;
+    e.z = s.player.position.z - 5;
+    e.y = enemyCfg(CHEWER).height / 2;
+    e.hp = 1e7;
+
+    let widest = 0;
+    for (let off = 0; off <= 3.0; off += 0.05) {
+      for (let i = 0; i < 14; i++) {
+        const before = e.hp;
+        aimAt(s.player, new THREE.Vector3(e.x + off, e.y, e.z));
+        s.weapon.fire();
+        if (e.hp < before) { widest = off; break; }
+      }
+    }
+    return widest;
+  };
+
+  const rifleSlack = slack(rifleP);
+  const sweepSlack = slack(sweepP);
+  const coneRadius = sweepP.spread * 5; // metres across at the 5 m test range
+
+  ok("both weapons connect dead on (test is not vacuous)",
+    rifleSlack > 0 && sweepSlack > 0,
+    `rifle tolerates ${rifleSlack.toFixed(2)} m off-centre, sweeper ${sweepSlack.toFixed(2)} m`);
+  ok("the cone buys roughly its own radius in aim slack, which is the real trade",
+    sweepSlack - rifleSlack >= coneRadius * 0.6,
+    `+${(sweepSlack - rifleSlack).toFixed(2)} m against a ${coneRadius.toFixed(2)} m cone radius`);
+  ok("one trigger pull removes a chewer where the rifle needs a burst",
+    sweepP.damage * sweepP.pellets >= CFG.enemies.chewer.hp
+    && rifleP.damage < CFG.enemies.chewer.hp,
+    `${sweepP.damage * sweepP.pellets} per pull against ${CFG.enemies.chewer.hp} hp,`
+    + ` where a rifle round is ${rifleP.damage}`);
+}
+
+// ---------------------------------------------------------------------------
+// Invariant 1, re-asserted against the thing that could plausibly break it.
+//
+// Section 12 fires single rays straight down. The whole point of a nine-pellet cone
+// is that it covers angles one ray does not, and the tempting assumption is that a
+// rule proven for a ray holds for a spread. It does -- every pellet goes through
+// `shootFrom` and gets its own clip -- but "it does because of how I wrote it" is
+// exactly the class of claim this project keeps finding to be wrong, so it is
+// measured across the whole depression range rather than argued.
+console.log("\n101. A nine-pellet cone still cannot reach beneath the hull");
+{
+  const sim = makeSim();
+  const { player, trampler, horde, weapon } = sim;
+  ok("holding the sweeper on the deck", hold(weapon, CFG.combat.scatter));
+
+  const chewer = horde.spawn(CHEWER);
+  const legLocal = trampler.legs[0].userData;
+  const parkChewer = () => {
+    const at = trampler.legAttackWorld(0, new THREE.Vector3());
+    chewer.x = at.x;
+    chewer.y = at.y;
+    chewer.z = at.z;
+    return at;
+  };
+
+  player.position.copy(trampler.localToWorld(
+    new THREE.Vector3(legLocal.side * CFG.enemies.chewer.inboardOffset, 1.0, legLocal.z),
+  ));
+  player.base = trampler;
+  player.velocity.set(0, 0, 0);
+  step(sim, 10);
+
+  const hitsBefore = weapon.hits;
+  const shotsBefore = weapon.shots;
+  // Straight down, then swept up through the depression range, because a cone's
+  // outermost pellets leave at an angle the centre ray never takes.
+  const blasts = 12;
+  for (let i = 0; i < blasts; i++) {
+    player.pitch = -Math.PI / 2 + (i / (blasts - 1)) * 0.6;
+    parkChewer();
+    weapon.fire();
+  }
+
+  ok("every pellet of every blast was actually fired (test is not vacuous)",
+    weapon.shots - shotsBefore === blasts * CFG.combat.scatter.pellets,
+    `${weapon.shots - shotsBefore} pellets over ${blasts} blasts`);
+  ok("not one of them reached the chewer under the hull",
+    weapon.hits === hitsBefore, `${weapon.hits - hitsBefore} hits`);
+  ok("the chewer is untouched", chewer.alive && chewer.hp === chewer.maxHp,
+    `${chewer.hp.toFixed(0)} / ${chewer.maxHp.toFixed(0)} hp`);
+
+  // And the other half of the claim: down there it is the right tool, which is what
+  // makes the trip worth making rather than merely mandatory.
+  placeOnGroundAt(sim, 0.2, legLocal.z);
+  const target = parkChewer();
+  aimAt(player, target);
+  parkChewer();
+  weapon.fire();
+  ok("but from underneath, one blast settles it -- the reason to bring it down",
+    !chewer.alive,
+    chewer.alive ? `${chewer.hp.toFixed(0)} hp left` : "killed by a single trigger pull");
+}
+
+// ---------------------------------------------------------------------------
+// Invariant 8b, checked in the direction that would quietly undo it.
+//
+// The bulwark exists to give the deck gun a recurring job, and its answer on foot is
+// POSITIONAL -- get behind it. A close-range weapon is exactly the sort of addition
+// that could hand the rifle's problem a new solution by accident, so the question is
+// not "is the sweeper good against armour" but "does it ever become the answer".
+//
+// It does not, and the reason is arithmetic nobody had to write: nine 12-damage
+// pellets each meet the 20 armour separately and each get floored to 2.4 by
+// minDamageFraction, so a blast does 21.6 rather than 108. Note what was NOT
+// asserted here -- the flank multiplier is x5.0 for both weapons, because
+// afterArmour(25, 20) is max(5, 5) and the two terms happen to coincide. Claiming a
+// bigger swing for the sweeper looked obviously true and is false.
+console.log("\n102. The sweeper never becomes the answer to armour");
+{
+  const armour = CFG.enemies.bulwark.armour;
+  const sweepP = CFG.combat.scatter;
+  const rifleP = CFG.combat.weapon;
+
+  const perPellet = afterArmour(sweepP.damage, armour);
+  const perBlast = perPellet * sweepP.pellets;
+  const perRound = afterArmour(rifleP.damage, armour);
+
+  ok("each pellet meets the plate on its own and is floored, not summed against it",
+    Math.abs(perPellet - sweepP.damage * CFG.enemies.minDamageFraction) < 1e-9,
+    `${perPellet.toFixed(1)} of ${sweepP.damage} per pellet gets through`);
+  ok("nothing is immune, so a blast is a wrong tool rather than a wall",
+    perBlast > 0, `${perBlast.toFixed(1)} per blast`);
+  ok("head-on it is WORSE than the rifle, so the plate keeps its job",
+    perBlast * sweepP.fireRate < perRound * rifleP.fireRate,
+    `${(perBlast * sweepP.fireRate).toFixed(0)} dps against the rifle's `
+    + `${(perRound * rifleP.fireRate).toFixed(0)}`);
+  ok("and from behind it is still no better, so armour never becomes its speciality",
+    sweepP.damage * sweepP.pellets * sweepP.fireRate < rifleP.damage * rifleP.fireRate,
+    `${(sweepP.damage * sweepP.pellets * sweepP.fireRate).toFixed(0)} dps unarmoured`
+    + ` against the rifle's ${(rifleP.damage * rifleP.fireRate).toFixed(0)}`);
+  ok("the flank is still worth walking round for, even with this in hand",
+    (sweepP.damage * sweepP.pellets) / perBlast >= 4,
+    `x${((sweepP.damage * sweepP.pellets) / perBlast).toFixed(1)} from behind`);
+
+  // Live, through the real path, with the orientation pinned. Two shipped tests once
+  // fired into a bulwark's back without knowing it, so the facing is asserted before
+  // anything is concluded from it.
+  const sim = makeSim();
+  const { player, horde, weapon } = sim;
+  placeOnGroundAt(sim, 0, -30);
+  ok("holding the sweeper for the live armour check", hold(weapon, sweepP));
+
+  const b = horde.spawn(BULWARK);
+  b.x = player.position.x;
+  b.z = player.position.z - 5;
+  b.y = enemyCfg(BULWARK).height / 2;
+
+  const faceAt = (e, x, z) => { e.yaw = Math.atan2(-(x - e.x), -(z - e.z)); };
+  const shotDir = (e) => new THREE.Vector3(e.x, e.y, e.z)
+    .sub(player.eyePosition(new THREE.Vector3())).normalize();
+
+  aimAt(player, new THREE.Vector3(b.x, b.y, b.z));
+  faceAt(b, player.position.x, player.position.z);
+  {
+    const d = shotDir(b);
+    ok("the bulwark is genuinely facing the muzzle (test is not vacuous)",
+      armourAt(CFG.enemies.bulwark, b.yaw, d.x, d.z) === armour,
+      `meets ${armourAt(CFG.enemies.bulwark, b.yaw, d.x, d.z)} of ${armour} head-on`);
+  }
+  let hp = b.hp;
+  weapon.fire();
+  const frontal = hp - b.hp;
+
+  faceAt(b, b.x + (b.x - player.position.x), b.z + (b.z - player.position.z));
+  {
+    const d = shotDir(b);
+    ok("and then genuinely turned away (test is not vacuous)",
+      armourAt(CFG.enemies.bulwark, b.yaw, d.x, d.z) === 0,
+      `meets ${armourAt(CFG.enemies.bulwark, b.yaw, d.x, d.z)} of ${armour} from behind`);
+  }
+  hp = b.hp;
+  weapon.fire();
+  const rear = hp - b.hp;
+
+  ok("a live blast into the plate is soaked",
+    frontal > 0 && frontal <= sweepP.damage * sweepP.pellets * 0.3,
+    `${frontal.toFixed(1)} of a possible ${sweepP.damage * sweepP.pellets}`);
+  ok("and a live blast into its back is several times as much",
+    rear >= frontal * 3, `${rear.toFixed(1)} from behind vs ${frontal.toFixed(1)} head-on`);
+}
+
+// ---------------------------------------------------------------------------
+// Invariant 8a: the readout has to agree with what a shot would actually do.
+//
+// This is the clause a second weapon breaks silently. `scanTarget` used to read the
+// rifle's 220 m unconditionally, so carrying a 40 m weapon would have had the
+// crosshair confidently name and range a target five times further than any pellet
+// could reach -- and the crosshair is the only thing that teaches a player their tool
+// is wrong rather than the game being broken.
+//
+// It has two sides and both need asserting, because a readout that simply stopped
+// working would pass the first half on its own.
+console.log("\n103. The aim readout reports the weapon actually in your hands");
+{
+  const sim = makeSim();
+  const { player, horde, weapon, guns, trampler } = sim;
+  const sweepP = CFG.combat.scatter;
+  const beyond = sweepP.range + 40;
+
+  // Staged in clear air rather than on the sand, and that is a correction the check
+  // made itself. The first version stood on the pan and put the target 80 m along it;
+  // the non-vacuity assertion below reported the RIFLE naming nothing at all, because
+  // the world's merged rock scatter lives inside the patrol ring and something was in
+  // the way. The subject here is the scan's range clamp, which is pure geometry, so
+  // the honest fix is to remove the variable rather than to widen the assertion.
+  player.position.set(0, 40, 0);
+  player.base = null;
+  player.velocity.set(0, 0, 0);
+
+  const far = horde.spawn(CLIMBER);
+  far.x = player.position.x;
+  far.y = player.position.y;
+  far.z = player.position.z - beyond;
+  aimAt(player, new THREE.Vector3(far.x, far.y, far.z));
+
+  ok("the rifle reaches it and says so (test is not vacuous)",
+    hold(weapon, CFG.combat.weapon) && weapon.scanTarget() === far,
+    `named at ${weapon.aimDist.toFixed(0)} m, rifle range ${CFG.combat.weapon.range} m`);
+  ok("switching to a 40 m weapon stops the crosshair claiming a target at 80 m",
+    hold(weapon, sweepP) && weapon.scanTarget() === null,
+    `sweeper range ${sweepP.range} m against a target at ${beyond} m`);
+
+  // The other side: the null above must be about REACH, not about the readout having
+  // quietly broken for the sweeper.
+  const close = horde.spawn(CLIMBER);
+  close.x = player.position.x;
+  close.y = player.position.y;
+  close.z = player.position.z - 15;
+  aimAt(player, new THREE.Vector3(close.x, close.y, close.z));
+  ok("and it still names what the sweeper CAN reach, so the null was range",
+    weapon.scanTarget() === close,
+    `named at ${weapon.aimDist.toFixed(0)} m`);
+
+  // Manning a mount hands the trigger to the mount. Scanning at the sidearm's reach
+  // would then blind a 300 m gun because of what is slung on your back.
+  const gun = guns[0];
+  player.position.copy(gun.operatorWorld(new THREE.Vector3()));
+  player.base = trampler;
+  player.velocity.set(0, 0, 0);
+  step(sim, 5);
+  sim.input.presses.add(CFG.deckGun.key);
+  step(sim, 2);
+  ok("manned the mount while still carrying the sweeper (test is not vacuous)",
+    gun.mounted && weapon.profile === sweepP,
+    `station ${gun.mounted ? "manned" : "empty"}, holding ${weapon.weaponName}`);
+  ok("the readout then scans at the MOUNT's reach, not the sidearm's",
+    weapon.triggerProfile === CFG.deckGun,
+    `scanning to ${weapon.triggerProfile.range} m, not ${sweepP.range} m`);
+}
+
+// ---------------------------------------------------------------------------
+// The interaction a second weapon creates, and the reason it gets measured rather
+// than reasoned about: a proc that rolls per HIT now sees NINE hits per trigger pull
+// instead of one.
+//
+// That is the exact shape invariant 2b-i exists for -- an item nobody thinks of as
+// dangerous composing with something else into a multiplier -- and the steering is
+// explicit that a combination is covered by neither system's own test. Risk of Rain
+// needs a per-weapon proc coefficient for precisely this. This project does not, and
+// the reason is worth pinning down rather than being lucky about: ARC CONDUCTOR
+// chains a FRACTION of the damage that triggered it, so nine rolls at 12 damage and
+// one roll at 25 come out proportional to the weapon's own throughput instead of to
+// its hit count.
+//
+// So this is where a future item that deals a FLAT amount per hit would show up as a
+// weapon-dependent multiplier, which is the failure the section is really guarding.
+console.log("\n104. Nine pellets do not multiply the proc layer");
+{
+  const rifleP = CFG.combat.weapon;
+  const sweepP = CFG.combat.scatter;
+
+  // ---- on-HIT: measured as damage a BYSTANDER receives per second of fire.
+  //
+  // The bystander sits 6 m to the side: inside the arc's 9 m reach, and far outside
+  // even the sweeper's cone at this range (0.44 m across at 4 m), so every point of
+  // damage it takes arrived through a chain rather than through a stray pellet.
+  const chainDps = (profile, pulls) => {
+    const s = makeSim();
+    s.economy.stacks.arc = 3; // a high chance, so a finite sample is not mostly zeros
+    s.economy.applyAll();
+    s.trampler.walking = false;
+    s.trampler.turning = false;
+    placeOnGroundAt(s, 0, -40);
+    hold(s.weapon, profile);
+
+    const target = s.horde.spawn(CHEWER);
+    target.x = s.player.position.x;
+    target.z = s.player.position.z - 4;
+    target.y = enemyCfg(CHEWER).height / 2;
+    target.hp = 1e9;
+
+    const bystander = s.horde.spawn(CHEWER);
+    bystander.x = target.x + 6;
+    bystander.z = target.z;
+    bystander.y = target.y;
+    bystander.hp = 1e9;
+
+    aimAt(s.player, new THREE.Vector3(target.x, target.y, target.z));
+    const before = bystander.hp;
+    for (let i = 0; i < pulls; i++) s.weapon.fire();
+
+    return {
+      chained: before - bystander.hp,
+      arcs: s.items.procs.arc,
+      // pulls / fireRate is how many seconds of fire that was.
+      perSecond: (before - bystander.hp) * (profile.fireRate / pulls),
+    };
+  };
+
+  const rifleArc = chainDps(rifleP, 400);
+  const sweepArc = chainDps(sweepP, 200);
+
+  ok("both weapons genuinely rolled arcs (test is not vacuous)",
+    rifleArc.arcs > 0 && sweepArc.arcs > 0 && rifleArc.chained > 0 && sweepArc.chained > 0,
+    `rifle ${rifleArc.arcs} arcs over 400 shots, sweeper ${sweepArc.arcs} over`
+    + ` 200 pulls (${sweepP.pellets * 200} pellets)`);
+  ok("the sweeper rolls far MORE often, because a roll is per hit (not vacuous)",
+    sweepArc.arcs > rifleArc.arcs,
+    `${sweepArc.arcs} rolls vs ${rifleArc.arcs} -- this is the thing that could have`
+    + ` multiplied`);
+  ok("but chained damage per second does not exceed the rifle's",
+    sweepArc.perSecond <= rifleArc.perSecond,
+    `${sweepArc.perSecond.toFixed(0)} dps of chain vs the rifle's`
+    + ` ${rifleArc.perSecond.toFixed(0)}`);
+
+  // And WHY it does not, stated as the relationship rather than as a bare inequality,
+  // so the next person can see which property is load-bearing.
+  const baseRatio = (sweepP.damage * sweepP.pellets * sweepP.fireRate)
+    / (rifleP.damage * rifleP.fireRate);
+  const arcRatio = sweepArc.perSecond / rifleArc.perSecond;
+  ok("it tracks the weapon's own throughput, because the chain shares a FRACTION",
+    Math.abs(arcRatio - baseRatio) <= 0.2,
+    `chain ratio x${arcRatio.toFixed(2)} against a base-damage ratio of`
+    + ` x${baseRatio.toFixed(2)}`);
+
+  // ---- on-KILL: one trigger pull, one kill, one proc. Nine would be the bug.
+  {
+    const s = makeSim();
+    s.economy.stacks.fragment = 1;
+    s.economy.applyAll();
+    s.trampler.walking = false;
+    s.trampler.turning = false;
+    placeOnGroundAt(s, 0, -40);
+    ok("holding the sweeper for the on-kill check", hold(s.weapon, sweepP));
+
+    const victim = s.horde.spawn(CHEWER);
+    victim.x = s.player.position.x;
+    victim.z = s.player.position.z - 4;
+    victim.y = enemyCfg(CHEWER).height / 2;
+
+    // Inside the 4.5 m splash and outside the cone, so the splash has somewhere to
+    // land and cannot be mistaken for a pellet.
+    const neighbour = s.horde.spawn(CHEWER);
+    neighbour.x = victim.x + 2;
+    neighbour.z = victim.z;
+    neighbour.y = victim.y;
+    neighbour.hp = 1e9;
+
+    ok("one blast is enough to kill it outright (test is not vacuous)",
+      sweepP.damage * sweepP.pellets >= victim.maxHp,
+      `${sweepP.damage * sweepP.pellets} per pull against ${victim.maxHp.toFixed(0)} hp`);
+
+    aimAt(s.player, new THREE.Vector3(victim.x, victim.y, victim.z));
+    const neighbourBefore = neighbour.hp;
+    s.weapon.fire();
+
+    ok("it died to that single trigger pull", !victim.alive);
+    ok("and the splash actually went off (test is not vacuous)",
+      neighbour.hp < neighbourBefore,
+      `neighbour took ${(neighbourBefore - neighbour.hp).toFixed(0)}`);
+    ok("but exactly ONE on-kill proc fired, not one per pellet",
+      s.items.procs.fragment === 1 && s.horde.killCount === 1,
+      `${s.items.procs.fragment} procs from ${s.horde.killCount} kills across`
+      + ` ${sweepP.pellets} pellets`);
+  }
+
+  // And the wider claim, from config alone: the sweeper is not an on-kill engine
+  // either. It kills a chewer in one pull at 1.5 pulls/s; the rifle takes two rounds
+  // at 8/s, which is more kills per second and therefore more procs.
+  const killsPerSecond = (p) =>
+    p.fireRate / Math.ceil(CFG.enemies.chewer.hp / (p.damage * p.pellets));
+  ok("nor is it a better on-kill platform -- the rifle triggers those more often",
+    killsPerSecond(sweepP) <= killsPerSecond(rifleP),
+    `${killsPerSecond(sweepP).toFixed(1)} kills/s against the rifle's`
+    + ` ${killsPerSecond(rifleP).toFixed(1)}`);
 }
 
 ok("no boarder ever floated off the deck footprint", !sawFloatingBoarder);

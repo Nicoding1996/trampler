@@ -68,6 +68,19 @@ export class Weapon {
     // bulwark keeps making the rifle the wrong tool until a run decides otherwise.
     this.armourPierce = 0;
 
+    // What is in your hands. Resolved from config once, so a swap is an index move
+    // rather than a lookup, and stored as a PROFILE rather than as a weapon type --
+    // every read below goes through `this.profile.x`, so there is no branch anywhere
+    // on which weapon is out. That matters for the same reason `enemyCfg(type)`
+    // exists instead of ternaries: a third weapon must not be able to inherit the
+    // rifle's numbers by being forgotten in one branch.
+    this.profiles = CFG.combat.loadout.carried.map((k) => CFG.combat[k]);
+    this.slot = 0;
+    this.profile = this.profiles[0];
+    // Polled by the presentation layer the same way `shots` and `footfalls` are, so
+    // the simulation still has no idea a HUD or a viewmodel exists.
+    this.swaps = 0;
+
     // Assigned by whoever owns the bus, not taken as a constructor argument, so
     // tools/scene-cost.mjs can build a Weapon to count draw calls without one.
     this.events = null;
@@ -125,6 +138,39 @@ export class Weapon {
     }
   }
 
+  /** The name of whatever is in your hands, for the swap toast. */
+  get weaponName() {
+    return this.profile.name;
+  }
+
+  /**
+   * Whichever profile actually owns the trigger this frame.
+   *
+   * Manning a station hands the trigger to that station's gun, and the aim readout
+   * has to agree with what a shot would do (invariant 8a) -- so it must scan at the
+   * range of the thing that would fire, not at the range of the thing slung on your
+   * back. Without this, selecting the 40 m sweeper and then sitting in a 300 m mount
+   * would have made the readout go blank on everything the gun can actually reach.
+   */
+  get triggerProfile() {
+    return this.player.station ? CFG.deckGun : this.profile;
+  }
+
+  /**
+   * Cycle to the next carried weapon.
+   *
+   * The cost is folded into the existing fire cooldown rather than given its own
+   * timer, which has a consequence worth keeping: a slow weapon's recovery cannot be
+   * escaped by switching out of it.
+   */
+  swap() {
+    this.slot = (this.slot + 1) % this.profiles.length;
+    this.profile = this.profiles[this.slot];
+    this.cooldown = Math.max(this.cooldown, CFG.combat.loadout.swapTime);
+    this.swaps++;
+    return this.profile;
+  }
+
   /**
    * Rescan what the crosshair is on.
    *
@@ -139,7 +185,7 @@ export class Weapon {
    * hull reads as nothing rather than as a target.
    */
   scanTarget() {
-    const range = CFG.combat.weapon.range;
+    const range = this.triggerProfile.range;
     this.player.eyePosition(_origin);
     this.player.lookDirection(_dir);
 
@@ -207,16 +253,44 @@ export class Weapon {
     // Manning a station hands the trigger over to that station's weapon.
     if (this.player.station) return;
 
+    // After the early return on purpose, so a swap only happens when the weapon is
+    // actually in your hands. The viewmodel is hidden while manning a gun, so a
+    // silent swap you cannot see is worse than a keypress that does nothing.
+    if (input.pressed(CFG.combat.loadout.swapKey)) this.swap();
+
     if (input.locked && input.mouseDown(0) && this.cooldown <= 0) {
       this.fire();
-      this.cooldown = 1 / (CFG.combat.weapon.fireRate * this.fireRateScale);
+      this.cooldown = 1 / (this.profile.fireRate * this.fireRateScale);
     }
   }
 
+  /**
+   * One trigger pull of the carried weapon.
+   *
+   * Multiple pellets are N calls into the SAME hitscan path rather than a second
+   * shot function, which is what keeps invariant 1 free: each pellet gets its own
+   * occlusion clip, its own armour resolution and its own facing check, so a wide
+   * cone fired from the deck cannot reach beneath the hull any more than one ray
+   * could.
+   *
+   * The look direction is re-read PER PELLET, and that is load-bearing rather than
+   * tidy: `shootFrom` applies its cone by mutating the direction it is handed, so
+   * reusing one vector would compound the spread and walk the pattern off target
+   * instead of scattering it around the crosshair.
+   *
+   * @returns the first pellet that connected, so a single-pellet weapon behaves
+   *          exactly as it did when this was one line.
+   */
   fire() {
-    this.player.eyePosition(_origin);
-    this.player.lookDirection(_dir);
-    return this.shootFrom(_origin, _dir, CFG.combat.weapon, null);
+    const p = this.profile;
+    let first = null;
+    for (let i = 0; i < p.pellets; i++) {
+      this.player.eyePosition(_origin);
+      this.player.lookDirection(_dir);
+      const hit = this.shootFrom(_origin, _dir, p, null);
+      if (hit && !first) first = hit;
+    }
+    return first;
   }
 
   /**

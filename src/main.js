@@ -273,6 +273,7 @@ function boot() {
   let lastStepCount = 0;
   let lastHurtCount = 0;
   let lastKillRef = null;
+  let lastSwaps = 0;
 
   // The banner is otherwise driven by persistent states and cleared every frame,
   // so a transient message needs its own timer or the next frame erases it.
@@ -384,6 +385,14 @@ function boot() {
     items.update(dt);
     // After the director, so a wave resolved this frame pays this frame.
     handlePurchasing(dt);
+    // Named on the swap, polled from a counter like every other pure reader. The
+    // silhouette in your hands is the standing readout for which weapon is up; this
+    // is the one moment a WORD is worth more than a shape, because "useless past
+    // 20 m" is not something a model can say.
+    if (weapon.swaps !== lastSwaps) {
+      lastSwaps = weapon.swaps;
+      toast(`${weapon.weaponName}<small>${weapon.profile.detail}</small>`, 1.4);
+    }
     if (economy.lastEvent) {
       const ev = economy.lastEvent;
       toast(

@@ -484,8 +484,17 @@ export const CFG = {
     // over and over. Applies to death only, not the debug respawn key.
     spawnGrace: 1.2,
 
+    // The rifle. Named now, because there is more than one thing to hold.
+    //
+    // `pellets` is 1 here and it is not decoration: it is what lets `fire()` be one
+    // loop rather than a branch on which weapon is out, and a branch on weapon type
+    // is exactly the `type === CHEWER ? a : b` pattern that made a newly added enemy
+    // silently inherit the wrong numbers. One code path, per-profile data.
     weapon: {
+      name: "SERVICE RIFLE",
+      detail: "accurate at any range, one body at a time",
       damage: 25,
+      pellets: 1,
       fireRate: 8,      // shots per second
       spread: 0.007,    // radians of cone
       seed: 4242,       // cone spread draws from this, never Math.random
@@ -519,6 +528,81 @@ export const CFG = {
       impactSolidScale: 0.6,   // dirt puffs stay quiet; hits on enemies pop
 
       hitFlash: 0.12,   // hitmarker + enemy flash duration
+    },
+
+    // -------------------------------------------------------------------------
+    // The second weapon, and the reason there is one at all.
+    //
+    // The two positions this game is about differ in RANGE and CROWDING -- the
+    // ground is a 26 x 16 m box full of bodies at contact range, the deck watches a
+    // wave cross 165 m of pan. Until now your hands did the identical thing in both,
+    // so oscillating was a navigation problem rather than a change of play. A weapon
+    // that is only correct in one of the two places is the pillar restated in the
+    // player's hands.
+    //
+    // It is deliberately NOT an upgrade. Single-target throughput is 162 dps against
+    // the rifle's 200, so nothing here is strictly better.
+    //
+    // WHAT IT ACTUALLY BUYS IS BURST AND SLACK, NOT CROWD CLEAR, and that correction
+    // came from the measurement rather than from thinking about it. The first version
+    // of this comment claimed a blast killed two chewers at once; test 100 put two of
+    // them a metre apart at 5 m and killed one, because the cone is 0.55 m across at
+    // that distance and a chewer's hit box is about 1.06 m -- so the two bodies
+    // overlapped and the near one shadowed the far one. A nine-pellet cone at contact
+    // range is narrower than a single target, which is the opposite of the intuition.
+    //
+    // The real trade, measured: 108 damage in ONE trigger pull kills a chewer where
+    // the rifle needs two rounds and a quarter-second of tracking, and it connects
+    // from about half a metre further off-centre. That is what matters with something
+    // chewing on you at 40 hp/s under a hull -- burst, and not having to be precise.
+    // What it costs is 26 m, where it lands 1.1 pellets of 9.
+    //
+    // Three numbers do the position-coding, and two of them are geometric rather
+    // than arbitrary:
+    //
+    //   `spread` 0.11 rad is the falloff, and it is PHYSICAL rather than a damage
+    //   curve. The cone is 0.88 m across at 4 m, so all nine pellets land on a 1.6 m
+    //   chewer; it is 3.3 m across at 15 m, so one or two do. Nobody has to be told
+    //   the range limit -- the pattern tells them, which is the depression-clamp
+    //   lesson applied to a shotgun.
+    //
+    //   `range` 40 is the hard stop, and it exists so the tracers visibly END. A
+    //   weapon whose shots simply stop arriving is illegible; one whose tracers die
+    //   in mid-air at a consistent distance is not.
+    //
+    // And note what falls out for free rather than being special-cased. Against the
+    // bulwark's 20 armour each 12-damage pellet is floored to 2.4 by
+    // minDamageFraction, so a blast does 21.6 and the plate takes 14 of them -- the
+    // sweeper is WORSE than the rifle head-on and needs the flank harder, which is
+    // invariant 8b reinforced by arithmetic nobody had to write. Every pellet also
+    // goes through `shootFrom`, so all nine are clipped by the hull slab and a wide
+    // cone buys no reach beneath it: invariant 1 costs nothing to preserve.
+    scatter: {
+      name: "TRENCH SWEEPER",
+      detail: "shreds at contact range, useless past 20 m",
+      damage: 12,
+      pellets: 9,
+      fireRate: 1.5,
+      spread: 0.11,
+      range: 40,
+    },
+
+    // What the operative carries, in swap order. First entry is what a run starts
+    // with, and the ids are keys into CFG.combat above rather than a second copy of
+    // the numbers.
+    loadout: {
+      swapKey: "KeyZ",
+      carried: ["weapon", "scatter"],
+
+      // A swap is not free, and this is the whole of what stops "carry both" being
+      // strictly better than choosing. It reuses the fire cooldown rather than
+      // adding a second timer, which also means the slow weapon's recovery is not
+      // escapable by switching -- fire the sweeper, swap, and the rifle still waits
+      // out the sweeper's 0.67 s.
+      //
+      // Short on purpose. The cost of the wrong weapon should be paid in the fight,
+      // by having brought it, not in a third of a second of animation.
+      swapTime: 0.35,
     },
   },
 
