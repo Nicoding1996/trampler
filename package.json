@@ -2,6 +2,7 @@
   "name": "trampler-feel-test",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "First-person prototype: a crew, a walking fortress, and a roguelike siege you can ride or fight beneath.",
   "scripts": {
