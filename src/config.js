@@ -900,6 +900,33 @@ export const CFG = {
 
     separation: 1.5,
     playerReach: 2.1,
+
+    // When a boarder is pressed against deck furniture, how much of its speed has to
+    // survive the slide along that face before the direction is taken as meaningful.
+    // Below this it is treated as a dead-on approach and a side is chosen instead.
+    //
+    // Grid resolution of the deck routing field boarders use to get past crates, the
+    // mast and the engine block, in metres, in hull-local space.
+    //
+    // 0.4 is a compromise between two failures with different shapes. Too coarse and a
+    // real gap gets marked solid: the channel outboard of the port crate is only 0.4 m
+    // of clear floor for a 0.55 m body, so at 0.5 m cells the sampling can miss it and
+    // wall off a route that exists. Too fine and the build cost grows as the square for
+    // no gain, since the direction it yields is one of eight either way.
+    //
+    // A 16 x 26 m deck at 0.2 is 80 x 130 = 10,400 cells, flooded once per distinct body
+    // radius at construction. Nothing reads this per frame -- a boarder does one array
+    // lookup -- so the cost is startup only.
+    //
+    // Halved from 0.4 for the interaction with conservative cell marking, not for
+    // accuracy on its own. A cell counts as solid if ANY part of it is obstructed, which
+    // is what stops the field telling a body to walk where it cannot fit: at 0.4 m, two
+    // boarders resting at local z 7.45 were told to head inboard because their cell
+    // CENTRE at 7.6 was clear of the crate behind them, and they pressed into its face
+    // instead. But conservative marking also eats narrow gaps, and the clear channel
+    // outboard of the port crate is only 0.4 m wide, so at 0.4 m cells nothing survives
+    // in it and a legitimate route vanishes. 0.2 keeps that channel one cell wide.
+    deckFlowCell: 0.2,
   },
 
   // The manned deck gun: the reason the deck is worth standing on.

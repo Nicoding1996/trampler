@@ -93,24 +93,65 @@ export class Director {
 
   // ----------------------------------------------------------------- pressure
 
-  /** 0..1 estimate of how much trouble the crew is actually in. */
-  get pressure() {
+  /**
+   * 0..1 estimate of how much trouble the crew is actually in.
+   *
+   * @param withHull count the fortress's own condition. Two callers need this question
+   *        asked two different ways -- see `settled` and `calm` below.
+   */
+  #pressureOf(withHull) {
     const p = CFG.waves.pressure;
     const pl = this.player;
 
     let v = p.hurtWeight * (1 - pl.hp / pl.maxHp);
     v += p.underWeight * Math.min(1, (this.horde.underHull ?? 0) / p.underFull);
     v += p.aboardWeight * Math.min(1, (this.horde.aboard ?? 0) / p.aboardFull);
-    if (this.trampler.immobilised) v += p.immobileWeight;
+    if (withHull && this.trampler.immobilised) v += p.immobileWeight;
     if (pl.timeSinceHurt < p.recentHurtWindow) v += p.recentHurtWeight;
 
     return Math.min(1, v);
   }
 
-  /** Has the fight actually settled? Both the pressure and the field must ease. */
-  get calm() {
-    return this.pressure < CFG.waves.pressure.calmBelow
+  /** The whole picture, hull included. What the diagnostics readout reports. */
+  get pressure() {
+    return this.#pressureOf(true);
+  }
+
+  /**
+   * Has the WAVE been dealt with? A question about the FIELD, not about the hull.
+   *
+   * Split out of `calm`, and the split is the fix for a bug that shipped a long time
+   * behind a green suite. `immobileWeight` is 0.40 against a `calmBelow` of 0.35, so while
+   * the fortress is below a tripod that one term puts the old combined test
+   * arithmetically out of reach -- not merely unlikely: unreachable, at full health, with
+   * an empty field, for ever. One getter was gating two unrelated questions, so a crew
+   * that killed every last enemy with four legs down never got the wave marked resolved.
+   *
+   * Everything downstream of `resolved` is credit for work already done: the wave-clear
+   * scrap, the pick cadence, the end of a siege, and the phase clause the refit terminal
+   * reads. So a wrecked fortress withheld the crew's payment for the fight they had just
+   * won, and shut the shop that sells the repair rig at the one moment it is wanted. The
+   * refusal even named the wrong clause -- NOT WHILE A WAVE IS OUT, with nothing on the
+   * field -- which is precisely the failure invariant 23b's three separate reasons exist
+   * to prevent. Reported as "I killed all the enemies but I cannot shop".
+   */
+  get settled() {
+    return this.#pressureOf(false) < CFG.waves.pressure.calmBelow
       && this.horde.liveCount <= CFG.waves.holdUntilCleared;
+  }
+
+  /**
+   * Can the crew take ANOTHER wave? Everything `settled` asks, plus the hull.
+   *
+   * The hull clause is invariant 19 in its strongest form and it does not move: nothing
+   * arrives while the fortress is dead in the sand, because that is the exact state the
+   * wave-three spiral used to happen in. Written as an explicit `immobilised` test rather
+   * than left buried in the pressure sum, because the weight is a tuning number and this
+   * is a hard gate. It is exactly equivalent to the old combined form, since
+   * `immobileWeight` already exceeds `calmBelow` on its own.
+   */
+  get calm() {
+    return this.settled && !this.trampler.immobilised;
   }
 
   /**
@@ -126,9 +167,17 @@ export class Director {
     return this.phase === PHASE.SPAWNING;
   }
 
-  /** The next wave is being withheld because the fight is not resolved. */
+  /**
+   * The next wave is being withheld because the fight is not resolved.
+   *
+   * Two branches asking two different questions, which is the point of the split above.
+   * Mid-wave the thing being waited on is the FIELD settling; in a rest it is the crew
+   * being fit to receive another one, which includes the hull. A crippled fortress on a
+   * clear field is therefore holding in REST rather than stuck in ENGAGED, and the
+   * distinction is visible: it has been paid for the wave it cleared.
+   */
   get holding() {
-    if (this.phase === PHASE.ENGAGED) return !this.calm;
+    if (this.phase === PHASE.ENGAGED) return !this.settled;
     return this.phase === PHASE.REST && this.timer <= 0 && !this.calm;
   }
 
@@ -353,6 +402,8 @@ export class Director {
           this.#pickBearing();
           this.#startWave();
         } else if (this.timer <= 0 && this.calm) {
+          // `calm`, not `settled`: SENDING a wave is what a wrecked fortress must not
+          // receive. This is the half of the old combined gate that is deliberate.
           this.#beginPrep();
         }
         break;
@@ -373,7 +424,14 @@ export class Director {
         if (this.forced) {
           this.#pickBearing();
           this.#startWave();
-        } else if (this.calm) {
+        } else if (this.settled) {
+          // `settled`, not `calm`: whether this wave is over is a question about the
+          // FIELD. Asking about the hull here meant a crippled crew could clear every
+          // last enemy and never be credited with it -- no scrap, no pick, no end to the
+          // siege, and a shop that refused with "NOT WHILE A WAVE IS OUT" against an
+          // empty field. Withholding the next wave is the rule; withholding payment for
+          // the last one was an accident of sharing one getter between two questions.
+          //
           // Seen off. Counted here and nowhere else, so a wave that was buried
           // under a stacked one never pays -- which is part of what Q costs.
           this.resolved++;

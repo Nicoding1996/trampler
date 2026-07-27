@@ -274,6 +274,7 @@ function boot() {
   let lastHurtCount = 0;
   let lastKillRef = null;
   let lastSwaps = 0;
+  let lastRefitCallouts = 0;
 
   // The banner is otherwise driven by persistent states and cleared every frame,
   // so a transient message needs its own timer or the next frame erases it.
@@ -402,7 +403,21 @@ function boot() {
         1.8,
       );
     }
+    // The buy window opened somewhere the console is not visible -- under the hull
+    // most of the time, which is the one place the kiosk's lamp cannot reach. Polled
+    // off a counter like every other pure reader, and it names the PLACE as well as
+    // the state, because "you may buy now" is useless to someone who then has to
+    // work out where from.
+    if (economy.refitCallouts !== lastRefitCallouts) {
+      lastRefitCallouts = economy.refitCallouts;
+      toast("REFIT OPEN<small>terminal on the bow bridge</small>", 2.5);
+    }
     horde.update(dt, player);
+    // The kiosk advertises whether it is worth crossing the deck, so use the
+    // economy's shared safety half rather than `open`, which only becomes true
+    // after the player has already arrived. Emissive materials do the signalling;
+    // this does not add a light to the scene.
+    trampler.setTerminalAvailable(economy.safeMoment);
     grapple.updateVisuals(dt);
 
     world.updateSun(player.position);

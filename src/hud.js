@@ -727,7 +727,11 @@ export class Hud {
         paceCls = "on";
         break;
       default:
-        pace = director.calm ? "resolving" : "engaged";
+        // `settled`, not `calm`: this branch is ENGAGED, and what ends an ENGAGED wave
+        // is the field settling. Reading `calm` here would report "engaged" on the very
+        // frame a crippled crew's wave resolves, which is the state this readout exists
+        // to name.
+        pace = director.settled ? "resolving" : "engaged";
         paceCls = "bad";
     }
     set(this.el.next, pace, paceCls);

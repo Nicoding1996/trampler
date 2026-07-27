@@ -73,7 +73,8 @@ function owner(obj) {
 
 trampler.group.name = "trampler";
 
-scene.traverse((obj) => {
+// Match WebGLRenderer: an invisible object prunes its entire subtree.
+scene.traverseVisible((obj) => {
   if (obj.isLight) {
     lights++;
     if (obj.castShadow) shadowLights++;

@@ -259,6 +259,174 @@ export class Trampler {
   }
 
   /**
+   * Give the refit terminal the silhouette of a destination rather than a crate.
+   *
+   * The structural box below remains the only collider, deck obstacle and grapple
+   * target. This shell is visual only: the arch rises out of the existing footprint,
+   * and emissive geometry communicates state without spending another light slot.
+   */
+  #buildTerminalKiosk() {
+    // A deep, broad-shouldered service arch, open at the bottom so the original
+    // structural box still reads as the counter. The depth gives it a canopy from
+    // oblique angles instead of leaving a thin facade pasted onto the corrugation.
+    const arch = new THREE.Shape();
+    arch.moveTo(-1.45, 0);
+    arch.lineTo(-1.45, 1.36);
+    arch.lineTo(-1.15, 1.72);
+    arch.lineTo(-0.62, 1.94);
+    arch.lineTo(0.62, 1.94);
+    arch.lineTo(1.15, 1.72);
+    arch.lineTo(1.45, 1.36);
+    arch.lineTo(1.45, 0);
+    arch.lineTo(0.98, 0);
+    arch.lineTo(0.98, 1.26);
+    arch.lineTo(0.78, 1.50);
+    arch.lineTo(-0.78, 1.50);
+    arch.lineTo(-0.98, 1.26);
+    arch.lineTo(-0.98, 0);
+    arch.closePath();
+
+    const frameGeo = new THREE.ExtrudeGeometry(arch, {
+      depth: 0.50,
+      steps: 1,
+      bevelEnabled: true,
+      bevelSegments: 1,
+      bevelSize: 0.045,
+      bevelThickness: 0.045,
+    });
+    // Shapes extrude along Z. Rotate that depth into local X; using the back cap
+    // as the inboard face preserves left-to-right lettering on the deck side.
+    frameGeo.rotateY(-Math.PI / 2);
+    frameGeo.translate(4.02, 2.04, -7.65);
+    // The ship's own mast role, so the kiosk is fortress hardware rather than
+    // something dropped on the deck: same tint, same vendored panel texture as the
+    // sponson, the engine block and the mast. `Look.std` caches by role AND params,
+    // so asking for a double-sided variant yields its own instance that still gets
+    // dressed with the mast texture, instead of turning face culling off for half
+    // the superstructure.
+    this.terminalFrameMat = Look.std("mast", {
+      color: 0x7a7f88, roughness: 0.68, metalness: 0.4, side: THREE.DoubleSide,
+    });
+    const frame = new THREE.Mesh(frameGeo, this.terminalFrameMat);
+    frame.name = "terminal_kiosk_frame";
+    frame.castShadow = false;
+    frame.receiveShadow = true;
+    this.group.add(frame);
+    this.terminalFrameMesh = frame;
+
+    const rectangle = (x0, y0, x1, y1) => {
+      const shape = new THREE.Shape();
+      shape.moveTo(x0, y0);
+      shape.lineTo(x1, y0);
+      shape.lineTo(x1, y1);
+      shape.lineTo(x0, y1);
+      shape.closePath();
+      return shape;
+    };
+
+    // Keep every luminous part in one mesh: a service window up close, narrow rails
+    // that stay visible around the grapple ring, and the marquee plus beacon that
+    // identify the destination from across the deck.
+    //
+    // Deliberately a set of narrow lit ELEMENTS rather than one large glowing slab.
+    // The first version lit the whole face and the whole arch, which read as a neon
+    // sign bolted to a dieselpunk ship — the area was doing the shouting, so dimming
+    // alone would not have fixed it.
+    const signalShapes = [
+      rectangle(-0.58, 0.38, 0.58, 0.94),
+      rectangle(-0.95, 0.10, 0.95, 0.15),
+      rectangle(-1.25, 0.18, -1.16, 1.38),
+      rectangle(1.16, 0.18, 1.25, 1.38),
+    ];
+
+    // A tiny block alphabet is more legible here than another abstract icon, and
+    // unlike a canvas texture it keeps this simulation module headless-safe.
+    const glyphs = [
+      ["110", "101", "110", "101", "101"], // R
+      ["111", "100", "110", "100", "111"], // E
+      ["111", "100", "110", "100", "100"], // F
+      ["111", "010", "010", "010", "111"], // I
+      ["111", "010", "010", "010", "010"], // T
+    ];
+    const cell = 0.044;
+    const letterGap = 0.046;
+    const letterWidth = cell * 3;
+    const labelWidth = glyphs.length * letterWidth + (glyphs.length - 1) * letterGap;
+    const labelX = -labelWidth / 2;
+    const labelY = 1.57;
+    for (let letter = 0; letter < glyphs.length; letter++) {
+      for (let row = 0; row < 5; row++) {
+        for (let column = 0; column < 3; column++) {
+          if (glyphs[letter][row][column] !== "1") continue;
+          const x = labelX + letter * (letterWidth + letterGap) + column * cell;
+          const y = labelY + (4 - row) * cell;
+          signalShapes.push(rectangle(x + 0.005, y + 0.005, x + cell - 0.005, y + cell - 0.005));
+        }
+      }
+    }
+
+    const beacon = new THREE.Shape();
+    beacon.moveTo(-0.20, 1.97);
+    beacon.lineTo(0.20, 1.97);
+    beacon.lineTo(0.28, 2.09);
+    beacon.lineTo(0.19, 2.24);
+    beacon.lineTo(-0.19, 2.24);
+    beacon.lineTo(-0.28, 2.09);
+    beacon.closePath();
+    signalShapes.push(beacon);
+
+    const signalGeo = new THREE.ExtrudeGeometry(signalShapes, {
+      depth: 0.055,
+      steps: 1,
+      bevelEnabled: true,
+      bevelSegments: 1,
+      bevelSize: 0.012,
+      bevelThickness: 0.012,
+    });
+    signalGeo.rotateY(-Math.PI / 2);
+    signalGeo.translate(3.50, 2.04, -7.65);
+
+    // Lit hardware, not a light box. The numbers follow the deck's hazard striping,
+    // which is this project's one existing example of a signal that reads without
+    // blowing out: a DARK emissive colour at modest intensity. The first pass used a
+    // saturated colour at 2.1-3.0, which is above `CFG.render.bloom.threshold` of
+    // 1.05, so the sign bloomed and lit the bow like a flare — invariant 33's
+    // "only genuinely emissive things bloom", broken by the newest thing added.
+    this.terminalSignalMat = new THREE.MeshStandardMaterial({
+      color: 0x5c3226,
+      emissive: 0x37130a,
+      emissiveIntensity: 0.7,
+      roughness: 0.52,
+      metalness: 0.22,
+      side: THREE.DoubleSide,
+    });
+    const signal = new THREE.Mesh(signalGeo, this.terminalSignalMat);
+    signal.name = "terminal_status_signal";
+    signal.castShadow = false;
+    signal.receiveShadow = false;
+    this.group.add(signal);
+    this.terminalSignalMesh = signal;
+
+    this.terminalAvailable = null;
+    this.setTerminalAvailable(false);
+  }
+
+  /** Presentation-only availability signal; the economy remains the authority. */
+  setTerminalAvailable(available) {
+    const next = !!available;
+    if (!this.terminalSignalMat || this.terminalAvailable === next) return;
+    this.terminalAvailable = next;
+
+    // Hue carries the state and brightness only nudges it, so the two readings stay
+    // distinguishable at distance without either of them shouting. Both sit under the
+    // bloom threshold, so neither state throws light across the bow. No material
+    // recompilation is needed for a colour or intensity change.
+    this.terminalSignalMat.color.setHex(next ? 0x2f4a30 : 0x5c3226);
+    this.terminalSignalMat.emissive.setHex(next ? 0x123a17 : 0x37130a);
+    this.terminalSignalMat.emissiveIntensity = next ? 0.85 : 0.7;
+  }
+
+  /**
    * Non-colliding detail, and the single biggest reason the fortress reads as
    * enormous rather than as a grey box.
    *
@@ -269,6 +437,8 @@ export class Trampler {
    * depends on. Detail that is only ever looked at must never be solid.
    */
   #buildDetail(rand, hullMat, mastMat, trimMat) {
+    this.#buildTerminalKiosk();
+
     const add = (geo, mat, x, y, z, cast = true) => {
       const m = new THREE.Mesh(geo, mat);
       m.position.set(x, y, z);

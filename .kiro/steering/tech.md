@@ -102,7 +102,7 @@ the verification.
 ## Verification
 
 `verify.mjs` runs the real simulation modules in Node with no DOM and no
-renderer: 106 sections, 793 assertions. The failure modes here — drift, being
+renderer: 107 sections, 803 assertions. The failure modes here — drift, being
 yanked off a turning deck, an anchor that does not track the hull, an enemy
 shielded by geometry, an automated defence that quietly holds a position — are
 invisible to inspection and tedious to confirm by hand.

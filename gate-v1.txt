@@ -1,0 +1,427 @@
+
+1. Based movement: standing still on a walking, turning deck
+  pass  hull actually travelled (test is not vacuous)  (68.6 m of world travel)
+  pass  player never lost the deck as its base
+  pass  no drift across the deck over 15 s  (max 0.00 cm)
+  pass  player stayed at deck height
+
+2. Walking is relative to the deck, not the world
+  pass  walked ~walkSpeed across the deck in 1 s  (got 6.708, want 7.000 +/- 1)
+  pass  stayed aboard while walking
+  pass  walked along the deck's own axes, not the world's  (local z drifted 0.000 m)
+
+3. Jumping on a moving deck lands you where you took off
+  pass  the jump happened
+  pass  kept the hull's momentum in the air  (worst gap 0.063 m/s vs hull 4.50 m/s)
+  pass  landed back on the deck
+  pass  landed within 30 cm of take-off point  (1.6 cm)
+
+4. Stepping off carries momentum instead of yanking you
+  pass  standing still on deck = moving exactly with the hull at your feet  (off by 0.00e+0 m/s)
+  pass  and that is close to the hull's own speed  (got 4.563, want 4.500 +/- 0.3)
+  pass  frame switch preserves world velocity exactly  (delta 0.00e+0 m/s)
+
+5. Grapple boards you: flank approach to a boarding beacon
+  pass  player is on the ground, off the hull  (y=0.90)
+  pass  found a port boarding beacon
+  pass  grapple found a target on the hull
+  pass  the shot landed on the beacon, not on hull plating  (anchor local -6.2,1.6,0.1)
+  pass  anchor moved with the hull  (anchor travelled 1.17 m)
+  pass  anchor stayed fixed in hull space
+  pass  reel ended on arrival  (54 frames, reason=arrived)
+  pass  ended up aboard the hull  (base=trampler, y=8.42)
+
+6. Grappling bare hull plating now recovers via a mantle
+  pass  grapple hits the bow plate
+  pass  anchor is on plating below deck level  (anchor local y=-0.80)
+  pass  the dangle turned into a climb
+  pass  and the player ended up aboard rather than falling 7 m  (base=trampler, y=8.42)
+
+7. The under-hull arena is standable
+  pass  standing on sand beneath the hull, not attached to it
+  pass  neither crushed by the hull nor pushed out from under it  (y=0.90, hull underside at 4.5)
+
+8. Stress: no tunnelling, no getting stuck in geometry
+  pass  never ended up embedded inside the hull slab
+  pass  never tunnelled below the terrain
+  pass  position stayed finite
+
+9. Cutting the rope early keeps your momentum
+  pass  default release preset is the braked one
+  pass  fired at the beacon
+  pass  being hauled upward before the cut  (vy=17.9)
+  pass  rope was cut, not auto-released
+  pass  kept essentially all the reel speed  (37.4 -> 37.1 m/s)
+  pass  still travelling upward after letting go  (vy=17.4)
+  pass  coasts upward on its own after the cut  (rose a further 5.25 m)
+
+10. The release-feel presets actually change the feel
+  pass  dead stop drops you almost cold  (0.47 m/s)
+  pass  braked keeps your speed  (37.1 m/s)
+  pass  halo amplifies it  (37.1 -> 50.9 m/s)
+
+11. Fast exits cannot tunnel through the railings
+  pass  test setup is airborne, so friction cannot mask the result
+  pass  actually reached the railing (test is not vacuous)  (max local x = 7.10)
+  pass  stopped at the railing instead of passing through it  (max local x = 7.10, rail inner face at 7.5)
+  pass  still aboard after the impact
+
+12. Chewers under the hull cannot be shot from the deck
+  pass  spawned a chewer
+  pass  six point-blank shots straight down hit nothing  (0 hits)
+  pass  the shots were stopped by the fortress itself
+  pass  the chewer survived
+  pass  the same chewer is hittable from underneath the hull
+  pass  and it took damage  (25 / 50 hp)
+
+13. Chewers converge on the legs and break them
+  pass  legs took damage  (720 -> 0 hp total)
+  pass  at least one leg broke  (6 of 6 broken)
+  pass  broken legs slowed the hull  (speed factor 1.00 -> 0.00)
+  pass  enough losses stop it outright rather than letting it crawl forever  (0 legs working, factor 0.00)
+
+14. Climbers board the moving hull and reach the reactor
+  pass  climbers actually got aboard a walking hull  (peak 5 aboard)
+  pass  the reactor took damage  (0 / 420 hp)
+  pass  a boarder's world position moved with the hull  (2.21 m of world travel)
+  pass  a boarder stayed at deck height in hull space  (local y 0.95 -> 0.95)
+
+15. The ground has a cost
+  pass  standing next to a chewer costs health  (100 -> 91 hp)
+  pass  health regenerates after disengaging  (91 -> 100 hp)
+
+16. Wave director cycles rest, prep, spawn, engage
+  pass  starts resting with nothing on the field
+  pass  still resting partway through the opening calm  (phase rest)
+  pass  nothing has spawned yet
+  pass  rest gives way to a telegraphed prep window  (phase prep)
+  pass  the prep window names a bearing  (OFF THE PORT BOW)
+  pass  still nothing spawned during prep  (0 alive)
+  pass  the wave then releases  (wave 1, 4 alive)
+  pass  the wave is still arriving several seconds in  (phase spawning, 4 of 10)
+  pass  enemy health scales with elapsed time, not wave number  (x1.26 -> x1.86)
+
+16b. A wave is a trickle, not a lump
+  pass  wave is releasing
+  pass  only a couple are out after one second  (2 of 10 after 1 s)
+  pass  the whole wave is out a few seconds later  (10 of 10)
+
+17. Crowd performance
+  pass  pool filled to 400  (400 alive)
+  pass  400 enemies simulate well inside a frame budget  (0.61 ms/frame for the whole sim step)
+  pass  still no NaN with a full pool
+
+18. Spawn and teleport points are clear of geometry
+  pass  deck spawn is not inside any collider  (local -4.5,1.2,0.0)
+  pass  player settles where they spawned, not shoved aside  (moved 0.00 m)
+  pass  and ends up standing on the deck  (local y 0.92)
+  pass  ground drop point leaves the player on the sand  (y=0.90)
+
+19. Death cannot loop on a boarder standing at the spawn
+  pass  first hit killed and respawned
+  pass  grace window opened
+  pass  further hits during grace are ignored  (1 deaths)
+  pass  grace expired
+  pass  and damage lands again afterwards  (2 deaths)
+
+20. Chewers escalate once every leg is down
+  pass  all legs down
+  pass  chewers switched to boarding instead of idling
+  pass  and started on the reactor  (420 -> 105 hp)
+
+21. Enemies halt on target instead of walking through it
+  pass  a chewer on its target stands still instead of driving through the hull  (parked 60 of 60 frames)
+  pass  and stays put rather than drifting off it  (wandered 0.00 m)
+  pass  while still chewing  (leg 0 at 102 hp)
+  pass  holds station under a walking hull rather than being shaken off  (702 -> 612 total leg hp)
+  pass  and stays beneath the fortress instead of overshooting into the open  (max |local x| 7.00, hull half-width 8)
+  pass  it is latched to the hull, not re-chasing the leg every frame
+
+15b. Chewers hold a leg even when far slower than the hull
+  pass  at 1.0x (4.70 m/s, hull 4.5) it still chews  (198 hp dealt over 20 s)
+  pass  and stays latched at 1.0x
+  pass  at 0.6x (2.82 m/s, hull 4.5) it still chews  (198 hp dealt over 20 s)
+  pass  and stays latched at 0.6x
+
+22. Mantling closes the deck traversal gap
+  pass  climbed onto the 2.0 m crate  (mantled=true, local y 2.90, want 2.90)
+  pass  climbed onto the 2.4 m reactor  (mantled=true, local y 3.30, want 3.30)
+  pass  climbed onto the 2.6 m engine block  (mantled=true, local y 3.50, want 3.50)
+
+23. Mantling cannot board the hull from the ground
+  pass  never got aboard by jumping and mantling
+  pass  never climbed anywhere near deck height  (peak y 2.96, deck at 7.5)
+
+24. Mantling is not a ladder to the crow's nest
+  pass  never chained a climb above the reachable ceiling  (peak local y 5.23)
+  pass  crow's nest stayed grapple-only
+
+25. A climb onto the hull tracks the moving hull
+  pass  the climb was registered against the hull, not the world
+  pass  the hull kept walking during the climb (test is not vacuous)  (hull moved 1.43 m mid-climb)
+  pass  landed at the intended spot on the deck, not where the deck used to be  (off by 0.020 m in hull space)
+  pass  and ended at rest relative to the deck  (rel speed 0.00 m/s)
+
+26. An enemy attacking the reactor can actually be killed
+  pass  a boarder reached the reactor  (after 622 frames)
+  pass  found the attacker
+  pass  the attacker is not embedded inside the reactor  (local (3.16, 0.95, 2.08))
+  pass  aimed shots damage it  (hp 80 -> 55, alive=true)
+
+27. Point-blank enemies are hittable
+  pass  level shots connect at melee range  (5 of 5)
+  pass  an enemy pressed against the player is hittable
+  pass  hitmarker fires on a connecting shot
+
+28. Geometry still blocks shots after the hit-test change
+  pass  still cannot shoot through the deck at a chewer below  (0 hits)
+  pass  the chewer is untouched
+
+29. You can deliberately back off the deck
+  pass  started aboard
+  pass  the mantle did not drag the player back aboard
+  pass  the player actually left the hull
+  pass  and ended up on the sand  (y=0.90)
+
+30. Intent gating did not break climbing into a ledge
+  pass  still climbs the reactor when moving into it  (mantled=true, local y 3.30)
+
+31. Shots are visible at range
+  pass  a tracer was spawned
+  pass  it spans the full distance to the target  (30.6 m long)
+  pass  and widens with range instead of going sub-pixel  (radius 0.085 m vs base 0.045)
+  pass  the beam starts at a muzzle offset, not at the camera  (0.47 m off the eye)
+  pass  an impact marker was placed at the hit point
+  pass  the impact grows with range  (radius 0.076 m vs base 0.054)
+  pass  but stays small enough to read as dust  (radius 0.076 m)
+  pass  impact is dust-coloured for a geometry hit
+
+32. Legs degrade in stages, then stop the hull dead
+  pass  drive scales down one leg at a time  (0:1.00  1:0.75  2:0.50  3:0.25  4:0.00  5:0.00  6:0.00)
+  pass  immobilised once a tripod is impossible
+  pass  the hull does not travel while immobilised  (moved 0.000 m in 2 s)
+
+33. Repair brings a dead leg back and gets it walking
+  pass  hull is immobilised to begin with
+  pass  a repair target is offered in range  (PORT FORE LEG)
+  pass  the offered target is the nearby leg
+  pass  the dead leg came back  (120 / 120 hp)
+  pass  and the hull can walk again  (3 legs, factor 0.25)
+  pass  it actually starts travelling again  (moved 2.25 m)
+
+34. Repair needs you in the danger zone, not anywhere
+  pass  no repair happens out of range  (60 hp, unchanged)
+  pass  and no prompt is offered
+  pass  the repair point is inboard, beneath the hull  (local (-7.0, -8.5) vs hull 8 x 13)
+
+35. The reactor is repairable too, from the deck
+  pass  the reactor is offered as a repair target  (REACTOR)
+  pass  holding the key restores it  (220 -> 340 hp)
+  pass  but not past full
+
+36. The deck gun can be manned, and pins you in place
+  pass  the mount is offered in range
+  pass  F mounts it
+  pass  the operator cannot walk off the mount  (drifted 0.000 m across the deck)
+  pass  but they did ride the hull through world space  (6.99 m of world travel)
+  pass  F dismounts it
+
+37. The deck gun cannot reach beneath the hull
+  pass  manned the gun
+  pass  the gun actually fired during the sweep  (41 shots)
+  pass  the aim clamp refuses to depress past the limit  (deepest -0.700 rad, floor -0.7)
+  pass  no shot from the gun reached the chewer under the hull  (0 hits, chewer at 50 hp)
+
+38. The deck gun is strong against the incoming wave
+  pass  kills a climber out at ~65 m
+  pass  the gun out-damages the rifle per shot  (45 vs 25)
+  pass  and reaches further  (300 m vs 220 m)
+
+39. Heat stops the gun being an answer to everything
+  pass  sustained fire cuts the gun out  (heat 0.72, 42 shots fired)
+  pass  it managed a meaningful burst first  (31 rounds before cut-out)
+  pass  it recovers once you stop firing  (heat 0.00)
+
+40. Both mounts still cannot reach beneath the hull at -40 deg
+  pass  manned the BOW GUN
+  pass  BOW GUN fired plenty during the sweep  (28 shots)
+  pass  BOW GUN never reached the chewer under the hull  (0 hits, chewer at 50 hp)
+  pass  manned the STERN GUN
+  pass  STERN GUN fired plenty during the sweep  (28 shots)
+  pass  STERN GUN never reached the chewer under the hull  (0 hits, chewer at 50 hp)
+
+41. Relaxing depression bought real close-in reach
+  pass  kills a ground target ~22 m ahead of the bow
+  pass  still kills at long range too
+
+42. The stern mount covers what the bow cannot
+  pass  there are two mounts
+  pass  they face opposite ways  (0.00 vs 3.14)
+  pass  their arcs together cover a full circle  (4.00 + 4.00 rad)
+  pass  the stern gun can be manned
+  pass  it kills a pursuer astern
+  pass  only one mount can be manned at a time
+
+43. Repair is findable and survives a moving hull
+  pass  a ground marker appears at the damaged leg
+  pass  undamaged legs are not marked
+  pass  the marker sits on the actual repair point  (0.00 m off)
+  pass  standing at the visible leg offers the repair  (PORT FORE LEG)
+  pass  repair progresses while in range  (0 -> 37 hp)
+  pass  progress already made is never lost  (37 -> 37 hp)
+  pass  the prompt does eventually clear once truly away
+
+44. Impact markers are subtle enough to read as dust
+  pass  a terrain impact was placed
+  pass  it is a modest puff, not a metre-wide ball  (radius 0.076 m)
+  pass  terrain impacts are quieter than hits on enemies  (scale x0.6, opacity 0.38 vs 0.95)
+  pass  and the sphere has enough segments to not read as a hexagon  (12 segments)
+
+45. Repair can now actually patch a leg quickly
+  pass  a dead leg is restored in about a second  (1.10s at 110 hp/s)
+  pass  which is faster than the chewer damage it has to outrun  (110 hp/s)
+
+46. Emitters mount to the hull, not the world
+  pass  start with a full rack
+  pass  cannot deploy while aboard  (MUST BE ON FOOT)
+  pass  cannot deploy on open ground  (MUST BE BENEATH THE HULL)
+  pass  and the refusal says why
+  pass  can deploy beneath the hull
+  pass  deployed one
+  pass  it moved through world space with the hull  (4.65 m of world travel)
+  pass  but stayed fixed in hull space
+  pass  cannot exceed the rack size  (3 deployed)
+  pass  recall frees a slot  (1 free)
+
+47. Emitters kill things under the hull while you are away
+  pass  emitter is live
+  pass  it killed chewers with nobody present  (6 -> 3 alive)
+
+48. Emitters delay the spiral but cannot stop it alone
+  pass  all three emitters were placed  (3 placed)
+  pass  undefended, the fortress is crippled  (60.3s, wave 1)
+  pass  but emitters do NOT hold the line on their own -- the pillar survives  (still crippled without a player, at 80.5s)
+  pass  against a fixed force they buy real time  (16.4s -> 25.1s)
+
+49. Emitters run dry rather than firing forever
+  pass  deploys with a full bank  (6.0 / 6)
+  pass  the bank actually drains under sustained use  (dropped to 0.00 charges)
+  pass  and it throttles rather than stopping dead  (recharge 0.35/s vs one shot per 0.9s)
+
+50. Spawns are far away, and waves wait for the field to thin
+  pass  nothing spawns anywhere near the hull  (nearest spawn 63.2 m from hull centre)
+  pass  hostiles do accumulate in the hull's shadow  (peak 7 beneath the hull)
+  pass  the field did get crowded  (peak 10 alive)
+  pass  with nobody defending, the fortress ends up crippled  (0 legs working)
+  pass  a stopped fortress halts the pacing entirely  (phase engaged, pressure 60%)
+  pass  and it stays halted for as long as that lasts  (wave 1 after another minute)
+  pass  recovering does not fire the next wave instantly  (phase rest)
+  pass  but it does come after the rest and the telegraph  (wave 2)
+
+51. Calling a wave early overrides the hold
+  pass  field is crowded and the wave is held  (10 alive, wave 1, phase engaged)
+  pass  Q is accepted
+  pass  stacking waves remains the player's choice  (wave 1 -> 2)
+  pass  and calling early skips the prep window -- that is the risk  (phase spawning)
+
+52. Climbers do not pop when they latch on
+  pass  no enemy jumps more than a stride in one frame  (worst frame-to-frame move 0.147 m)
+
+53. Contested repair is slowed, not blocked
+  pass  a repair is offered  (PORT FORE LEG)
+  pass  nothing nearby means it is uncontested
+  pass  unopposed repair is fast  (55 hp in 0.5 s)
+  pass  the threat is detected
+  pass  work still progresses while contested  (19 hp in 0.5 s)
+  pass  the interaction stays active rather than refusing
+  pass  but it is clearly slower than unopposed  (19 vs 55 hp)
+  pass  contested rate is in the stalemate band, not a win button  (38 hp/s while contested)
+  pass  clearing restores full speed
+  pass  and the leg comes back  (120 / 120 hp)
+
+54. Stopping never brings enemies closer, or more of them
+  pass  the walking case is set up correctly
+  pass  the stopped case is set up correctly
+  pass  nothing spawns close in either case  (nearest 63.2 m walking, 63.2 m stopped)
+  pass  and the ring is the same distance either way  (mean 75.5 m vs 75.5 m)
+  pass  a walking fortress does get waves  (25 spawned)
+  pass  a stopped one never gets more than a walking one  (walking 25, stopped 0)
+  pass  in fact being crippled halts reinforcements entirely  (0 spawned while immobilised)
+
+55. Pacing is gated on crew pressure, not a head count
+  pass  an untouched crew reads as calm  (pressure 0%)
+  pass  losing health raises pressure  (0% -> 28%)
+  pass  an immobilised fortress raises pressure  (40%)
+  pass  and that alone is enough to stop the pacing advancing
+  pass  the same eight enemies read as more pressure once they are under the hull  (0% at range -> 25% beneath)
+
+56. A guaranteed breather follows every wave
+  pass  a cleared wave drops into rest, not straight into the next telegraph  (phase rest)
+  pass  the rest is a real length, not a formality  (9.9s of 10s remaining)
+  pass  no telegraph during the guaranteed rest  (phase rest)
+  pass  then the telegraph opens  (phase prep)
+  pass  and still no new wave until the telegraph finishes  (wave 1)
+
+57. A restarted encounter replays the same fight
+  pass  the run actually spawned something (test is not vacuous)  (10 spawns, wave 1)
+  pass  the same seed replays the same spawn sequence  (identical)
+  pass  and the same wave bearing  (-0.5451 vs -0.5451)
+  pass  and reaches the same wave  (wave 1 vs 1)
+  pass  resetPose puts the fortress back on its start heading  (yaw 3.1416)
+  pass  and back at its start position on the patrol ring  ((165.00, 0.00))
+
+58. The live enemy-speed knob scales and restores cleanly
+  pass  scaling down changes both enemy types  (chewer 2.35, climber 2.26)
+  pass  and it warns once they are slower than the hull itself  (slowest 2.26 vs hull 4.5)
+  pass  the scale is clamped at the low end  (0.5)
+  pass  and at the high end  (1.5)
+  pass  repeated scaling does not compound  (5.640 vs expected 5.640)
+  pass  and 1.0x restores the authored speeds exactly  (chewer 4.7, climber 4.52)
+  pass  the authored speeds stay above the hull's own speed  (slowest 4.52 vs hull 4.5)
+
+59. The wave bearing stays varied enough to be worth telegraphing
+  pass  all three bearings still occur  (OFF THE PORT BOW 22, DEAD AHEAD 19, OFF THE STARBOARD BOW 19)
+  pass  and none of them dominates the telegraph  (most common appeared 22/60)
+  pass  waves still arrive from meaningfully different directions  (98 deg of spread used)
+  pass  the arc stays within the forward hemisphere  (52 deg either side)
+
+60. A siege ends when its last wave is resolved
+  pass  the siege reaches its end  (phase held)
+  pass  and it ends on the configured wave, not before or after  (held at wave 5, siegeLength 5)
+  pass  nothing spawns once it is held  (0 enemy-frames after the siege ended)
+  pass  the wave count does not creep past the siege length  (wave 5)
+  pass  and calling a wave early cannot restart a finished siege
+  pass  resetting clears the held state  (phase rest, wave 0)
+
+61. Kills pay into two separate purses
+  pass  both purses start empty
+  pass  a chewer pays personal salvage  (2 salvage)
+  pass  and a little shared scrap  (1 scrap)
+  pass  a climber pays more, because reaching one costs you position  (6 salvage)
+  pass  kills from any source pay, not just the rifle
+  pass  wounding pays nothing  (8 salvage)
+
+62. Refits apply, escalate in price, and respect their bounds
+  pass  a purchase reports what it did
+  pass  and the effect actually lands  (damage scale 1 -> 1.25)
+  pass  the next stack costs more than the first  (45 -> 68)
+  pass  vitals raises max health  (100 -> 125)
+  pass  and heals by the same amount, so it helps immediately  (125 / 125)
+  pass  plating reduces incoming fortress damage  (1 -> 0.850)
+  pass  the repair rig speeds up repair  (1 -> 1.30)
+  pass  fortress upgrades stop at their cap  (4 / 4)
+  pass  and say so rather than silently failing  (HULL PLATING AT MAXIMUM)
+  pass  personal upgrades keep stacking with no cap  (17 stacks)
+  pass  even fully plated, the fortress still takes real damage  (takes 52% damage)
+
+63. Buying happens at a PLACE, and between waves
+  pass  the terminal is a real trip from where you spawn, not somewhere you start  (11.5 m across the deck vs a 3 m radius)
+  pass  the console is well clear of the reactor, which is where boarders stop and stay  (10.8 m to the reactor surface, against a 6 m proximity threshold)
+  pass  there are boarding routes to be measured against (test is not vacuous)  (8 boarding routes)
+  pass  and it is not sitting on top of a boarding route exit either  (nearest of 8 exits is 3.3 m (a rejected placement measured 1.5 m here))
+  pass  BOW GUN's seat is outside the console's radius, so you cannot be at both  (4.3 m from the BOW GUN seat vs a 3 m radius)
+  pass  STERN GUN's seat is outside the console's radius, so you cannot be at both  (17.4 m from the STERN GUN seat vs a 3 m radius)
+  pass  standing under the hull cannot reach the terminal, so the ground cannot shop  (13.2 m from the console, atTerminal false)
+  pass  and the refusal names the reason, which is a place rather than a time  ("NOT AT THE REFIT TERMINAL")
+  pass  walking to it during a rest opens the shop  (phase rest, atTerminal true)
+^C

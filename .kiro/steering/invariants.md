@@ -545,7 +545,41 @@ schedule. A stopped fortress alone now halts reinforcements outright.
 A burrowing enemy is deliberately **excluded** from the pressure count: there is
 nothing the crew can act on yet, and pacing should not be gated on something
 invisible.
-→ tests 16, 50, 54, 55
+
+**But the halt withholds the next wave, NOT credit for the last one.** That distinction
+was missing for a long time and nothing asserted it either way. `immobileWeight` is 0.40
+against a `calmBelow` of 0.35, so while the fortress is below a tripod the hull term alone
+put `calm` arithmetically out of reach — at full health, with an empty field, for ever.
+One getter was gating two unrelated questions, so a crew that killed every last enemy with
+four legs down never had the wave marked resolved.
+
+Everything downstream of `resolved` is payment for work already done: the wave-clear
+scrap, the pick cadence, the end of a siege, and the phase clause the refit terminal
+reads. So a wrecked fortress withheld the money for the fight the crew had just won, and
+shut the shop that sells the repair rig at the one moment it is wanted. The refusal even
+named the wrong clause — `NOT WHILE A WAVE IS OUT`, with nothing on the field — which is
+exactly the failure 23b's three separate reasons exist to prevent. Reported in those
+words: "I killed all the enemies but I cannot shop".
+
+Two getters now. `settled` asks about the **field** and ends an ENGAGED wave; `calm` is
+`settled && !immobilised` and is what lets a REST become a PREP. The hull clause is
+unchanged and deliberate — nothing arrives while you are dead in the sand — and the
+measurements behind it are untouched: still 0 spawned while immobilised, still held for a
+full minute, byte-identical.
+
+Worth naming the shape, because it is the third time this project has hit it: **one
+predicate serving two questions is a bug waiting for the questions to diverge.** Same
+family as `open` versus `pickOpen` sharing `safeMoment` but not `atTerminal`, and as the
+two pressure halves here. When a condition is asked for two reasons, split it before the
+reasons drift.
+
+The stalling *incentive* this exposed is deliberately NOT addressed. A crippled fortress
+still halts reinforcements indefinitely, priced only by the elapsed-time hp ramp, and
+whether that price is right is unmeasured. Measuring it wants a losing player's ledger —
+total stall time and accumulated ramp cost across a siege with a deliberately weak
+defender — which is the same shape as the 400 s camped-at-the-console measurement in 23.
+Two variables, one at a time.
+→ tests 16, 50, 54, 55, 105
 
 **19b. Every wave is telegraphed, and a guaranteed rest precedes it.** Deep Rock
 Galactic gives 15-20 s before a swarm so players can set defences; that window is

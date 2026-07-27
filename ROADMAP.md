@@ -5,7 +5,7 @@ Design context is in `.kiro/steering/`. Read `product.md` first, then
 
 ```
 npm start      # http://localhost:5173
-npm run verify  # 106 sections, 793 checks, headless
+npm run verify  # 107 sections, 803 checks, headless
 npm run audit   # static checks the harness structurally cannot make
 npm run cost    # draw calls, triangles, shadow casters, lights — no renderer needed
 npm run imports # every import specifier resolves
@@ -40,7 +40,7 @@ Everything that was on this roadmap below Tier 3 is built and measured.
 | Update 2 The Roster — enemy variety | next, after a playtest |
 | Tier 3 Networked players on a moving platform | untouched, and needs an engine spike |
 
-793 headless checks pass. Two consecutive full runs differ in exactly one line:
+803 headless checks pass. Two consecutive full runs differ in exactly one line:
 the wall-clock performance reading.
 
 ## What is actually missing, and the three updates that fix it

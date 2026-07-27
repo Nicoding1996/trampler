@@ -495,6 +495,11 @@
     background: linear-gradient(90deg, transparent, var(--brass), transparent);
   }
   #gate p { margin: 0; color: var(--ink-dim); font-size: 13px; line-height: 1.7; }
+  /* The hint is tucked under the call to action deliberately, so "how to start" and
+     "the one thing to know when you do" read as a single block rather than as two
+     competing lines. The controls key is pushed clear of both. */
+  #gate .one { margin-top: 12px; }
+  #gate .keys { margin-top: 22px; }
   #gate b { color: var(--accent); }
   #gate .cta {
     margin-top: 22px; font-size: 13px; letter-spacing: 0.24em; color: var(--warn);
@@ -723,13 +728,46 @@
 
   <div id="banner"></div>
 
+  <!-- Three jobs and no more: name the thing, get you in, and say the one thing
+       that cannot be learned by playing. Everything else was content the first wave
+       teaches for free, and it was being read at the one moment the player wants to
+       start.
+
+       OUT: the pillar line, "ride the fortress or fight on foot -- you cannot do
+       both". It is the design's own thesis, and printing it here primes the tester on
+       the single question the whole prototype exists to answer: whether the
+       oscillation happens ON ITS OWN. The geometry already teaches it, which is the
+       depression-clamp lesson again -- invariant 1 puts the 3 m hull slab in the way
+       of every downward ray and invariant 10 draws the impact marker, so a player
+       shooting at a chewer from the deck watches the rounds hit their own hull. The
+       clamp came out because the slab already did the job; so does this sentence. The
+       framing a TESTER needs is still there, behind H, under "What this test is for",
+       which is the right side of that key for instrumentation.
+
+       OUT: the landmark count, which the route panel says at the moment it matters.
+
+       STAYS: the grapple, because it is the only thing on this screen that fails
+       SILENTLY. Invariant 2 makes it the sole route aboard, so a player who does not
+       know it exists steps off the deck once and reasonably concludes the deck is
+       somewhere you start rather than somewhere you return to. No amount of play
+       reveals that, because nothing announces the way up. It earns the one content
+       slot on the strength of being unlearnable.
+
+       OUT: the refit-bay and diagnostics keys. Neither does anything a player can SEE
+       from here -- both panels stack under an opaque gate, so pressing them looks
+       broken while silently toggling state you then start the game with -- and
+       "` diagnostics" is instrumentation advertised on the front door. Both are in the
+       help panel already.
+
+       The action is second now rather than last, and the hint sits under it so the two
+       read as one block. Its visual WEIGHT is a separate change and has not been made:
+       13px --warn breathing to 0.55 is still the faintest thing here. -->
   <div id="gate">
     <h1>TRAMPLER</h1>
     <div class="rule"></div>
-    <p>Ride the fortress or fight on foot. You cannot do both.<br>
-      Four landmarks, a siege at each, and something waiting at the last one.</p>
-    <p style="margin-top:12px"><b>H</b> controls &middot; <b>Tab</b> refit bay &middot; <b>`</b> diagnostics</p>
     <div class="cta">CLICK TO PLAY</div>
+    <p class="one"><b>RIGHT MOUSE</b> grapples you aboard &mdash; it is the only way up.</p>
+    <p class="keys"><b>H</b> controls</p>
     <div class="err" id="gate-err"></div>
   </div>
 

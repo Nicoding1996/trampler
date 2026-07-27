@@ -50,6 +50,21 @@ function near(label, actual, expected, tol) {
     `got ${actual.toFixed(3)}, want ${expected.toFixed(3)} +/- ${tol}`);
 }
 
+/**
+ * Same idea as `near`, with the tolerance as a percentage of the expected value.
+ *
+ * Exists for the survival times in invariant 2b's family. Those are quoted in the
+ * steering files as measurements and were previously only PRINTED, so two of the three
+ * drifted 11% and 4% with the suite fully green. A percentage band is the right shape
+ * for them: the absolute values span 60 s to 131 s, so one fixed tolerance would be
+ * slack at the top and brittle at the bottom.
+ */
+function nearPct(label, actual, expected, pct) {
+  const tol = Math.abs(expected) * (pct / 100);
+  ok(label, Math.abs(actual - expected) <= tol,
+    `got ${actual.toFixed(1)}, want ${expected.toFixed(1)} +/-${pct}% (${tol.toFixed(1)})`);
+}
+
 function makeInput() {
   return {
     locked: true,
@@ -1197,6 +1212,81 @@ console.log("\n25. A climb onto the hull tracks the moving hull");
 }
 
 // ---------------------------------------------------------------------------
+// Reported by the owner watching a boarding: enemies visibly pass THROUGH the hull on
+// the way up. They did. `CLIMBING` drives a body along a hull-local path with no
+// collision, and the path ran from a start outboard and below the deck to an end 1.2 m
+// INBOARD of the flank -- so it cut the corner, and the corner is the 3 m hull slab.
+// Measured before the fix: 0.88 s of a 2.20 s climb inside solid armour, identically on
+// all eight routes, on every single boarding.
+//
+// It is invariant 9 as well as a visual fault, though the correctness half turned out
+// much smaller than expected and that is worth recording. The prediction was that the
+// body would be unshootable in there, since `shootFrom` is the only place occlusion is
+// applied. Firing the real rifle at it from the sand outboard measured 352 of 424 rounds
+// still LANDING -- because the body was at most a metre inboard and its own half-width
+// put the near face of its hit box outside the flank. So the honest finding is 17% of
+// shots eaten during that window, not immunity. Fixed for the visual, which is what was
+// actually reported; the shooting improved from 80% to 95% of rounds landing as a
+// side effect.
+console.log("\n25b. A climb stays outside the hull it is climbing");
+{
+  const sim = makeSim();
+  const { trampler, horde } = sim;
+  const HULL_DEPTH = 3; // slab is local y -3..0, x +/-halfW
+
+  let worstStep = 0;
+  let checked = 0;
+  let insideFrames = 0;
+  let reached = 0;
+  let deepest = 0;
+
+  for (let routeIndex = 0; routeIndex < trampler.climbRoutes.length; routeIndex++) {
+    const route = trampler.climbRoutes[routeIndex];
+    const e = horde.spawn(CLIMBER);
+    e.routeIndex = routeIndex;
+    e.state = ENEMY_STATE.CLIMBING;
+    e.climbT = 0;
+    e.climbFrom.copy(route.start);
+    const w = trampler.localToWorld(route.start.clone());
+    e.x = w.x; e.y = w.y; e.z = w.z;
+
+    // A WALKING hull on purpose. The path is authored in hull-local space, so the claim
+    // is a local-space one and has to hold while the fortress moves underneath it.
+    let prev = new THREE.Vector3(e.x, e.y, e.z);
+    let frames = 0;
+    while (e.state === ENEMY_STATE.CLIMBING && frames < 400) {
+      frames++;
+      step(sim, 1);
+      const here = new THREE.Vector3(e.x, e.y, e.z);
+      worstStep = Math.max(worstStep, here.distanceTo(prev));
+      prev = here;
+
+      const l = localOf(trampler, here);
+      checked++;
+      if (Math.abs(l.x) < trampler.halfW && l.y > -HULL_DEPTH && l.y < 0) {
+        insideFrames++;
+        deepest = Math.max(deepest, trampler.halfW - Math.abs(l.x));
+      }
+    }
+    if (e.onHull) reached++;
+    horde.clear();
+  }
+
+  ok("every route was actually climbed (test is not vacuous)",
+    reached === trampler.climbRoutes.length && checked > 400,
+    `${reached}/${trampler.climbRoutes.length} routes completed over ${checked} frames`);
+  ok("a climbing body is never inside the hull slab", insideFrames === 0,
+    insideFrames === 0
+      ? `0 of ${checked} frames`
+      : `${insideFrames} frames, up to ${deepest.toFixed(2)} m inboard of the flank`);
+  // Holding the inboard move back concentrates it into the top of the climb, so the
+  // per-frame travel is the thing this change could plausibly have broken. Asserted here
+  // rather than left to test 52, which would catch it but would not say why.
+  ok("and holding the inboard move back did not turn it into a lurch",
+    worstStep < 0.35, `worst frame-to-frame move ${worstStep.toFixed(3)} m`);
+}
+
+// ---------------------------------------------------------------------------
 // Straight from a playtest: an enemy attacking the reactor could not be killed.
 // It had walked inside the reactor box, so the reactor's own mesh absorbed
 // every bullet aimed at it.
@@ -2106,6 +2196,22 @@ console.log("\n48. Emitters delay the spiral but cannot stop it alone");
     armed.reached
       ? `still crippled without a player, at ${(armed.frames / 60).toFixed(1)}s`
       : "AUTOMATION ALONE WON");
+
+  // Both times PINNED as well as printed, and this is the section that earned the rule.
+  // These two are invariant 2b's baseline figures, quoted in the steering files, and they
+  // had drifted 11% and 4% from what is written there with every check above still green
+  // -- because "crippled" was asserted and the time was only reported. Nothing was wrong
+  // with the game; the record had silently stopped matching it, and the record is what
+  // makes the next difficulty change attributable.
+  //
+  // Deliberately NOT asserted: that `armed` beats `bare`. Invariant 19c says wall-clock
+  // survival under a live director measures nothing about a defensive tool's
+  // contribution, because killing things lowers pressure and brings the next wave
+  // sooner. The fixed-force measurement below is where that claim belongs.
+  nearPct("undefended time-to-crippled is about what the record says",
+    bare.frames / 60, 60.3, 10);
+  nearPct("and so is the time with three emitters up",
+    armed.frames / 60, 80.5, 10);
 
   // Their contribution has to be measured with the director OUT of the loop.
   // Pacing is now adaptive: emitters lower pressure by killing things, which
@@ -4171,7 +4277,17 @@ console.log("\n75. Boarders walk around deck scenery instead of through it");
   const mast = trampler.colliders.find((b) => b.tag === "mast");
   let insideMast = 0;
   let insideAny = 0;
-  step(sim, 60 * 20, () => {
+  // ARRIVAL, not "still aboard". The previous version of this section asserted
+  // `e.onHull` under the label "and it still got where it was going", and `onHull`
+  // only means "did not fall off the deck" -- which a boarder pressed motionless
+  // against the mast satisfies perfectly. It did: measured, this exact scenario
+  // parked at local (0.00, -1.85), one body radius off the mast's aft face, with its
+  // distance to the reactor frozen at 4.85 m for the full 20 s, and this section
+  // reported three passes. The straight line from (0, -6) runs through the mast, so
+  // the test was aimed at the right thing and then measured the wrong one.
+  let arrivedAt = -1;
+  let closest = Infinity;
+  step(sim, 60 * 20, (i) => {
     const l = localOf(trampler, new THREE.Vector3(e.x, e.y, e.z));
     const r = CFG.enemies.climber.radius * 0.5; // generous: only count real overlap
     if (l.x > mast.min.x + r && l.x < mast.max.x - r
@@ -4185,13 +4301,107 @@ console.log("\n75. Boarders walk around deck scenery instead of through it");
         break;
       }
     }
+
+    const surf = trampler.reactorSurfaceWorld(new THREE.Vector3(e.x, e.y, e.z));
+    const d = Math.hypot(e.x - surf.x, e.y - surf.y, e.z - surf.z);
+    closest = Math.min(closest, d);
+    if (d < CFG.enemies.climber.reactorReach && arrivedAt < 0) arrivedAt = i / 60;
   });
 
   ok("a boarder never ends a frame inside the mast", insideMast === 0,
     `${insideMast} frames inside`);
   ok("nor inside any other piece of deck furniture", insideAny === 0,
     `${insideAny} frames inside something`);
-  ok("and it still got where it was going", e.onHull);
+  ok("it is still aboard", e.onHull);
+  ok("and it actually REACHED the reactor, rather than merely staying on the deck",
+    arrivedAt >= 0,
+    arrivedAt >= 0
+      ? `arrived at ${arrivedAt.toFixed(2)} s, closest ${closest.toFixed(2)} m`
+      : `never arrived, closest ${closest.toFixed(2)} m in 20 s`);
+}
+
+// ---------------------------------------------------------------------------
+// The generalised form of 75. One scenario proves the mechanism; the pin was a
+// GEOMETRIC condition -- aim perpendicular to the face you are pressed against --
+// so it has to be checked wherever the geometry produces it, not just at the mast.
+//
+// The starts are the eight boarding-route exits `#buildClimbPoints` authors, plus
+// the same eight nudged +/-0.6 m to stand in for a crowd's separation push, which is
+// worth up to `speed * 0.9` sideways and so trivially produces this. Measured before
+// the detour existed: 7/8 clean and 12/16 nudged, five pin points across four
+// separate pieces of furniture. The nudged column is the one that matters -- a route
+// that only works when nothing jostles you is not a route.
+console.log("\n75b. Every boarding route reaches the reactor, jostled or not");
+{
+  const reach = CFG.enemies.climber.reactorReach;
+
+  // Fresh sim per start. Sharing one would let earlier boarders separate against
+  // later ones, which is the crowd effect the nudge is standing in for -- measuring
+  // it twice, in an uncontrolled way, instead of pathing.
+  const runFrom = (lx, lz) => {
+    const sim = makeSim();
+    const { trampler, horde } = sim;
+    trampler.walking = false;
+    trampler.turning = false;
+    // Operative parked well clear: this is a pathing measurement, and a boarder that
+    // stops to hit the player is not a boarder that failed to path. Detached from the
+    // hull as well as moved, or based movement just carries them back onto the deck.
+    sim.player.position.set(0, 400, 0);
+    sim.player.base = null;
+
+    const e = horde.spawn(CLIMBER);
+    e.state = ENEMY_STATE.ON_DECK;
+    e.onHull = true;
+    const w = trampler.localToWorld(new THREE.Vector3(lx, 0.95, lz));
+    e.x = w.x; e.y = w.y; e.z = w.z;
+
+    // 10 s, not 20. Every measured arrival was under 3 s and a slide adds at most a
+    // couple of metres at full speed, so this is generous; and 27 sims at 20 s each
+    // is a lot of suite runtime to spend on headroom nothing uses.
+    let arrived = false;
+    step(sim, 60 * 10, () => {
+      const surf = trampler.reactorSurfaceWorld(new THREE.Vector3(e.x, e.y, e.z));
+      if (Math.hypot(e.x - surf.x, e.y - surf.y, e.z - surf.z) < reach) arrived = true;
+    });
+    return arrived;
+  };
+
+  const exits = [];
+  for (const side of [-1, 1]) {
+    for (const z of [-9, -3, 3, 9]) exits.push([side * 6.8, z]);
+  }
+
+  let clean = 0;
+  const cleanFails = [];
+  for (const [x, z] of exits) {
+    if (runFrom(x, z)) clean++;
+    else cleanFails.push(`(${x.toFixed(1)}, ${z})`);
+  }
+  ok("every boarding route exit reaches the reactor", clean === exits.length,
+    `${clean}/${exits.length}${cleanFails.length ? ` -- failed ${cleanFails.join(" ")}` : ""}`);
+
+  let jostled = 0;
+  const jostledFails = [];
+  for (const [x, z] of exits) {
+    for (const dz of [-0.6, 0.6]) {
+      if (runFrom(x, z + dz)) jostled++;
+      else jostledFails.push(`(${x.toFixed(1)}, ${(z + dz).toFixed(1)})`);
+    }
+  }
+  ok("and still does after 0.6 m of crowd jostle", jostled === exits.length * 2,
+    `${jostled}/${exits.length * 2}`
+    + `${jostledFails.length ? ` -- failed ${jostledFails.join(" ")}` : ""}`);
+
+  // The specific trap the measurement found, kept as its own check because it is the
+  // clearest statement of the rule: the starboard crate sits at local z 4..7, wholly
+  // inside the reactor's own z extent of 3..7, so a boarder anywhere on that crate's
+  // outboard face aims EXACTLY along the face normal. Every one of these froze with
+  // local z identical to two decimal places for 20 s.
+  let faceOk = 0;
+  const faceZ = [4.0, 5.5, 7.0];
+  for (const z of faceZ) if (runFrom(6.0, z)) faceOk++;
+  ok("the starboard crate's outboard face is not a permanent trap",
+    faceOk === faceZ.length, `${faceOk}/${faceZ.length} escaped`);
 }
 
 // ---------------------------------------------------------------------------
@@ -4398,6 +4608,19 @@ console.log("\n77. Fully refitted AND fully moduled, automation still cannot hol
     trampler.immobilised
       ? `crippled at ${(frames / 60).toFixed(1)}s, wave ${director.wave}`
       : "EVERY DEFENSIVE SYSTEM TOGETHER HELD THE LINE -- THE PILLAR IS BROKEN");
+  // And PINNED, not merely printed. This number is quoted in two steering files as the
+  // headline measurement for invariant 2b-i, and a figure that is only ever printed is
+  // free to wander -- which the other two numbers in this family did, by 11% and 4%,
+  // with every check still green because they were reported as detail rather than
+  // asserted. Same trap as the refit terminal's "6.3 m" comment: a number defended only
+  // by a comment is not defended.
+  //
+  // A band rather than an equality, because the simulation is deterministic but not
+  // frozen: a change to boarder pathing moved a sibling measurement 0.2% without
+  // touching anything defensive. 10% is wide enough to ignore that and tight enough that
+  // the drift which went unnoticed would have been caught. A failure here is not
+  // necessarily a bug -- it means re-measure, then update the record on purpose.
+  nearPct("and it is still crippled at about the recorded time", frames / 60, 131.2, 10);
   ok("and no amount of repair rig repaired anything unattended",
     trampler.legHp.some((h) => h <= 0),
     `legs [${trampler.legHp.map((h) => Math.round(h)).join(",")}]`);
@@ -8245,6 +8468,106 @@ console.log("\n104. Nine pellets do not multiply the proc layer");
     killsPerSecond(sweepP) <= killsPerSecond(rifleP),
     `${killsPerSecond(sweepP).toFixed(1)} kills/s against the rifle's`
     + ` ${killsPerSecond(rifleP).toFixed(1)}`);
+}
+
+// ---------------------------------------------------------------------------
+// A crippled fortress used to make a wave UNRESOLVABLE, and nothing asserted it
+// either way.
+//
+// `immobileWeight` is 0.40 against a `calmBelow` of 0.35, so while the hull is below a
+// tripod that one term puts `calm` permanently out of reach -- not merely unlikely,
+// arithmetically unreachable, at full health with an empty field. And `calm` gated two
+// completely different questions: "has this wave been dealt with" and "can the crew take
+// another one". So killing every last enemy with four legs down left the phase in ENGAGED
+// for ever.
+//
+// Every consequence pointed the wrong way. No wave-clear scrap for work actually done, no
+// pick from the cadence, a siege that cannot end, and the refit terminal reporting NOT
+// WHILE A WAVE IS OUT against an empty field -- a refusal naming a clause that is not
+// true, which is the exact failure invariant 23b's three-reason split exists to prevent.
+// Worst of it: the shop is where the repair rig and the hull plate are sold, so it was
+// shut at the one moment it is most needed. Reported as "I killed all the enemies but I
+// cannot shop".
+//
+// The halt itself is invariant 19 and stays. It is the SPAWNING half that is meant to
+// stop, not the crew's credit for clearing the field, and this section asserts both
+// halves so a later fix to one cannot quietly undo the other.
+console.log("\n105. A crippled fortress still gets credit for clearing the field");
+{
+  const sim = makeSim();
+  const { trampler, horde, director, economy } = sim;
+  shopReady(sim); // at the terminal, so the buy clause can be read as well
+  sim.waves = true;
+
+  // The wave has to be genuinely OUT before anything is crippled. Crippling first
+  // proves nothing: no wave would ever spawn for there to be one to resolve.
+  director.callEarly();
+  step(sim, 4);
+  while (director.phase === PHASE.SPAWNING) step(sim, 1);
+
+  ok("a wave is actually on the field (test is not vacuous)",
+    director.phase === PHASE.ENGAGED && horde.liveCount > 0,
+    `phase ${director.phase}, ${horde.liveCount} alive`);
+
+  // Arranged rather than fought for: four legs gone is below a tripod.
+  for (let i = 0; i < 4; i++) trampler.damageLeg(i, 1e6);
+  ok("and the fortress is crippled", trampler.immobilised,
+    `${trampler.workingLegs()} legs working`);
+
+  // The pressure term is why this section exists, so state it as a measurement rather
+  // than trusting two numbers in two config blocks to stay in this relationship.
+  ok("being crippled alone exceeds the calm threshold -- that is the mechanism",
+    CFG.waves.pressure.immobileWeight > CFG.waves.pressure.calmBelow,
+    `immobile ${CFG.waves.pressure.immobileWeight} vs calmBelow`
+    + ` ${CFG.waves.pressure.calmBelow}`);
+
+  // Now the crew kills every last one of them.
+  horde.clear();
+  ok("the field is genuinely empty (test is not vacuous)",
+    horde.liveCount === 0 && horde.underHull === 0,
+    `${horde.liveCount} alive, ${horde.underHull} beneath`);
+
+  const resolvedBefore = director.resolved;
+  const scrapBefore = economy.scrap;
+  step(sim, 5);
+
+  ok("clearing the field resolves the wave even with the hull down",
+    director.resolved === resolvedBefore + 1,
+    `resolved ${resolvedBefore} -> ${director.resolved}, phase ${director.phase}`);
+  ok("so the crew is paid for the wave they actually cleared",
+    economy.scrap > scrapBefore,
+    `${scrapBefore.toFixed(0)} -> ${economy.scrap.toFixed(0)} scrap`);
+  ok("and the terminal opens, which is where the repair rig is sold",
+    economy.open, `closedReason "${economy.closedReason}"`);
+
+  // The other half, and the half that must NOT move: invariant 19 still withholds
+  // reinforcements. A resolved wave is credit for work done, not permission to send
+  // the next one at a fortress lying in the sand.
+  let spawned = 0;
+  const origSpawn = horde.spawn.bind(horde);
+  horde.spawn = (t, s, a) => {
+    const e = origSpawn(t, s, a);
+    if (e) spawned++;
+    return e;
+  };
+
+  const waveAt = director.wave;
+  const waited = CFG.waves.minRest + CFG.waves.prepTime + 10;
+  step(sim, 60 * waited);
+  ok("but no reinforcements arrive while it is still crippled",
+    director.wave === waveAt && spawned === 0,
+    `wave ${director.wave}, ${spawned} spawned over ${waited}s`);
+  ok("and the pacing reports the hold rather than merely doing nothing",
+    director.holding,
+    `phase ${director.phase}, pressure ${(director.pressure * 100).toFixed(0)}%`);
+
+  // Repairing releases it -- after the telegraph, not instantly.
+  trampler.repairAll();
+  sim.player.hp = sim.player.maxHp;
+  sim.player.timeSinceHurt = 99;
+  step(sim, 60 * (CFG.waves.prepTime + 3));
+  ok("repairing the legs releases the next wave", director.wave > waveAt,
+    `wave ${waveAt} -> ${director.wave}`);
 }
 
 ok("no boarder ever floated off the deck footprint", !sawFloatingBoarder);

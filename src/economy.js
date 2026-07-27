@@ -55,6 +55,18 @@ export class Economy {
   // an economy exists at all.
   #resolvedSeen = 0;
 
+  // Whether a wave has been out since the last time the buy window was announced.
+  // Starts false so the opening rest says nothing: the crew spawns on the deck with
+  // nothing having happened yet, and a shop announcing itself at spawn is the push
+  // behaviour invariant 23 spent three versions removing.
+  #calloutArmed = false;
+
+  // How many times the buy window has opened away from the console, for a pure
+  // reader to poll. Deliberately NOT cleared by `reset()`: it is a lifetime
+  // presentation counter like `trampler.stepCount`, not run state, and zeroing it
+  // would make a restart look like a fresh callout to anything watching for a change.
+  refitCallouts = 0;
+
   constructor({
     player, trampler, weapon, repair, horde, director, modules = null, events = null,
   }) {
@@ -790,6 +802,34 @@ export class Economy {
         this.#resolvedSeen++;
         this.#payWaveClear(this.#resolvedSeen);
       }
+    }
+
+    // ---- the buy window opening, for a crew that cannot see the console.
+    //
+    // The kiosk's own lamp answers "is it open" from anywhere on the deck, and it
+    // structurally cannot answer it from UNDERNEATH: the hull is in the way, which is
+    // invariant 1 doing its job rather than a fault to route around. So the one
+    // position the sign can never reach gets a transient line instead.
+    //
+    // ARMED BY A WAVE GOING OUT, so it fires at most once per wave. Edge-detecting
+    // `safeMoment` on its own would repeat: a rest legally permits `holdUntilCleared`
+    // survivors, so one of them wandering past the operative flips the proximity
+    // clause off and back and every flip would be another announcement.
+    //
+    // Silent at the console, because the panel in front of you already changes from
+    // locked to live — 23b's rule that a refusal names itself, read forwards.
+    //
+    // Counted rather than flagged, so a reader polls it exactly like
+    // `trampler.footfalls` and `weapon.shots` and there is nothing to clear. The rule
+    // lives here rather than in `hud.js` for the reason the number-key router does:
+    // the harness cannot see the DOM, so anything decided in the presentation layer
+    // has no test behind it.
+    const phase = this.director?.phase;
+    if (phase === PHASE.SPAWNING || phase === PHASE.ENGAGED) {
+      this.#calloutArmed = true;
+    } else if (this.#calloutArmed && this.safeMoment && !this.atTerminal) {
+      this.#calloutArmed = false;
+      this.refitCallouts++;
     }
 
     if (!input) return;

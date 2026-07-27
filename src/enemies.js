@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { CFG, ENEMY_TYPE_KEYS, enemyCfg, afterArmour } from "./config.js";
-import { makeRandom } from "./util.js";
+import { makeRandom, clamp, lerp, smoothstep } from "./util.js";
 import { Look, enemyGeometry } from "./look.js";
 
 // Pooled horde on InstancedMesh with a spatial hash for separation.
@@ -81,6 +81,12 @@ export const isSubmerged = (e) => e.state === S.BURROWED;
 
 const _v = new THREE.Vector3();
 const _local = new THREE.Vector3();
+// Their own, rather than borrowed from the two above. `_v` holds the reactor target
+// during the state switch and is reused for the deck-edge probe after integration, so
+// a module-level vector shared between two things that both run in one frame is a bug
+// waiting for someone to reorder them.
+const _flowProbe = new THREE.Vector3();
+const _flowDir = new THREE.Vector3();
 const _m = new THREE.Matrix4();
 const _q = new THREE.Quaternion();
 const _scl = new THREE.Vector3(1, 1, 1);
@@ -99,6 +105,55 @@ const _yAxis = new THREE.Vector3(0, 1, 0);
 // numbers that get argued about.
 const TINT_BANDS = 4;
 const TINT_FLOOR = 0.42;
+
+// How far the deck routing field will look for a way back on when a body is standing
+// somewhere the grid calls solid. Three cells is 1.2 m at the current resolution, which
+// covers the only way this happens in practice -- resting against a face, so at most one
+// cell deep. Kept here rather than in CFG because it is the shape of the mechanism, not
+// a number anyone would tune for feel.
+const FLOW_RESCUE_RINGS = 3;
+
+/**
+ * Does the 2D segment a->b touch `box` expanded by `r`? Slab test, x/z only.
+ *
+ * Scalars in, boolean out, no allocation: this runs per boarder per frame and test 17
+ * pins the whole simulation step under a millisecond.
+ */
+function segmentHitsBox(ax, az, bx, bz, box, r) {
+  const minX = box.min.x - r;
+  const maxX = box.max.x + r;
+  const minZ = box.min.z - r;
+  const maxZ = box.max.z + r;
+
+  let t0 = 0;
+  let t1 = 1;
+
+  const dx = bx - ax;
+  if (Math.abs(dx) < 1e-9) {
+    if (ax <= minX || ax >= maxX) return false;
+  } else {
+    let n = (minX - ax) / dx;
+    let f = (maxX - ax) / dx;
+    if (n > f) { const sw = n; n = f; f = sw; }
+    if (n > t0) t0 = n;
+    if (f < t1) t1 = f;
+    if (t0 > t1) return false;
+  }
+
+  const dz = bz - az;
+  if (Math.abs(dz) < 1e-9) {
+    if (az <= minZ || az >= maxZ) return false;
+  } else {
+    let n = (minZ - az) / dz;
+    let f = (maxZ - az) / dz;
+    if (n > f) { const sw = n; n = f; f = sw; }
+    if (n > t0) t0 = n;
+    if (f < t1) t1 = f;
+    if (t0 > t1) return false;
+  }
+
+  return true;
+}
 
 /** Uniform spatial hash. Only used for neighbour separation, so hash
  *  collisions are harmless -- a false neighbour is a negligible extra nudge. */
@@ -145,6 +200,13 @@ export class Horde {
     this.burrowed = 0;
     this.cursor = 0;
     this.grid = new Grid(CFG.enemies.separation * 2);
+
+    // How boarders get to the reactor past the deck's furniture. Built once, here,
+    // because the deck is static in HULL space -- which is the same property that lets
+    // everything else aboard be stored in hull-local coordinates. Lives in the Horde
+    // rather than the Trampler because it is keyed by enemy body size, and the fortress
+    // deliberately holds no knowledge of the horde.
+    this.deckFlow = this.#buildDeckFlow();
 
     // Counters, for audio and the HUD. Polling a counter keeps the simulation
     // unaware that a mixer or a particle system exists.
@@ -196,6 +258,9 @@ export class Horde {
         shoveVz: 0,
         // Holds one of the reactor's limited engagement slots.
         reactorSlot: false,
+        // Which face of a piece of deck furniture this body is pressed against, set
+        // by the push-out and consumed by the next steer. -1 is "nothing in the way".
+        // 0 means the push was along x so the slide runs on z, 1 the other way round.
       };
     }
 
@@ -339,6 +404,7 @@ export class Horde {
     e.reactorSlot = false;
     e.shoveVx = 0;
     e.shoveVz = 0;
+
 
     if (cfg.goal === "reactor") {
       e.state = S.TO_CLIMB;
@@ -581,11 +647,48 @@ export class Horde {
         }
 
         case S.CLIMBING: {
-          // Position is driven along a hull-local line, so the route tracks the
+          // Position is driven along a hull-local path, so the route tracks the
           // walking, turning hull for free.
           const route = t.climbRoutes[e.routeIndex];
           e.climbT = Math.min(1, e.climbT + dt / (cfg.climbTime * this.climbScale));
-          _local.lerpVectors(e.climbFrom, route.end, e.climbT);
+
+          // The rise is linear; the INBOARD move is held back until the body has crested
+          // the deck. A single lerp from a start that is outboard AND below to an end
+          // that is inboard AND above has no choice but to cut the corner, and the corner
+          // is the 3 m hull slab: measured at 0.88 s of a 2.20 s climb spent inside solid
+          // armour, identically on all eight routes, on every boarding. It now rides up
+          // the flank and hauls itself over the edge, which is both correct and what
+          // climbing is supposed to look like.
+          //
+          // The knee is where the body's centre reaches the deck surface (local y = 0),
+          // derived from `climbFrom` rather than written as a fraction, because a climb
+          // starts from wherever the body actually was -- a fixed fraction would put the
+          // corner at a different height for every approach.
+          //
+          // x and z share the schedule because both are horizontal. z is usually a no-op,
+          // since a route's start and end have the same z, but `climbFrom` is the body's
+          // real position and can differ.
+          // The rise is EASED rather than linear, and that is about the lateral, not the
+          // rise. Holding the inboard move back leaves only the fraction of the climb
+          // above the knee to cover it, and with a linear rise that is 12% of 2.2 s for
+          // 1.9 m -- which measured as a 0.326 m frame-to-frame step against invariant
+          // 20's 0.35 m ceiling. Passing, but it had eaten nearly all the slack that
+          // ceiling exists to leave, so the guard would no longer catch a real teleport.
+          // Getting to deck level sooner buys the vault room to be gentle, and reads
+          // correctly too: a body hauls itself up the flank and then swings over.
+          const rise = 1 - (1 - e.climbT) * (1 - e.climbT);
+          const span = route.end.y - e.climbFrom.y;
+          const knee = span > 1e-6 ? clamp(-e.climbFrom.y / span, 0, 1) : 0;
+          // Linear, not smoothstepped: smoothstep peaks at 1.5x its own average, and the
+          // peak is exactly the number invariant 20 measures.
+          const lateral = rise <= knee
+            ? 0
+            : clamp((rise - knee) / Math.max(1e-6, 1 - knee), 0, 1);
+          _local.set(
+            lerp(e.climbFrom.x, route.end.x, lateral),
+            lerp(e.climbFrom.y, route.end.y, rise),
+            lerp(e.climbFrom.z, route.end.z, lateral),
+          );
           t.localToWorld(_local);
           e.x = _local.x;
           e.y = _local.y;
@@ -608,6 +711,25 @@ export class Horde {
           _v.set(e.x, e.y, e.z);
           t.reactorSurfaceWorld(_v, _v);
           const d = this.#steer(e, speed, _v);
+
+          // Straight at it while the line is clear, and route only when it is not.
+          // Deliberately this way round rather than always following the field: the
+          // direct steer is smooth and exact, while a grid gives eight directions, and
+          // most of the deck most of the time has nothing in the way. It also keeps the
+          // cost where it belongs -- the geometry test only runs for boarders that are
+          // actually obstructed.
+          if (d >= cfg.reactorReach && !this.#lineToReactorClear(e, cfg)) {
+            _flowProbe.set(e.x, e.y, e.z);
+            t.worldToLocal(_flowProbe);
+            if (this.#flowDir(_flowProbe.x, _flowProbe.z, cfg, _flowDir)) {
+              // The field is in hull space; the hull only yaws, so this is a plain 2D
+              // rotation and it is exact.
+              const c = Math.cos(t.yaw);
+              const s = Math.sin(t.yaw);
+              e.vx = (_flowDir.x * c + _flowDir.z * s) * speed;
+              e.vz = (-_flowDir.x * s + _flowDir.z * c) * speed;
+            }
+          }
 
           if (d < cfg.reactorReach) {
             e.vx = 0;
@@ -736,10 +858,307 @@ export class Horde {
   }
 
   /**
+   * Let a boarder SLIDE along the face it is pressed against, instead of pressing
+   * into it forever.
+   *
+   * This is the other half of `#avoidDeckScenery`, and shipping only that half was
+   * the bug. Making deck furniture solid stopped boarders walking through crates;
+   * nothing gave them a way past one. `#steer` aims straight at the reactor, the
+   * push-out shoves the body back out of whatever it walked into, and the pair
+   * produce a wall-slide ONLY on an oblique approach -- because that slide is just
+   * the leftover tangential part of a velocity nobody ever corrected. Dead-on, there
+   * is no leftover, so the body presses into the face at full speed for the rest of
+   * the run.
+   *
+   * Measured before this existed, one boarder at a time on a stationary hull:
+   *
+   *   - 1 of 8 boarding-route exits never reached the reactor, and 4 of 16 once the
+   *     start was nudged 0.6 m to stand in for a crowd's separation push -- which is
+   *     worth up to `speed * 0.9` sideways, so it happens constantly.
+   *   - The starboard crate's whole outboard face was a permanent trap: local z
+   *     identical to two decimal places across 20 s. Exactly zero slide, not slow.
+   *   - Five pin points across four separate pieces of furniture, every one of them
+   *     a perpendicular press: the mast's aft face, both amidships crates, and the
+   *     forward crate.
+   *
+   * It failed silently and worse than it looks. A pinned boarder still counts in
+   * `aboard`, so it is a permanent contribution to director pressure (invariant 19)
+   * that never resolves, and it is neither a threat you have to answer nor one that
+   * goes away.
+   *
+   * WHY A FLOW FIELD AND NOT A STEERING RULE. Four reactive rules were written and
+   * measured before this, and each one fixed the case it was aimed at and broke
+   * another: project the velocity onto the face (19/24 route starts arriving, up from
+   * 19), reject a blocked direction, widen the degeneracy band (21/24), commit to a
+   * sense of rotation and circumnavigate (20/24). The last one is the instructive
+   * failure. A boarder leaving the port-aft route meets the ENGINE BLOCK first and
+   * correctly commits to going forward around it, then meets the STARBOARD CRATE,
+   * where that same committed sense points away from the reactor. Commit per obstacle
+   * instead and the pocket deadlock comes straight back, because the pocket is two
+   * boxes taking turns.
+   *
+   * The reason is structural, not a bad constant. The deck's obstacle envelopes form
+   * CONCAVE UNIONS -- the port crate and the engine block overlap once expanded by a
+   * body radius, and so do the mast and the forward crate -- and escaping a concave
+   * union requires reasoning about the union. A rule that can only see the face it is
+   * touching cannot do that, and no fifth variant would have either.
+   *
+   * So: one breadth-first search per body radius, once, at construction, over a coarse
+   * grid of the deck in HULL-LOCAL space. Boarders read a direction out of an array.
+   * Three properties make this the right answer rather than merely a working one:
+   *
+   *   - It is DERIVED FROM THE COLLIDERS, not authored beside them. A hand-placed
+   *     waypoint graph is a second description of the deck that drifts from the first
+   *     the moment somebody moves a crate, and this whole bug is what silent drift
+   *     costs. Move the furniture and the field moves with it.
+   *   - The search is GLOBAL, so pockets are not a special case to be handled. There
+   *     is nothing left to get wrong about them.
+   *   - It is cheaper than any of the four rules it replaces: no per-frame geometry
+   *     queries at all, just an array read.
+   *
+   * Deterministic, which invariant 21 requires: fixed grid, fixed iteration order, no
+   * randomness anywhere in the build.
+   */
+  #buildDeckFlow() {
+    const t = this.trampler;
+    const cell = CFG.enemies.deckFlowCell;
+    const cols = Math.ceil((t.halfW * 2) / cell);
+    const rows = Math.ceil((t.halfL * 2) / cell);
+    const fields = new Map();
+
+    // Deck height in hull space, which is where a boarder's centre sits. Local y = 0 is
+    // the DECK SURFACE, not the ground, so a body standing on it is at half its height.
+    for (const key of ENEMY_TYPE_KEYS) {
+      const cfg = CFG.enemies[key];
+      const rKey = Math.round(cfg.radius * 100);
+      if (fields.has(rKey)) continue;
+      fields.set(rKey, this.#solveDeckFlow(cols, rows, cell, cfg));
+    }
+
+    return { cell, cols, rows, fields };
+  }
+
+  /** One BFS: mark what a body of this size cannot occupy, then flood from the reactor. */
+  #solveDeckFlow(cols, rows, cell, cfg) {
+    const t = this.trampler;
+    const y = cfg.height / 2;
+    const r = cfg.radius;
+    const rb = t.reactorBox;
+
+    const blocked = new Uint8Array(cols * rows);
+    const dist = new Int32Array(cols * rows).fill(-1);
+    const dirX = new Float32Array(cols * rows);
+    const dirZ = new Float32Array(cols * rows);
+
+    // Cell CENTRES. Note the parenthesising on the row: `(i / cols) | 0 + 0.5` parses
+    // as `(i / cols) | 0.5`, which is an integer truncation and silently throws the
+    // half-cell offset away, sampling every row on its boundary instead of its middle.
+    const cx = (i) => -t.halfW + ((i % cols) + 0.5) * cell;
+    const cz = (i) => -t.halfL + (((i / cols) | 0) + 0.5) * cell;
+
+    const queue = new Int32Array(cols * rows);
+    let head = 0;
+    let tail = 0;
+
+    for (let i = 0; i < blocked.length; i++) {
+      const x = cx(i);
+      const z = cz(i);
+      const half = cell * 0.5;
+      // The WHOLE cell has to be clear, not just its centre. A cell that merely contains
+      // a clear point will happily tell a body standing in the obstructed part of it to
+      // walk into the wall -- measured exactly that way before this was conservative.
+      if (this.#cellBlocked(x - half, x + half, z - half, z + half, y, cfg)) {
+        blocked[i] = 1;
+        continue;
+      }
+      // Goal cells: close enough to the reactor's SURFACE to attack it. Measured to the
+      // surface and not the centre, for invariant 9's reason -- an attacker that closed
+      // on the centre would be standing inside the box that shields it.
+      const dx = x - clamp(x, rb.min.x, rb.max.x);
+      const dz = z - clamp(z, rb.min.z, rb.max.z);
+      if (Math.hypot(dx, dz) <= cfg.reactorReach) {
+        dist[i] = 0;
+        queue[tail++] = i;
+      }
+    }
+
+    // Four-connected flood. The eight-way direction comes out of the gradient below, so
+    // the flood itself stays simple and cannot cut a corner it has no room for.
+    while (head < tail) {
+      const i = queue[head++];
+      const col = i % cols;
+      const row = (i / cols) | 0;
+      for (let k = 0; k < 4; k++) {
+        const nc = col + (k === 0 ? 1 : k === 1 ? -1 : 0);
+        const nr = row + (k === 2 ? 1 : k === 3 ? -1 : 0);
+        if (nc < 0 || nc >= cols || nr < 0 || nr >= rows) continue;
+        const j = nr * cols + nc;
+        if (blocked[j] || dist[j] >= 0) continue;
+        dist[j] = dist[i] + 1;
+        queue[tail++] = j;
+      }
+    }
+
+    // Gradient: head for the reachable neighbour closest to the reactor, diagonals
+    // included so the motion does not read as a body walking on a chessboard. A
+    // diagonal is only allowed when both of its orthogonals are open, or a boarder
+    // would clip the corner of a crate it cannot fit past.
+    for (let i = 0; i < dist.length; i++) {
+      if (dist[i] <= 0) continue;
+      const col = i % cols;
+      const row = (i / cols) | 0;
+      let bestD = dist[i];
+      let bx = 0;
+      let bz = 0;
+      for (let dz2 = -1; dz2 <= 1; dz2++) {
+        for (let dx2 = -1; dx2 <= 1; dx2++) {
+          if (dx2 === 0 && dz2 === 0) continue;
+          const nc = col + dx2;
+          const nr = row + dz2;
+          if (nc < 0 || nc >= cols || nr < 0 || nr >= rows) continue;
+          const j = nr * cols + nc;
+          if (dist[j] < 0) continue;
+          if (dx2 !== 0 && dz2 !== 0) {
+            if (blocked[row * cols + nc] || blocked[nr * cols + col]) continue;
+          }
+          if (dist[j] < bestD) {
+            bestD = dist[j];
+            bx = dx2;
+            bz = dz2;
+          }
+        }
+      }
+      const len = Math.hypot(bx, bz);
+      if (len > 0) {
+        dirX[i] = bx / len;
+        dirZ[i] = bz / len;
+      }
+    }
+
+    return { dist, dirX, dirZ };
+  }
+
+  /**
+   * Hull-local direction a boarder of this type should walk to reach the reactor, or
+   * null if the field has nothing to say -- off the grid, inside geometry, or in a
+   * genuinely walled-off cell. Callers fall back to steering straight at the target,
+   * which is exactly the old behaviour and no worse.
+   */
+  #flowDir(localX, localZ, cfg, out) {
+    const f = this.deckFlow;
+    const field = f.fields.get(Math.round(cfg.radius * 100));
+    if (!field) return null;
+
+    const t = this.trampler;
+    const col = Math.floor((localX + t.halfW) / f.cell);
+    const row = Math.floor((localZ + t.halfL) / f.cell);
+    const onGrid = col >= 0 && col < f.cols && row >= 0 && row < f.rows;
+
+    if (onGrid) {
+      const i = row * f.cols + col;
+      if (field.dist[i] === 0) return null; // already in range of the reactor
+      if (field.dist[i] > 0 && (field.dirX[i] !== 0 || field.dirZ[i] !== 0)) {
+        out.set(field.dirX[i], 0, field.dirZ[i]);
+        return out;
+      }
+    }
+
+    // Standing in a cell the field calls solid, which happens ROUTINELY rather than as
+    // an edge case: the push-out leaves a body resting exactly ON an expanded face, and
+    // the cell containing that point is by definition blocked. Measured as the last
+    // remaining stall -- three boarders parked on the engine block's starboard face at
+    // local (5.55, 8.15) while the grid insisted nothing could be standing there.
+    //
+    // So walk out to the nearest cell that does have a route and head for its centre.
+    // Nearest ring first, then lowest distance within that ring, which is deterministic
+    // and gets the body back onto the field in one short step.
+    let bestI = -1;
+    let bestD = Infinity;
+    for (let ring = 1; ring <= FLOW_RESCUE_RINGS && bestI < 0; ring++) {
+      for (let dz = -ring; dz <= ring; dz++) {
+        for (let dx = -ring; dx <= ring; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== ring) continue;
+          const nc = col + dx;
+          const nr = row + dz;
+          if (nc < 0 || nc >= f.cols || nr < 0 || nr >= f.rows) continue;
+          const j = nr * f.cols + nc;
+          if (field.dist[j] < 0) continue;
+          if (field.dist[j] < bestD) {
+            bestD = field.dist[j];
+            bestI = j;
+          }
+        }
+      }
+    }
+    if (bestI < 0) return null;
+
+    const tx = -t.halfW + ((bestI % f.cols) + 0.5) * f.cell;
+    const tz = -t.halfL + (((bestI / f.cols) | 0) + 0.5) * f.cell;
+    const dx = tx - localX;
+    const dz = tz - localZ;
+    const len = Math.hypot(dx, dz);
+    if (len < 1e-6) return null;
+    out.set(dx / len, 0, dz / len);
+    return out;
+  }
+
+  /**
+   * Is the straight line from this body to the reactor's surface clear of deck
+   * furniture? Slab test on x/z in hull space, exact because the hull only yaws.
+   *
+   * The reactor is skipped: it is the destination, so the segment always ends inside
+   * its own expanded box.
+   */
+  #lineToReactorClear(e, cfg) {
+    const t = this.trampler;
+    const r = cfg.radius;
+
+    _flowProbe.set(e.x, e.y, e.z);
+    t.worldToLocal(_flowProbe);
+    const ax = _flowProbe.x;
+    const ay = _flowProbe.y;
+    const az = _flowProbe.z;
+
+    const rb = t.reactorBox;
+    const bx = clamp(ax, rb.min.x, rb.max.x);
+    const bz = clamp(az, rb.min.z, rb.max.z);
+
+    for (const b of t.deckObstacles) {
+      if (b === rb) continue;
+      if (ay + cfg.height * 0.5 < b.min.y || ay - cfg.height * 0.4 > b.max.y) continue;
+      if (segmentHitsBox(ax, az, bx, bz, b, r)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Does a hull-local cell square overlap any deck obstacle, for a body of this size?
+   *
+   * The REACTOR is included here, unlike in the occlusion tests. Its own volume is not
+   * standable, so leaving it out would let the field route a path straight through the
+   * thing boarders are supposed to stop at the surface of -- invariant 9 from the other
+   * side. Goal cells are the free cells within reach of that surface, chosen separately.
+   */
+  #cellBlocked(x0, x1, z0, z1, y, cfg) {
+    const r = cfg.radius;
+    for (const b of this.trampler.deckObstacles) {
+      if (y + cfg.height * 0.5 < b.min.y || y - cfg.height * 0.4 > b.max.y) continue;
+      if (x1 <= b.min.x - r || x0 >= b.max.x + r) continue;
+      if (z1 <= b.min.z - r || z0 >= b.max.z + r) continue;
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Push a boarder out of the deck's solid scenery, in hull-local space.
    *
    * Returns true if it moved. Cheapest-axis resolution on x/z only, matching what
    * the player controller does, minus the vertical case.
+   *
+   * Collision only. WHERE a boarder goes is the flow field's business -- keeping the
+   * two apart is the lesson of the four steering rules that were tried here first, all
+   * of which tried to make the push-out double as navigation.
    */
   #avoidDeckScenery(local, cfg) {
     const r = cfg.radius;
