@@ -729,7 +729,82 @@ because the bay draws its own sockets. Both purses were **added**, because they 
 only on the shop panel — which is up for about a third of a siege, so for the rest of it
 the player was earning money they could not see. The owner asked whether scrap still
 existed. It did.
+
+**AND THE CONSEQUENCE THAT COSTS SOMETHING: THE RETICLE IS NOT AVAILABLE.** This needs
+recording because the idea it rules out is a *good* one that will be had again.
+
+The comment on `#combat` defends bottom-left partly as "the FPS convention". That half of
+the defence does not hold up. The convention is habituation rather than optimisation, and
+the measured version of the argument is Dreadnought's: they put ship health and energy at
+bottom-centre, were told by their own team it belonged in the lower corners like a
+shooter, tried it, found it *worse*, and ended up flanking the crosshair with two arcs for
+a better-than-fourfold improvement in index of difficulty — after which they could make
+the elements smaller. The honest reading of 27b's own history is that bottom-left was
+chosen by **elimination**, because every other corner was taken, and then rationalised.
+
+So "move the vitals next to the crosshair" is live, correct-sounding, and now closed off —
+not by taste, but because the reticle became the most transient-dense zone on screen while
+27b was being obeyed. `centre-middle` holds the target readout 26 px below the crosshair
+and the income tick 52 px above it, and both of them belong there: one names what you are
+aiming at, the other says what a kill just paid. A permanent gauge among them is 27b's own
+failure with the roles swapped, and test 67 says so outright — a permanent box at
+`left: 50%; top: 50%` reports as covered by both.
+
+Note that the zone model cannot tell "beside the reticle" from "under it", and that is the
+same deliberate limit recorded above rather than a second one. The two really would not
+overlap at ±70 px horizontally. But they would not overlap *only because of vertical
+separation the test cannot see*, between boxes whose heights are content-driven — which is
+exactly the drift a rectangle test was rejected for inviting.
+
+**What was done instead is the other half of Dreadnought's own equation.** Their model is
+distance OVER signal strength, so the two trade: raising the signal at a fixed distance
+buys what moving closer buys. See 27c.
 → test 67
+
+**27c. A PERMANENT READOUT HAS TO SURVIVE BEING SEEN OUT OF THE CORNER OF THE EYE.**
+27b decided where the vitals panel goes. This is about what it may carry once it is there,
+and it is the clause that made 27b's corner good enough to keep.
+
+Peripheral vision resolves brightness, hue and motion. It does not resolve fine detail,
+and it does not resolve text at all — letters crowd each other, so a string outside the
+couple of degrees you are actually looking at is not "hard to read", it is unreadable.
+Four rules fall out, and every one of them was being broken:
+
+- **A gauge states its BAND, not only its length.** Health and the reactor were green
+  gradients scaled on x, so the entire reading was a bar being somewhat shorter, and
+  length is the single property the periphery judges worst. At a glance a green bar at 20%
+  and one at 60% are the same object. They now carry amber and red bands from
+  `CFG.hud.hurtBelow` / `criticalBelow`, and the reactor's amber point is *the same knob*
+  that fires the full-frame alarm, so the bar and the alarm cannot come to disagree about
+  when the reactor is in trouble. The leg pips had always done this; the two bars the run
+  actually hangs on had not, which is the asymmetry that gave it away.
+- **A count is a numeral and a place is a marker; neither is a sentence.** `hostiles 9
+  (4 under, 0 aboard)` gave three numbers with different jobs identical weight in a form
+  none of them could be read in. The total is ambient pressure — the pacing rule already
+  says eight enemies loitering at 60 m are not eight chewing the legs. What you act on is
+  the other two, and each names one of the two positions the whole game is about. They are
+  now a 26 px numeral plus two markers drawn ONLY when non-zero, because a marker
+  *appearing* is motion, and `0 aboard` was a reading that cost attention and said
+  nothing.
+- **A total answers a planning question; an ARRIVAL needs its own signal.** Both purses
+  stay on the panel — 27b put them there for a good reason — but a small tabular figure in
+  the corner cannot report that something just happened. So income also arrives as a
+  transient figure above the reticle, accumulated over `CFG.hud.tickHold` so a burst of
+  four kills is one growing number rather than four fighting for the same 20 px. Polled as
+  a delta on `economy.earned`, which never decreases within a run: watching the purses
+  instead would report a purchase as income running backwards.
+- **A readout that can only be acted on in one PLACE belongs on the prompt.** The emitter
+  rack's `3 / 3` named a key and a ratio, never said what an emitter was, and was
+  actionable only while on foot beneath the hull. It is a contextual prompt now, which
+  means the placement rule teaches itself by the prompt appearing as you step under the
+  hull — the depression-clamp lesson, applied to a HUD row. The evidence that the old form
+  was not working is as direct as it gets: the owner asked what the row meant.
+
+One behaviour was deliberately dropped. The hostiles total no longer turns red above six
+under the hull. That was a bare `6` in the presentation layer colouring the TOTAL by a
+different number, and an amber `7 UNDER HULL` says it better, in the place the count
+lives, from the first hostile rather than the seventh.
+→ tests 67, 84
 
 **28. The number keys have exactly one owner per frame.** The refit panel, the refit
 bay, a road choice and a pending salvage pick all want 1-6. `routePurchaseInput`

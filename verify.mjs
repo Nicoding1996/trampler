@@ -3615,7 +3615,8 @@ console.log("\n67. The HUD is wired to markup that exists, and panels do not pil
   ])].filter((id) => panels.some((p) => p.id === id) || writesInto(id));
 
   ok("the transient readouts are in scope now, not just the panels",
-    boxIds.includes("prompt") && boxIds.includes("target") && boxIds.includes("buffs"),
+    boxIds.includes("prompt") && boxIds.includes("target") && boxIds.includes("buffs")
+    && boxIds.includes("tick"),
     boxIds.join(", "));
 
   const permanent = boxIds.filter((id) => !hiddenByDefault(id));
@@ -5876,6 +5877,77 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     ok("a lit charge warns on the prompt, because nothing else does", sawFuse,
       `"${fuseHud.promptLabel.textContent}"`);
 
+    // ---- the emitter prompt, which replaced a permanent `emitters 3 / 3` row
+    //
+    // The row named a key and a ratio, said nothing about what an emitter was or when to
+    // place one, and was actionable only on foot beneath the hull. As a prompt it says
+    // the same thing every other entry in that chain says -- the action available where
+    // you are standing -- so the placement rule teaches itself by the prompt appearing.
+    //
+    // Driven by standing the operative in the real placement zone rather than by writing
+    // `emitters.ready`, because the half that can rot is whether the geometry and the
+    // prompt agree about where "beneath the hull" is.
+    const emSim = makeSim();
+    const emHud = new Hud();
+    const ectx = () => ({
+      ...emSim, guns: emSim.guns, input: emSim.input, gun: null, fps: 60, dt: DT,
+    });
+    const emKey = CFG.emitters.deployKey.replace("Key", "");
+    emSim.trampler.walking = false;
+    emSim.trampler.turning = false;
+    emSim.player.dropToGround();
+    // Local y = 0 is the DECK SURFACE, so only x/z come from the hull centre; the world
+    // y is set outright to put the operative on the sand underneath it.
+    const beneathHull = emSim.trampler.localToWorld(new THREE.Vector3(0, 0, 0));
+    emSim.player.position.set(beneathHull.x, 1.2, beneathHull.z);
+    try {
+      step(emSim, 2);
+      emHud.update(ectx());
+    } catch (err) {
+      failures.push(`emitter prompt: ${err.message}`);
+    }
+    ok("standing under the hull on foot offers the emitter, with its key and what is left",
+      emSim.emitters.ready
+      && emHud.prompt.className.includes("show")
+      && emHud.promptKey.textContent === emKey
+      && emHud.promptLabel.textContent.includes("EMITTER")
+      && emHud.promptLabel.textContent.includes(`${CFG.emitters.max} LEFT`),
+      `"${emHud.promptKey.textContent} ${emHud.promptLabel.textContent}"`);
+
+    // The count is the part the deleted row was actually carrying, so it has to move
+    // with it rather than being dropped on the floor.
+    const placedOne = !!emSim.emitters.deploy(emSim.player);
+    try {
+      step(emSim, 1);
+      emHud.update(ectx());
+    } catch (err) {
+      failures.push(`emitter prompt after one: ${err.message}`);
+    }
+    ok("and the count comes down as the rack empties",
+      placedOne && emHud.promptLabel.textContent.includes(`${CFG.emitters.max - 1} LEFT`),
+      `placed ${emSim.emitters.deployedCount}, prompt "${emHud.promptLabel.textContent}"`);
+
+    // An empty rack is SILENT, and that is a decision rather than an oversight, so it is
+    // pinned here. Saying NO EMITTERS LEFT would be the better prompt -- it answers "I
+    // pressed X and nothing happened" and it would name C, which is otherwise only in the
+    // help panel -- but `canDeploy` tests the count before the position, so an empty rack
+    // reads the same way up on the deck. Isolating the case worth naming needs either a
+    // reordering that changes the strings test 46 asserts on, or a second copy of the
+    // placement geometry. When that lands, this assertion should fail and be rewritten.
+    while (emSim.emitters.available > 0) emSim.emitters.deploy(emSim.player);
+    try {
+      step(emSim, 1);
+      emHud.update(ectx());
+    } catch (err) {
+      failures.push(`emitter prompt empty: ${err.message}`);
+    }
+    ok("and an empty rack says nothing at all, which is a recorded gap not an accident",
+      emSim.emitters.deployedCount === CFG.emitters.max
+      && !emSim.emitters.ready
+      && emHud.prompt.className === "",
+      `${emSim.emitters.deployedCount} out, blockReason "${emSim.emitters.blockReason}",`
+      + ` prompt class "${emHud.prompt.className}"`);
+
     // ---- the target readout
     //
     // Every branch: nothing under the reticle, an unarmoured thing at full health,
@@ -6039,6 +6111,172 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
       !buffHud.buffs.className.includes("show"),
       `bonus ${buffSim.items.bonus}, class "${buffHud.buffs.className}"`);
 
+    // ---- hostiles: one numeral, plus a marker for each of the two places
+    //
+    // This was one string, `9  (4 under, 0 aboard)`, which peripheral vision cannot read
+    // at all and which gave three numbers with different jobs identical weight. Both
+    // counts come from the horde's own per-frame recount rather than being written into
+    // it, because the half that can rot is whether the panel and the recount agree.
+    const hostSim = makeSim();
+    const hostHud = new Hud();
+    const hctx = () => ({
+      ...hostSim, guns: hostSim.guns, input: hostSim.input, gun: null, fps: 60, dt: DT,
+    });
+    hostSim.trampler.walking = false;
+    hostSim.trampler.turning = false;
+    try {
+      step(hostSim, 1);
+      hostHud.update(hctx());
+    } catch (err) {
+      failures.push(`hostiles empty: ${err.message}`);
+    }
+    // Empty markers are the contract the CSS `:empty` rule hides on. A marker written
+    // with "0 ABOARD" would be a reading that costs attention and conveys nothing.
+    ok("an empty field is a bare numeral with neither marker drawn",
+      hostHud.el.live.textContent === "0"
+      && hostHud.el.under.textContent === ""
+      && hostHud.el.aboard.textContent === "",
+      `"${hostHud.el.live.textContent}" / under "${hostHud.el.under.textContent}"`
+      + ` / aboard "${hostHud.el.aboard.textContent}"`);
+
+    const hullCentre = hostSim.trampler.localToWorld(new THREE.Vector3(0, 0, 0));
+    const shadowed = 3;
+    for (let i = 0; i < shadowed; i++) {
+      const c = hostSim.horde.spawn(CHEWER);
+      // x/z only: the spawn already put it at standing height on the sand, and guessing
+      // that height here is how a test ends up asserting against mid-air.
+      c.x = hullCentre.x + i * 0.6;
+      c.z = hullCentre.z;
+    }
+    try {
+      step(hostSim, 1);
+      hostHud.update(hctx());
+    } catch (err) {
+      failures.push(`hostiles under: ${err.message}`);
+    }
+    ok("hostiles under the hull get their own marker, which names the place not a number",
+      hostSim.horde.underHull === shadowed
+      && hostHud.el.live.textContent === String(hostSim.horde.liveCount)
+      && hostHud.el.under.textContent === `${shadowed} UNDER HULL`
+      && hostHud.el.aboard.textContent === "",
+      `horde recounted ${hostSim.horde.underHull} under of ${hostSim.horde.liveCount} live;`
+      + ` panel says "${hostHud.el.live.textContent}" + "${hostHud.el.under.textContent}"`);
+
+    // The other half of the pillar. Placed on the deck and marked aboard rather than
+    // climbed up there for real -- test 14 owns the climb and it costs hundreds of
+    // frames. `horde.aboard` is still asserted, so this cannot pass without the recount
+    // having agreed.
+    const boarder = hostSim.horde.spawn(CLIMBER);
+    const onDeck = hostSim.trampler.localToWorld(new THREE.Vector3(0, 0.95, 4));
+    boarder.x = onDeck.x;
+    boarder.y = onDeck.y;
+    boarder.z = onDeck.z;
+    boarder.onHull = true;
+    try {
+      step(hostSim, 1);
+      hostHud.update(hctx());
+    } catch (err) {
+      failures.push(`hostiles aboard: ${err.message}`);
+    }
+    ok("and hostiles aboard get the other marker, so the two places never share a reading",
+      hostSim.horde.aboard === 1
+      && hostHud.el.aboard.textContent === "1 ABOARD"
+      && hostHud.el.under.textContent === `${shadowed} UNDER HULL`,
+      `horde recounted ${hostSim.horde.aboard} aboard and ${hostSim.horde.underHull} under;`
+      + ` panel says "${hostHud.el.under.textContent}" + "${hostHud.el.aboard.textContent}"`);
+
+    // ---- the income tick
+    //
+    // Driven with real kills through the real damage choke point rather than by writing
+    // `economy.earned`, because the half that can rot is whether a kill's payout and the
+    // HUD's reading of it agree at all.
+    const paySim = makeSim();
+    const payHud = new Hud();
+    const pctx = () => ({
+      ...paySim, guns: paySim.guns, input: paySim.input, gun: null, fps: 60, dt: DT,
+    });
+    try {
+      // First update BASELINES. Money the crew earned before the HUD existed is not an
+      // arrival, and reporting it as one is the bug this frame exists to avoid.
+      payHud.update(pctx());
+    } catch (err) {
+      failures.push(`income baseline: ${err.message}`);
+    }
+    ok("with nothing earned this frame there is no income tick on screen",
+      payHud.tick.className === "" && payHud.lastEarned !== null,
+      `class "${payHud.tick.className}", baselined ${payHud.lastEarned !== null}`);
+
+    const paidFor = paySim.horde.spawn(CHEWER);
+    const salvBefore = paySim.economy.earned.salvage;
+    const scrapBefore = paySim.economy.earned.scrap;
+    paySim.horde.damage(paidFor, paidFor.maxHp * 10, "player");
+    const paidSalv = paySim.economy.earned.salvage - salvBefore;
+    const paidScrap = paySim.economy.earned.scrap - scrapBefore;
+    try {
+      payHud.update(pctx());
+    } catch (err) {
+      failures.push(`income tick: ${err.message}`);
+    }
+    // Both lines, because invariant 22 is the whole economy and this would be the first
+    // place in the game to blur the two purses into one number.
+    ok("a kill that pays shows what it paid, both purses, next to the reticle",
+      paidSalv > 0 && paidScrap > 0
+      && payHud.tick.className.includes("show")
+      && payHud.tickSalvage.textContent === `+${Math.round(paidSalv)} SALVAGE`
+      && payHud.tickScrap.textContent === `+${Math.round(paidScrap)} SCRAP`,
+      `paid ${paidSalv} salvage / ${paidScrap} scrap, showing`
+      + ` "${payHud.tickSalvage.textContent}" + "${payHud.tickScrap.textContent}"`);
+
+    // ACCUMULATION, handed something to accumulate. A test of this that took whatever
+    // the frame happened to offer could pass on a single kill and prove nothing.
+    const firstReading = payHud.tickSalvage.textContent;
+    const alsoPaid = paySim.horde.spawn(CHEWER);
+    paySim.horde.damage(alsoPaid, alsoPaid.maxHp * 10, "player");
+    try {
+      payHud.update(pctx());
+    } catch (err) {
+      failures.push(`income accumulate: ${err.message}`);
+    }
+    ok("a second kill inside the window ADDS to the figure rather than replacing it",
+      payHud.tickSalvage.textContent === `+${Math.round(paidSalv * 2)} SALVAGE`
+      && payHud.tickSalvage.textContent !== firstReading,
+      `"${firstReading}" then "${payHud.tickSalvage.textContent}"`
+      + ` from 2 kills at ${paidSalv} each`);
+
+    // And it leaves on its own. Updated without stepping the simulation, so `earned` does
+    // not move and the only thing happening is the window running out.
+    const holdFrames = Math.ceil(CFG.hud.tickHold / DT) + 2;
+    try {
+      for (let i = 0; i < holdFrames; i++) payHud.update(pctx());
+    } catch (err) {
+      failures.push(`income expiry: ${err.message}`);
+    }
+    ok("and it clears itself once the window passes rather than sitting there",
+      payHud.tick.className === "" && payHud.tickSalv === 0,
+      `class "${payHud.tick.className}" after ${holdFrames} frames`
+      + ` of a ${CFG.hud.tickHold}s window`);
+
+    // A restart zeroes `earned`, which reads as a negative delta. The figure must go with
+    // it -- a +N left hanging over a fresh run is reporting the previous run's money.
+    const lastPaid = paySim.horde.spawn(CHEWER);
+    paySim.horde.damage(lastPaid, lastPaid.maxHp * 10, "player");
+    try {
+      payHud.update(pctx());
+    } catch (err) {
+      failures.push(`income before reset: ${err.message}`);
+    }
+    const upBeforeReset = payHud.tick.className.includes("show");
+    paySim.economy.reset();
+    try {
+      payHud.update(pctx());
+    } catch (err) {
+      failures.push(`income after reset: ${err.message}`);
+    }
+    ok("and a restart drops it instead of reporting the previous run's money",
+      upBeforeReset && payHud.tick.className === "" && payHud.tickSalv === 0,
+      `was up: ${upBeforeReset}, now class "${payHud.tick.className}",`
+      + ` earned reset to ${paySim.economy.earned.salvage}`);
+
     // ---- the alarm, the damage flash, and the crosshair
     const feelSim = makeSim();
     const feelHud = new Hud();
@@ -6048,11 +6286,58 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     feelHud.update(fctx());
     ok("the reactor alarm is silent at full integrity", !feelHud.alarm.className.includes("on"));
 
+    // ---- the two vitals gauges report a BAND, not only a length
+    //
+    // Length alone was the whole readout for two updates, and length is the property
+    // peripheral vision resolves worst -- which is the one that matters, because 27b
+    // deliberately parked this panel in the corner of the eye. Driven through all three
+    // bands rather than asserted at one point, since the interesting failure is a
+    // threshold that never fires rather than a class that is spelled wrong.
+    ok("at full integrity neither vitals gauge carries a band",
+      feelHud.el.barHp.className === "" && feelHud.el.barReactor.className === "",
+      `hp "${feelHud.el.barHp.className}", reactor "${feelHud.el.barReactor.className}"`);
+
     feelSim.trampler.damageReactor(feelSim.trampler.maxReactorHp * 0.7);
     feelHud.update(fctx());
     ok("and it takes over the frame once the reactor is failing",
       feelHud.alarm.className.includes("on"),
       `reactor at ${(feelSim.trampler.reactorHp / feelSim.trampler.maxReactorHp * 100).toFixed(0)}%`);
+
+    // The alarm and the amber band are ONE number, so they must turn on together. Two
+    // thresholds meaning the same thing is the drift this project has a rule about, and
+    // a bar that went amber at a different moment would teach a boundary the game does
+    // not have.
+    ok("the reactor gauge goes amber on the same frame the alarm does, off one knob",
+      feelHud.el.barReactor.className === "low"
+      && feelHud.alarm.className.includes("on")
+      && feelSim.trampler.reactorHp / feelSim.trampler.maxReactorHp < CFG.hud.hurtBelow,
+      `class "${feelHud.el.barReactor.className}" at `
+      + `${(feelSim.trampler.reactorHp / feelSim.trampler.maxReactorHp * 100).toFixed(0)}%`
+      + ` against hurtBelow ${CFG.hud.hurtBelow}`);
+
+    feelSim.trampler.damageReactor(feelSim.trampler.maxReactorHp * 0.2);
+    feelHud.update(fctx());
+    ok("and it escalates to critical without the fortress having been destroyed",
+      feelHud.el.barReactor.className === "crit" && !feelSim.trampler.destroyed,
+      `class "${feelHud.el.barReactor.className}" at `
+      + `${(feelSim.trampler.reactorHp / feelSim.trampler.maxReactorHp * 100).toFixed(0)}%`
+      + ` against criticalBelow ${CFG.hud.criticalBelow}`);
+
+    // Health reads the SAME language, in its own sim so the sequence above is not
+    // perturbed. Asserted separately on purpose: a later edit reverting this one bar to
+    // a plain `fill` would otherwise pass on the reactor's evidence alone.
+    const hpSim = makeSim();
+    const hpHud = new Hud();
+    hpSim.player.spawnGrace = 0;
+    hpSim.player.hurt(hpSim.player.maxHp * (1 - CFG.hud.criticalBelow) + 1);
+    hpHud.update({
+      ...hpSim, guns: hpSim.guns, input: hpSim.input, gun: null, fps: 60, dt: DT,
+    });
+    ok("and the operative gauge uses the same bands rather than its own",
+      hpHud.el.barHp.className === "crit" && hpSim.player.hp > 0,
+      `class "${hpHud.el.barHp.className}" at `
+      + `${(hpSim.player.hp / hpSim.player.maxHp * 100).toFixed(0)}% of `
+      + `${hpSim.player.maxHp} hp`);
 
     feelSim.player.spawnGrace = 0;
     feelSim.player.hurt(30);

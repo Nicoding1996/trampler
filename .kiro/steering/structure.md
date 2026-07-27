@@ -63,8 +63,18 @@ The harness constructs the **real** `World`, `Trampler`, `Player`, `Horde`,
   **only**. They are browser-only by design.
 - Those four are **pure readers**. They poll counters the simulation already keeps
   for its own reasons — `trampler.footfalls`, `trampler.stepCount`, `weapon.shots`,
-  `horde.killCount`, `horde.lastKill`, `player.hurtCount`, `economy.purchases`. The
-  simulation has no idea a renderer, a particle system or a mixer exists.
+  `horde.killCount`, `horde.lastKill`, `player.hurtCount`, `economy.purchases`,
+  `economy.earned`. The simulation has no idea a renderer, a particle system or a mixer
+  exists.
+
+  `economy.earned` is the newest and it makes the pattern explicit: **poll a counter, do
+  not watch a value.** The income tick needs "what just arrived", and the obvious source
+  is the purses — but those go DOWN on a purchase, so the readout would report spending as
+  negative income and would lose a payout that a purchase in the same frame cancelled out.
+  `earned` only ever rises within a run, which is what makes a frame-to-frame delta on it
+  mean what it looks like. Same shape as the damage flash reading `hurtCount` rather than
+  health, and for the same reason. A reset zeroes it, so the reader has to treat a negative
+  delta as "re-baseline", not as a number to draw.
 - Addon imports (`three/addons/...`) only appear in the browser-only modules, or
   behind the headless guard as a dynamic `import()`. A static addon import in a
   simulation module would put a path in the graph that resolves only through the
@@ -261,6 +271,11 @@ added three more:
   occlusion clip that keeps chewers safe under the hull.
 - `items.bonus` / `items.reasons` — the live conditional damage and why.
 - `run.modifiers` / `run.roadsTaken` — what the roads have cost so far.
+- `emitters.ready` — whether X would do anything from where the operative is standing.
+  Published rather than left as a call the HUD makes for itself, and the reason is small
+  but worth keeping: `canDeploy()` writes `blockReason` as a side effect, so a pure reader
+  invoking it is reaching in to mutate the module it reads. Idempotent, and still the wrong
+  direction. The prompt asks every frame, so it wants a field.
 - `economy.atTerminal` / `browsing` / `open` / `safeMoment` / `pickOpen` / `closedReason` —
   the shop's whole state, decided in the module and merely drawn. Both the panels and the
   number-key router read the same getters, which is the point: a HUD that decided for

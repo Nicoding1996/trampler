@@ -1624,6 +1624,49 @@ export const CFG = {
   },
 
   // ---------------------------------------------------------------------------
+  // Where the two gauges the run hangs on change from "fine" to "act".
+  //
+  // These are here rather than as numbers in hud.js for one specific reason: the
+  // reactor's amber band and the full-frame reactor alarm are THE SAME QUESTION, and
+  // the alarm's threshold was a bare 0.5 sitting in the presentation layer. Two
+  // nearly-identical thresholds in two files drift apart — that is the failure this
+  // project has hit often enough to have a rule about — and a bar that goes amber at a
+  // different moment from the alarm is worse than no bar state at all, because it
+  // teaches the player a boundary that is not the real one.
+  //
+  // The values, and why:
+  //
+  //   0.50 — the reactor's existing alarm point, unchanged. For the operative it is
+  //   50 of 100 hp, which is the moment breaking off is still cheap: regen is 14 hp/s
+  //   after a 4 s idle, so a full recovery from here costs about 7.6 s of not being
+  //   shot at. Below it, four engaged chewers at ~40 hp/s close that window.
+  //
+  //   0.25 — 105 of 420 reactor hp, about 2.3 s at the 45 dps the three-slot cap
+  //   holds boarders to (invariant 13b), and 25 hp for the operative, which is well
+  //   under a second of contact. Both mean "you are not deciding any more".
+  //
+  // Shared between the two bars rather than tuned per bar on purpose. The point of
+  // the colour is that it is LEARNABLE at a glance in the corner of the eye, and two
+  // gauges stacked on top of each other changing band at different lengths would
+  // teach two colour languages instead of one.
+  hud: {
+    hurtBelow: 0.5,
+    criticalBelow: 0.25,
+
+    // How long the income tick stays up, and therefore how long it keeps ACCUMULATING.
+    //
+    // The window is the whole design of that readout. A rifle at 200 dps against a
+    // 50 hp chewer kills roughly four times a second in a crowd, so one popup per kill
+    // would be four numbers a second fighting over the same 20 px above the reticle --
+    // legible as flicker and nothing else. Over 1.6 s that same burst is a single figure
+    // growing to +8, which is one thing to read instead of four.
+    //
+    // Long enough to gather a burst, short enough that what is on screen is the fight
+    // you are in rather than the last one.
+    tickHold: 1.6,
+  },
+
+  // ---------------------------------------------------------------------------
   // Renderer and post-processing. All of it optional at runtime: if a device
   // cannot allocate the float targets the composer needs, main.js falls back to
   // rendering the scene directly and the game plays identically.

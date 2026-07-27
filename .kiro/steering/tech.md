@@ -168,6 +168,16 @@ correctly. Only paths that genuinely resolve outside the root are worth assertin
   Use `**/*.js` or `**/enemies.js`.
 - Redirecting through PowerShell writes UTF-16, which `findstr` refuses. Redirect
   from cmd, or read the file with the file tools.
+- **A redirect that "produced no file" may produce it minutes later.** Worse than the
+  known "does not wait" quirk: `node tools/summarise.mjs run.txt 1>out.txt 2>&1` returned
+  empty and `out.txt` genuinely did not exist when read — and then appeared, correct, long
+  after the conclusion had been drawn that the command never ran. Six such files were
+  still sitting in the project root at the end of a session that believed it had cleaned
+  up. **Retry the identical command** rather than concluding it failed, and list the root
+  before declaring the scratch files gone.
+- Inline `node -e` returned empty three times in a row in the same session for a script
+  that worked verbatim from a file. The existing rule about putting non-trivial scripts
+  under `tools/` applies to *trivial* ones too once the wrapper starts misbehaving.
 
 ## Tests that lie — check for these before trusting a pass
 
@@ -310,6 +320,25 @@ Every one of these produced a green or red result that was wrong:
   carried.
 - **Sharing a module-level scratch vector with the harness's own invariant
   checks.** `_probe` is used by `step()`. Declare a local one in a test block.
+- **`npm run audit`'s class check has two blind spots, and one of them fires on a
+  COMMENT.** Check 3 — "every CSS class assigned from code has a rule behind it" — only
+  scrapes a class name it finds as a plain string literal in the argument position. Write
+  the obvious nested ternary and the names vanish from the check entirely, silently, which
+  is a false green for the one thing that catches a class with no rule behind it. Adding
+  two band names to `hud.js` moved check 3 from 18 class names to 20 only after the
+  ternary was rewritten as three explicit branches; before that it stayed at 18 and
+  reported clean. **Confirm the count moved.**
+
+  The other form produced a false red, 137 of them. The scraper reads *raw* source
+  including comments — deliberately, since check 2 needs that — so a comment that quotes
+  call syntax followed by a backtick matches its template-literal branch, which then
+  captures everything up to the next backtick anywhere in the file and reports every
+  ordinary English word in between as a class with no CSS rule. The fix was rewording a
+  comment. Do not write cls-call syntax with a backtick in prose.
+
+  Both are the `includePattern` lesson in a different tool: a checker built on pattern
+  matching over source text has to have its *matching* verified, not just its verdict
+  read.
 
 ## Performance
 

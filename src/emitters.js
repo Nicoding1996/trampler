@@ -31,6 +31,13 @@ export class Emitters {
     this.slots = [];
     this.blockReason = "";
 
+    // Whether X would do anything right now, published rather than left as a call the
+    // HUD makes for itself. Two reasons. `canDeploy` writes `blockReason` as a side
+    // effect, and a pure reader reaching into the module it reads to mutate it is the
+    // wrong direction even when the write is idempotent. And the contextual prompt asks
+    // this every frame, so it wants a field, not a predicate.
+    this.ready = false;
+
     // Owned by the EMITTER RACK module. More emitters and deeper capacitors, but
     // still finite and still hand-placed -- invariant 2b says automation may delay
     // the fortress being crippled and must never prevent it, so nothing here ever
@@ -229,7 +236,8 @@ export class Emitters {
 
     if (input.pressed(cfg.deployKey)) this.deploy(player);
     if (input.pressed(cfg.recallKey)) this.recall(player);
-    this.canDeploy(player); // refresh blockReason for the HUD
+    // Refreshes `blockReason` for the HUD as before, and now records the answer too.
+    this.ready = this.canDeploy(player);
 
     const r2 = cfg.radius * cfg.radius;
 

@@ -252,6 +252,32 @@ only up when you are choosing what to buy; what the roads have cost sits on the 
 panel, which is only up when you are choosing the next one. Neither costs a line of
 always-visible screen, and both answer the question at the moment it arises.
 
+**And there is a second corollary about HOW, which took longer to notice: a readout in
+the corner has to be readable from the corner of the eye.** Fixing the readout is only
+cheaper than tuning if the readout actually reaches the player, and three of ours did not.
+
+The vision science is unambiguous and inconvenient. Peripheral vision resolves brightness,
+hue and motion; it does not resolve fine detail, and text it does not resolve *at all*,
+because the letters crowd each other. So a health bar that reports only by getting shorter
+is invisible to a player whose eyes are on the crosshair — length is precisely the property
+the periphery judges worst — and `hostiles 9 (4 under, 0 aboard)` is not a hard read but an
+impossible one. Both had been on screen for updates, both were correct, and neither was
+doing any work.
+
+The instinct that follows is to move the panel toward the crosshair, and the measured
+support for it is real: Dreadnought put ship vitals in the lower corners because that is
+where shooters put them, found it performed worse than the centre, and gained better than
+fourfold on their own difficulty metric by flanking the reticle instead. Their model is
+distance over signal strength, though, and that is the useful part — **the two trade.**
+Raising the signal where the panel already is buys what moving it would have bought, and
+costs nothing that is already spoken for. Which mattered here, because by the time the
+question came up the reticle was the busiest region on the screen. Invariant 27b records
+why it is now closed, and 27c records what went in its place.
+
+The general shape: **before moving a readout, check whether it is carrying its information
+in a channel the eye it is aimed at can actually receive.** A permanent panel gets one
+glance every few seconds at best, and everything it says has to survive that.
+
 **Enemy speed is a human-facing knob, not a difficulty knob.** Slowing enemies 16%
 changed the oracle's survival by one second in 227, because the oracle never
 travels. Speed spends itself almost entirely on a human's travel and reaction
@@ -295,6 +321,22 @@ it. Reading was split from buying at the same time, so the panel is legible when
 stand there and the window itself is one keypress rather than ten seconds of frantic
 comparison. The guaranteed window doubled, and — unlike the number it replaced — it is a
 floor every player gets rather than a ceiling only a good one sees.
+
+Update 1.8 changed nothing about the fight and rewrote how four readouts *carry* what they
+already knew. 1.6 had moved the vitals panel to the empty bottom-left corner, which was
+right, and then left everything on it speaking in channels the corner of an eye cannot
+receive. So: the health and reactor bars state a band in colour rather than only a length;
+the hostile count is a large numeral with a marker for each of the two positions, drawn only
+when there is something in one; income arrives as a figure above the reticle instead of only
+accruing to a total in the corner; and the emitter rack's permanent `3 / 3` became a
+contextual prompt, since it could only ever be acted on from one place.
+
+That last one is the honest measure of how bad the problem was. The rack row had been on
+screen for the whole of two updates, and the owner of the game asked what it meant — and
+then what an emitter was, and what it did. A mechanic that exists to convert "I cannot be in
+two places" into "spend something before you leave" was delivering none of that, and no
+amount of tuning its damage would have been the fix. The help panel now says what one does
+rather than only where you may put it.
 
 **The pillar is confirmed.** A solo playtest reported the intended rhythm —
 picking off the approach from a gun, dropping down to fight and repair under the

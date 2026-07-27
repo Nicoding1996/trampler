@@ -23,6 +23,34 @@ const cls = (el, want) => {
   if (el.className !== want) el.className = want;
 };
 
+/**
+ * A vitals gauge: length AND band.
+ *
+ * `fill` alone is the right thing for the prompt, telegraph and target bars -- those
+ * are timers and progress, read while looking straight at them. It is the wrong thing
+ * for health and the reactor, which live in the bottom-left corner by design (27b)
+ * while the player's eye is locked to the crosshair. Length is precisely the property
+ * peripheral vision resolves worst, so for two updates the only reading of "am I about
+ * to lose this run" was a green bar being somewhat shorter than a green bar.
+ *
+ * Kept separate from `fill` rather than folded into it: the other three bars must not
+ * gain these classes, and a shared helper writing a className would be a silent
+ * restyle of the prompt the first time a repair passed 50%.
+ */
+const gauge = (el, frac) => {
+  fill(el, frac);
+  // Three explicit branches rather than the nested ternary this obviously wants to be,
+  // and that is deliberate. Audit check 3 -- "every CSS class assigned from code has a
+  // rule behind it" -- only scrapes a class name it finds as a plain literal in the
+  // argument position. A conditional expression there hides the name from it. Written
+  // the tidy way, both band names would be invisible to the one check that catches a
+  // class with no rule behind it, and that failure is silent in the worst way: the
+  // state changes correctly and nothing on screen moves. Tidiness is not worth that.
+  if (frac < CFG.hud.criticalBelow) cls(el, "crit");
+  else if (frac < CFG.hud.hurtBelow) cls(el, "low");
+  else cls(el, "");
+};
+
 export class Hud {
   constructor() {
     const id = (s) => document.getElementById(s);
@@ -51,7 +79,6 @@ export class Hud {
       barHp: id("b-hp"),
       barReactor: id("b-reactor"),
       drive: id("r-drive"),
-      emitters: id("r-emitters"),
       // Both purses, on the always-visible panel as well as on the shop. The shop's
       // copy is the one you buy against; this one is the one you PLAN against, and it
       // exists because the shop is only up for about a third of a siege.
@@ -63,6 +90,10 @@ export class Hud {
       pressure: id("r-pressure"),
       threat: id("r-threat"),
       live: id("r-live"),
+      // The two counts that say WHERE, split out of what used to be one string. See the
+      // write site, and the markup, for why.
+      under: id("r-under"),
+      aboard: id("r-aboard"),
       kd: id("r-kd"),
     };
 
@@ -111,6 +142,17 @@ export class Hud {
     this.buffs = document.getElementById("buffs");
     this.buffGain = document.getElementById("buff-gain");
     this.buffWhy = document.getElementById("buff-why");
+
+    // The income tick, and the state it accumulates into. `lastEarned` starts null
+    // rather than zeroed so the first frame BASELINES instead of reporting every coin
+    // taken before the HUD existed as though it had just arrived.
+    this.tick = document.getElementById("tick");
+    this.tickSalvage = document.getElementById("tick-salv");
+    this.tickScrap = document.getElementById("tick-scrap");
+    this.tickSalv = 0;
+    this.tickScr = 0;
+    this.tickTimer = 0;
+    this.lastEarned = null;
 
     this.target = document.getElementById("target");
     this.targetName = document.getElementById("tgt-name");
@@ -387,6 +429,70 @@ export class Hud {
   }
 
   /**
+   * What the last second and a half of killing paid, above the reticle.
+   *
+   * The purse totals on the vitals panel are not being replaced -- they answer "can I
+   * afford the plate", which is a question asked standing at the terminal. This answers
+   * "did that pay", which is asked while looking at the thing you just shot, and until
+   * now the only place it was answered was a 12 px figure in the corner of the eye:
+   * fine detail and a short string, which are the two things peripheral vision is worst
+   * at. Motion and brief events are what it is good at, and a total cannot be either.
+   *
+   * Driven off a DELTA on `economy.earned`, which is the same shape as the damage flash
+   * reading `player.hurtCount` and the kill flash reading `horde.killCount` -- poll a
+   * counter the simulation already keeps, never watch a value. Watching the purses
+   * themselves would report a purchase as income running backwards, and would lose a
+   * payout that a purchase in the same frame happened to cancel out. `earned` never goes
+   * down within a run, which is the property that makes it the right counter to read.
+   */
+  #incomeTick(economy, dt) {
+    if (!economy) return;
+
+    const { salvage, scrap } = economy.earned;
+
+    if (this.lastEarned === null) this.lastEarned = { salvage, scrap };
+    const dSalv = salvage - this.lastEarned.salvage;
+    const dScr = scrap - this.lastEarned.scrap;
+    this.lastEarned.salvage = salvage;
+    this.lastEarned.scrap = scrap;
+
+    // A restart zeroes `earned`, so the delta goes NEGATIVE. Re-baseline and drop
+    // whatever is on screen: a +8 hanging over the first frame of a fresh run would be
+    // reporting the previous run's money, which is invariant 25's problem wearing a
+    // presentation-layer hat.
+    if (dSalv < 0 || dScr < 0) {
+      this.tickSalv = 0;
+      this.tickScr = 0;
+      this.tickTimer = 0;
+      cls(this.tick, "");
+      return;
+    }
+
+    if (dSalv > 0 || dScr > 0) {
+      this.tickSalv += dSalv;
+      this.tickScr += dScr;
+      this.tickTimer = CFG.hud.tickHold;
+    }
+
+    if (this.tickTimer <= 0) return;
+    this.tickTimer -= dt;
+    if (this.tickTimer <= 0) {
+      this.tickSalv = 0;
+      this.tickScr = 0;
+      cls(this.tick, "");
+      return;
+    }
+
+    // Rounded for display, and a line rounding to nothing is not drawn at all: "+0"
+    // states that a kill paid you nothing, which is worse than saying nothing.
+    const salv = Math.round(this.tickSalv);
+    const scr = Math.round(this.tickScr);
+    set(this.tickSalvage, salv > 0 ? `+${salv} SALVAGE` : "");
+    set(this.tickScrap, scr > 0 ? `+${scr} SCRAP` : "");
+    cls(this.tick, salv > 0 || scr > 0 ? "show" : "");
+  }
+
+  /**
    * Road choice at a landmark. Only up while the run is actually asking.
    *
    * Steps aside for a pending pick, because the two share a screen anchor and the
@@ -509,6 +615,7 @@ export class Hud {
     this.#pickPanel(economy);
     this.#routePanel(run, economy);
     this.#buffStrip(items);
+    this.#incomeTick(economy, dt);
     this.#targetPanel(weapon);
 
     // ---- movement readout
@@ -577,9 +684,11 @@ export class Hud {
     }
 
     // ---- combat
-    fill(this.el.barHp, player.hp / player.maxHp);
+    // `gauge`, not `fill`: these two report their band as well as their length. See
+    // the helper, and CFG.hud for where the bands are and why.
+    gauge(this.el.barHp, player.hp / player.maxHp);
     const reactorFrac = trampler.reactorHp / trampler.maxReactorHp;
-    fill(this.el.barReactor, reactorFrac);
+    gauge(this.el.barReactor, reactorFrac);
 
     for (let i = 0; i < this.pips.length; i++) {
       const frac = trampler.legHp[i] / CFG.trampler.legHp;
@@ -602,14 +711,14 @@ export class Hud {
     // number, one of them always on screen for a state that only exists while you are
     // sitting in a mount.
 
-    if (emitters) {
-      const ready = emitters.canDeploy(player);
-      set(
-        this.el.emitters,
-        `${emitters.available} / ${emitters.capacity}`,
-        ready ? "on" : emitters.available <= 0 ? "off" : "",
-      );
-    }
+    // The emitter rack had a permanent row here too, and it went for a stronger version
+    // of the same reason. `emitters 3 / 3` named a key and a ratio: it never said what an
+    // emitter was, what it did, or when to place one, and it was actionable only while
+    // you were on foot beneath the hull -- which is a small fraction of a siege, so for
+    // the rest of one it was instrumentation sitting in a UI slot. The evidence it was
+    // not working is direct: the owner of the game asked what the row meant.
+    //
+    // It is a contextual prompt now, down in the prompt chain. See there for why.
 
     // The purses. Salvage rises on every kill and scrap only when a wave resolves, so
     // seeing them apart is also the clearest statement invariant 22 has: one of these
@@ -669,6 +778,36 @@ export class Hud {
         horde.fusesLit > 1 ? `${horde.fusesLit} CHARGES SET — GET UNDER THE HULL` : "CHARGE SET — GET UNDER THE HULL",
         horde.fuseWarning / Math.max(CFG.enemies.sapper.fuse, 0.001),
         "blocked",
+      );
+    } else if (emitters?.ready) {
+      // On foot, beneath the hull, with something left in the rack. This is where the
+      // permanent `emitters 3 / 3` row went, and the shape of the move is the point.
+      //
+      // As a prompt it means exactly what every other entry in this chain means: the
+      // action available WHERE YOU ARE STANDING. So it needs no timing rule of its own,
+      // and it gets one for free that is better than any it could have been given —
+      // the prompt appearing as you step under the hull teaches "beneath the hull" the
+      // way the missing depression clamp taught "the hull's shadow is the safe zone".
+      // A sentence reading MUST BE BENEATH THE HULL, shown wherever you happened to be
+      // standing, would have been the worse half of that trade.
+      //
+      // Ranked below the fuse warning and the repair because both are work with a clock
+      // on them, and above the banked pick and the refit terminal because both of those
+      // are things you can walk away from. Same ordering principle as the key router:
+      // how stuck the crew is without it.
+      //
+      // Deliberately silent when the rack is empty rather than saying NO EMITTERS LEFT.
+      // That refusal is worth making — it is the one that answers "I pressed X and
+      // nothing happened", and it would name C, which is otherwise discoverable only in
+      // the help panel. But `canDeploy` tests the count BEFORE the position, so an empty
+      // rack reads as NO EMITTERS LEFT up on the deck too, and isolating the case that
+      // matters needs either a reordering that changes strings test 46 asserts on or a
+      // second copy of the placement geometry. Both are a separate change. Test 84 pins
+      // the silence so this is a recorded decision rather than an oversight.
+      this.#prompt(
+        CFG.emitters.deployKey.replace("Key", ""),
+        `DEPLOY EMITTER · ${emitters.available} LEFT`,
+        1,
       );
     } else if (economy?.pendingPick?.length) {
       // A pick is banked but this is not a moment to read three items in. Lowest
@@ -762,11 +901,34 @@ export class Hud {
       this.#hideTelegraph();
     }
 
-    set(
-      this.el.live,
-      `${horde.liveCount}  (${horde.underHull ?? 0} under, ${horde.aboard ?? 0} aboard)`,
-      (horde.underHull ?? 0) > 6 ? "bad" : "",
-    );
+    // Hostiles: one large numeral for how much is out there, and a marker for each of
+    // the two places that change what you should be doing.
+    //
+    // This was one string — `9  (4 under, 0 aboard)` — and it failed twice. A string is
+    // unreadable in peripheral vision because its own letters crowd each other, and this
+    // panel is in the corner of the eye deliberately. And it gave equal weight to three
+    // numbers with different jobs: the total is ambient pressure, while "under" and
+    // "aboard" are the two halves of the pillar telling you which way to travel.
+    //
+    // Each marker is written EMPTY when its count is zero, and the CSS hides an empty
+    // one. So the marker appearing is the signal, which is motion rather than text —
+    // the one channel the periphery actually has. `0 aboard` was a reading that cost
+    // attention and conveyed nothing.
+    //
+    // Two arguments to `set`, not three, on all three of these: the third rewrites
+    // className to "v ...", which would strip the styling classes off elements that are
+    // not diagnostics rows.
+    //
+    // The total no longer turns red at more than six under the hull. That was a bare 6
+    // in the presentation layer, and it coloured the TOTAL according to a different
+    // number — while an amber marker reading "7 UNDER HULL" says the same thing in the
+    // place the count actually lives, and says it from the first one rather than the
+    // seventh.
+    const under = horde.underHull ?? 0;
+    const aboard = horde.aboard ?? 0;
+    set(this.el.live, String(horde.liveCount));
+    set(this.el.under, under > 0 ? `${under} UNDER HULL` : "");
+    set(this.el.aboard, aboard > 0 ? `${aboard} ABOARD` : "");
     set(this.el.kd, `${weapon.kills} / ${player.deaths}`);
 
     this.#feedback(player, trampler, weapon, horde, grapple, reactorFrac, dt);
@@ -795,7 +957,12 @@ export class Hud {
     // The reactor alarm is the one thing allowed to take over the whole frame,
     // because losing it ends the run and it is the single event a player cannot
     // afford to miss while looking the wrong way.
-    const alarming = reactorFrac < 0.5 && !trampler.destroyed;
+    //
+    // Reads CFG.hud.hurtBelow, which is the same knob the reactor bar's amber band
+    // uses. Value unchanged at 0.5 -- the point is that there is now ONE number. A bar
+    // that turned amber at a different moment from the alarm would teach the player a
+    // boundary the game does not actually have.
+    const alarming = reactorFrac < CFG.hud.hurtBelow && !trampler.destroyed;
     cls(this.alarm, alarming ? "on" : "");
 
     // Crosshair: grapple validity AND weapon state. It used to report only the

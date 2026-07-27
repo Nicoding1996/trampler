@@ -157,9 +157,37 @@
   }
   /* Hostiles is the one row that changes what you do THIS SECOND, so it is the one
      row given size. Everything else here is a state you check; this is a number you
-     react to. */
-  #combat .row.loud { font-size: 14px; margin-top: 2px; }
-  #combat .row.loud .k { font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase; }
+     react to.
+
+     It used to be one string at 14 px: `9  (4 under, 0 aboard)`. That is the wrong
+     carrier for it twice over.
+
+     First, a string is the one thing peripheral vision cannot read at all -- the letters
+     crowd each other, so nothing in it resolves without looking straight at it, and this
+     panel sits in the corner of the eye on purpose. A single large numeral does resolve.
+
+     Second, and worse, it gave three numbers with completely different jobs identical
+     weight. The total is ambient pressure; the project's own pacing note says eight
+     enemies loitering at 60 m are not the same problem as eight chewing the legs. What
+     you ACT on is the other two, and each one names one of the two places the whole game
+     is about: under the hull is "get down there", aboard is "get up there". So they are
+     markers rather than words in a sentence, in the two colours severity already uses,
+     and they are drawn ONLY when non-zero -- `0 aboard` costs a reading and says nothing,
+     while a marker APPEARING is motion, which is the one thing the periphery is good at.
+     Same discipline as the buff strip: up only while it has something to say.
+
+     Hidden by `:empty` rather than by a class, so the HUD writes text and nothing else,
+     and a flex child set to display:none takes its gap with it. */
+  #combat .tally { display: flex; align-items: baseline; gap: 10px; margin: 1px 0 8px; }
+  #combat .tally .big {
+    font-size: 26px; line-height: 1; font-variant-numeric: tabular-nums;
+  }
+  #combat .tally .mark { font-size: 10px; letter-spacing: 0.16em; white-space: nowrap; }
+  #combat .tally .mark:empty { display: none; }
+  /* Amber for the legs, red for the reactor, matching what losing each one costs: a
+     broken leg stops the fortress, a lost reactor ends the run. */
+  #combat .tally .under { color: var(--warn); }
+  #combat .tally .aboard { color: var(--bad); }
   /* Segmented gauges. A smooth bar is a progress indicator; a segmented one is
      an instrument, and the notches make small changes legible at a glance. */
   .bar {
@@ -180,6 +208,31 @@
   #b-reactor { background: linear-gradient(90deg, #2f7a33, #63e06a); }
   #b-heat { background: linear-gradient(90deg, #b0752a, var(--warn)); }
   #b-heat.hot { background: linear-gradient(90deg, #a02020, var(--bad)); }
+  /* The two gauges the whole run hangs on say WHICH BAND they are in, not only how
+     long they are.
+
+     Length was the entire readout for two updates, and length is the one property
+     peripheral vision judges worst -- which matters here more than almost anywhere,
+     because invariant 27b deliberately put this panel in the corner of the eye and the
+     player's eye is locked to the crosshair. At a glance, a green bar at 20% and a
+     green bar at 60% are the same object. Hue plus brightness is what the periphery
+     can actually resolve, so the band is stated instead of inferred.
+
+     The leg pips have always worked this way -- pip / hurt / broken -- and the two
+     bars that matter more than the pips did not. That asymmetry is the bug.
+
+     Thresholds come from CFG.hud, and the amber point is the SAME knob that fires the
+     full-frame reactor alarm, so the bar and the alarm cannot come to disagree about
+     when the reactor is in trouble. */
+  #b-hp.low, #b-reactor.low { background: linear-gradient(90deg, #b0752a, var(--warn)); }
+  /* Critical adds BRIGHTNESS on top of hue, because brightness survives further into
+     the periphery than colour does. Deliberately not an animation: the reactor already
+     pulses the whole frame below this point, and a second pulse underneath it competes
+     with the one signal that is allowed to interrupt everything. */
+  #b-hp.crit, #b-reactor.crit {
+    background: linear-gradient(90deg, #c62828, #ff6b60);
+    box-shadow: 0 0 8px rgba(255, 95, 86, 0.75);
+  }
   #pips { display: flex; gap: 4px; margin: 3px 0 8px; }
   #pips .pip {
     flex: 1; height: 8px; border-radius: 1px; background: var(--good);
@@ -372,6 +425,51 @@
   #target .bar { height: 4px; margin: 4px 0 0; }
   #target .bar > span { background: linear-gradient(90deg, #a02020, var(--bad)); }
   #target.hurt .bar > span { background: linear-gradient(90deg, #b0752a, var(--warn)); }
+
+  /* ---- income tick ----
+     What a kill just paid, above the reticle, for a second and a half.
+
+     The two purse TOTALS live on the vitals panel and stay there. They were added in 1.6
+     for a real reason -- they had only ever been on the shop panel, so for the two thirds
+     of a siege you cannot buy anything you were earning money you could not see, and the
+     owner asked whether scrap still existed. But a total answers a PLANNING question:
+     "can I afford the plate", which is asked at the terminal. What was still missing is
+     the arrival.
+
+     And a small tabular figure in the corner of the eye is close to the worst possible
+     carrier for an arrival, because peripheral vision resolves neither fine detail nor
+     short strings. What it does resolve well is motion and brief events -- which is
+     precisely what a standing total can never be, and exactly what this is.
+
+     ACCUMULATED over a window rather than one popup per kill. See CFG.hud.tickHold: a
+     burst of four kills in a second is one figure growing to +8, not four numbers
+     colliding.
+
+     The two purses stay on separate lines in their own colours, because invariant 22 is
+     the whole economy and a combined "+3" would be the first place in the game to blur
+     them. Cyan is wrong here for the same reason it is right everywhere else, so salvage
+     borrows nothing from the interactive palette -- it is brass and lamp, not "you can
+     touch this".
+
+     ABOVE the reticle, because #target sits 26 px below it and the two must never meet.
+     Both are inside the couple of degrees of visual angle where text is actually legible,
+     which is the point of putting either of them here. Fades on opacity rather than
+     display, like the telegraph, because a transition needs something to interpolate. */
+  #tick {
+    position: fixed; left: 50%; top: 50%; z-index: 8;
+    transform: translate(-50%, -52px); width: 220px;
+    pointer-events: none; text-align: center;
+    opacity: 0; transition: opacity 0.5s ease-out;
+  }
+  /* Appears fast and leaves slowly: the arrival is the signal, the fade is just tidying
+     up after it. A symmetrical transition would soften the one moment worth noticing. */
+  #tick.show { opacity: 1; transition: opacity 0.07s ease-out; }
+  #tick .salv, #tick .scr {
+    font-variant-numeric: tabular-nums; letter-spacing: 0.14em;
+    text-shadow: 0 2px 9px rgba(0,0,0,0.95);
+  }
+  #tick .salv { font-size: 16px; color: var(--brass); }
+  #tick .scr { font-size: 11px; color: var(--ink-dim); }
 
   /* ---- live conditional damage ----
      Half the salvage table pays only in a particular place, or for a few seconds
@@ -575,8 +673,17 @@
       <dt>Z</dt><dd>swap weapon &mdash; the rifle reaches, the sweeper only works up close</dd>
       <dt>RMB</dt><dd>grapple winch (tap to reel)</dd>
       <dt>E</dt><dd>hold to repair &mdash; much slower while contested</dd>
-      <dt>X</dt><dd>deploy a shock emitter (on foot, under the hull)</dd>
-      <dt>C</dt><dd>pick the nearest emitter back up</dd>
+      <!-- This line used to read "deploy a shock emitter (on foot, under the hull)",
+           which says WHERE and never says WHAT. It was the only description of the
+           mechanic anywhere in the game, and the result was the owner asking what an
+           emitter was and what it did. A tool whose whole job is to be spent before you
+           leave is not one a player can reason about from a key binding. -->
+      <dt>X</dt><dd>drop a shock emitter &mdash; a post that zaps whatever comes near it,
+        on its own, while you are somewhere else. Feeble on purpose: about a tenth of your
+        rifle, and it runs dry after six shots. On foot, under the hull only &mdash; it
+        bolts to the fortress and walks with it. It buys you a few seconds down there. It
+        does not hold the line.</dd>
+      <dt>C</dt><dd>pick the nearest emitter back up, so a bad placement is not permanent</dd>
       <dt>F</dt><dd>man / leave a gun (bow sponson, stern engine block)</dd>
       <dt>&mdash;</dt><dd>mantle is automatic: jump at a ledge and look at it</dd>
       <dt>1&ndash;6</dt><dd>buy a refit &mdash; only at the <em>refit terminal</em>, the lit console
@@ -642,6 +749,14 @@
        the refit bay draws its own three sockets and a count of them told you nothing
        you could act on without opening it anyway.
 
+       GONE: the emitter rack's `3 / 3`, for a stronger version of the heat bar's reason.
+       It named a key and a ratio and never said what an emitter was or when to place
+       one, and it could only be acted on while on foot beneath the hull -- so for most
+       of a siege it was instrumentation occupying a UI slot. The evidence is direct: the
+       owner asked what the row meant. It is a contextual prompt now, which is the same
+       treatment the heat reading got and for the same reason -- a state that exists only
+       while you are standing somewhere belongs on the thing that appears when you are.
+
        FOLDED: leg count and drive percentage into the LEGS caption, since the pips
        underneath are the same fact drawn better; and journey, siege and pacing into one
        line, because "where am I" and "what is next" is one question asked twice.
@@ -660,9 +775,9 @@
       <div class="pip"></div><div class="pip"></div><div class="pip"></div>
       <div class="pip"></div><div class="pip"></div><div class="pip"></div>
     </div>
-    <div class="row loud"><span class="k">hostiles</span><span class="v" id="r-live">0</span></div>
+    <div class="lbl">hostiles</div>
+    <div class="tally"><span class="big" id="r-live">0</span><span class="mark under" id="r-under"></span><span class="mark aboard" id="r-aboard"></span></div>
     <div class="row"><span class="k">salvage · scrap</span><span class="v"><span id="v-salvage">0</span> · <span id="v-scrap">0</span></span></div>
-    <div class="row"><span class="k">emitters (X)</span><span class="v" id="r-emitters">3 / 3</span></div>
     <div class="row"><span class="k">leg <span id="r-leg">1 / 4</span> · wave <span id="r-wave">0 / 5</span></span><span class="v" id="r-next">rest 12 s</span></div>
   </div>
 
@@ -713,6 +828,11 @@
     <div class="tn" id="tgt-name">CHEWER</div>
     <div class="ta" id="tgt-armour"></div>
     <div class="bar"><span id="tgt-bar"></span></div>
+  </div>
+
+  <div id="tick">
+    <div class="salv" id="tick-salv"></div>
+    <div class="scr" id="tick-scrap"></div>
   </div>
 
   <div id="buffs">
