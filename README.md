@@ -19,6 +19,10 @@ click to start.
 `node_modules` is committed on purpose so a clone runs offline with nothing to
 install. Most of the tuning happens away from a connection.
 
+The browser loads three.js from `vendor/` rather than `node_modules/`, because
+static hosts routinely skip a directory with that name and the failure looks
+identical to a broken game. The tests resolve it from `node_modules` as normal.
+
 ## Tests
 
 ```

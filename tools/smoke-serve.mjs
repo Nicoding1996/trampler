@@ -19,12 +19,13 @@ const paths = [
   "/src/fx.js",
   "/src/audio.js",
   "/src/viewmodel.js",
-  "/node_modules/three/build/three.module.js",
-  "/node_modules/three/examples/jsm/postprocessing/EffectComposer.js",
-  "/node_modules/three/examples/jsm/postprocessing/UnrealBloomPass.js",
-  "/node_modules/three/examples/jsm/postprocessing/OutputPass.js",
-  "/node_modules/three/examples/jsm/shaders/FXAAShader.js",
-  "/node_modules/three/examples/jsm/loaders/RGBELoader.js",
+  // vendor/, not node_modules/ -- see the comment on the importmap in index.html.
+  "/vendor/three/build/three.module.js",
+  "/vendor/three/examples/jsm/postprocessing/EffectComposer.js",
+  "/vendor/three/examples/jsm/postprocessing/UnrealBloomPass.js",
+  "/vendor/three/examples/jsm/postprocessing/OutputPass.js",
+  "/vendor/three/examples/jsm/shaders/FXAAShader.js",
+  "/vendor/three/examples/jsm/loaders/RGBELoader.js",
   "/assets/manifest.json",
 ];
 

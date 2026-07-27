@@ -606,11 +606,26 @@
   @keyframes breathe { 0%,100% { opacity: 0.55; } 50% { opacity: 1; } }
   #gate .err { margin-top: 18px; color: var(--bad); font-size: 12px; max-width: 520px; }
 </style>
+<!--
+  Served from vendor/ rather than node_modules/, because static hosts routinely
+  skip a directory with that name -- GitHub Pages does it by default -- and the
+  failure presents as a blank canvas with one line in the console.
+
+  vendor/ is trimmed to what is actually served: three.module.js, the whole of
+  postprocessing/ and shaders/, and RGBELoader. 86 files, 1.6 MB, against 342
+  files and 11 MB for the untrimmed copy. Only 12 of them are reachable from the
+  six addons render.js imports, but whole folders are kept because an unused file
+  with a dangling import is harmless where a missing one is a blank canvas.
+
+  node_modules is still what `npm run verify` resolves the bare specifier from,
+  so adding an addon import means copying it here too. `npm run imports` fails
+  loudly if you forget.
+-->
 <script type="importmap">
 {
   "imports": {
-    "three": "/node_modules/three/build/three.module.js",
-    "three/addons/": "/node_modules/three/examples/jsm/"
+    "three": "/vendor/three/build/three.module.js",
+    "three/addons/": "/vendor/three/examples/jsm/"
   }
 }
 </script>
