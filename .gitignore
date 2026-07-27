@@ -1,0 +1,20 @@
+# Scratch run logs.
+#
+# The debugging workflow here is `node verify.mjs > out.txt` and then reading the
+# file, because the suite prints ~830 lines and terminal output gets truncated.
+# Sixteen of these had accumulated in the root and been committed before anyone
+# noticed. None of them belong in the history.
+*.txt
+*.log
+
+# node_modules is deliberately NOT ignored.
+#
+# It is committed so a clone runs offline with nothing to install, which is the
+# whole reason three.js is served from disk rather than a CDN. Adding it here
+# would not untrack what is already tracked, but it would silently drop any file
+# added by a future `npm install`. See the README.
+
+# OS and editor cruft.
+.DS_Store
+Thumbs.db
+desktop.ini

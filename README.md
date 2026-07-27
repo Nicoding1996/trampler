@@ -55,6 +55,7 @@ Credits in ATTRIBUTION.md.
 All of it is optional. Delete `assets/` and the game plays the same in flat
 colours. `npm run assets` re-fetches it, and it's the only thing here that
 touches the network.
+
 ## License
 
 The code is MIT. See LICENSE.
