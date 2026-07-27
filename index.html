@@ -617,8 +617,8 @@
   six addons render.js imports, but whole folders are kept because an unused file
   with a dangling import is harmless where a missing one is a blank canvas.
 
-  node_modules is still what `npm run verify` resolves the bare specifier from,
-  so adding an addon import means copying it here too. `npm run imports` fails
+  node_modules is still what the test harness resolves the bare specifier from,
+  so adding an addon import means copying it here too. The import check fails
   loudly if you forget.
 -->
 <script type="importmap">
