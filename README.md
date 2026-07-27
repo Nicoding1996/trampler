@@ -5,7 +5,11 @@ from the deck and from underneath, and you can't be in both places at once.
 
 Browser game, three.js, no engine, no build step.
 
-## Running it
+**Play it: https://trampler.writingexperts365.workers.dev** — desktop only, mouse
+and keyboard. It takes pointer lock when you click to start, and the first load
+pulls about 20 MB of textures.
+
+## Running it locally
 
 ```
 npm start
