@@ -22,7 +22,7 @@ import { Items } from "./items.js";
 import { Modules } from "./modules.js";
 import { Run, describeRoad } from "./run.js";
 import { Hud } from "./hud.js";
-import { createRenderer, Post, Shake } from "./render.js";
+import { CameraPresentation, createRenderer, Post, Shake } from "./render.js";
 import { Fx } from "./fx.js";
 import { ViewModel } from "./viewmodel.js";
 import { Audio } from "./audio.js";
@@ -110,6 +110,7 @@ function boot() {
     player.station ?? guns.find((g) => g.canMount) ?? null;
 
   const input = new Input(canvas, gate);
+  const cameraPresentation = new CameraPresentation(player, input, camera);
   const hud = new Hud();
   const post = new Post(renderer, scene, camera);
   const shake = new Shake();
@@ -613,6 +614,7 @@ function boot() {
     // frame that owes three steps should apply it once and then predict forward three times,
     // which is exactly what a client does between packets anyway.
     net.applyPending(renderDt, frameMs / 1000);
+    cameraPresentation.rebase();
 
     accumulator += absorbMs;
     let steps = 0;
@@ -635,7 +637,9 @@ function boot() {
       const waitingForBaseline = net.awaitingAuthority;
       const sent = waitingForBaseline ? false : net.sendInput(input, steps === 0);
       if (!waitingForBaseline) {
+        cameraPresentation.beforeStep();
         simStep(STEP);
+        cameraPresentation.afterStep();
         // AFTER the step, so what is recorded is the OUTCOME of that command rather than the
         // state before it. Solo steps have no command and therefore no prediction mark.
         if (sent) net.recordPrediction();
@@ -653,6 +657,10 @@ function boot() {
     // authority restored by applyPending(); drawing now uses the smooth server-tick cursor.
     net.applyPresentation(renderDt);
 
+    // Simulation remains fixed-step; only the camera is drawn between its two newest poses.
+    // This also restores the unshaken base transform on every rendered frame.
+    cameraPresentation.apply(accumulator / STEP_MS);
+
     // Per rendered frame, not per step: it draws the rope against the camera, and
     // the camera is only final once. Still inside frame() rather than in simStep,
     // which is what audit check 9 compares -- and the harness drives it per step
@@ -663,9 +671,8 @@ function boot() {
 
     // ---- feel: shake, then everything that reads the camera --------------
     //
-    // Shake is applied AFTER simStep, which contains player.update, and the
-    // controller writes the camera transform outright. Anything added before it is
-    // discarded.
+    // Shake is applied AFTER camera presentation has restored the interpolated
+    // base transform. It stays additive and keeps the existing impulse tuning.
     if (trampler.stepCount !== lastStepCount) {
       // Attenuated by distance to the nearest foot that landed, so a leg astern
       // does not shake the view as hard as the one you are standing beside.

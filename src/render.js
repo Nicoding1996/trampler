@@ -330,6 +330,94 @@ export class Post {
   }
 }
 
+/** Shortest signed turn from one yaw to another. */
+function angleDelta(from, to) {
+  let d = (to - from) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+/**
+ * Render the local camera between fixed simulation poses.
+ *
+ * Player state remains wholly fixed-step. This keeps only the previous and current eye pose,
+ * then draws between them at render cadence. Network reconciliation is rebased onto both
+ * endpoints so authority bookkeeping is not mistaken for one tick of physical travel.
+ *
+ * Mouse input is already visible before its fixed step is due. When that step arrives,
+ * `beforeStep` moves the old endpoint by the consumed delta so interpolation does not turn the
+ * view backwards and apply the same input a second time. Mounted aim is excluded because only
+ * the station knows its legal traverse arc.
+ */
+export class CameraPresentation {
+  constructor(player, input, camera = player.camera) {
+    this.player = player;
+    this.input = input;
+    this.camera = camera;
+
+    this.previousPosition = player.eyePosition(new THREE.Vector3());
+    this.currentPosition = this.previousPosition.clone();
+    this.actualPosition = new THREE.Vector3();
+    this.correction = new THREE.Vector3();
+    this.previousYaw = player.yaw;
+    this.currentYaw = player.yaw;
+    this.previousPitch = player.pitch;
+    this.currentPitch = player.pitch;
+  }
+
+  /** Shift both endpoints by any correction applied outside the fixed-step loop. */
+  rebase() {
+    this.player.eyePosition(this.actualPosition);
+    this.correction.copy(this.actualPosition).sub(this.currentPosition);
+    this.previousPosition.add(this.correction);
+    this.currentPosition.copy(this.actualPosition);
+
+    const yawCorrection = angleDelta(this.currentYaw, this.player.yaw);
+    this.previousYaw += yawCorrection;
+    this.currentYaw = this.player.yaw;
+    this.previousPitch += this.player.pitch - this.currentPitch;
+    this.currentPitch = this.player.pitch;
+  }
+
+  /** Preserve the old fixed pose immediately before the simulation advances. */
+  beforeStep() {
+    this.previousPosition.copy(this.currentPosition);
+    this.previousYaw = this.currentYaw;
+    this.previousPitch = this.currentPitch;
+
+    if (!this.input.locked || this.player.station) return;
+    this.previousYaw -= this.input.mouse.dx * CFG.player.lookSensitivity;
+    this.previousPitch = clamp(
+      this.previousPitch - this.input.mouse.dy * CFG.player.lookSensitivity,
+      -CFG.player.pitchLimit,
+      CFG.player.pitchLimit,
+    );
+  }
+
+  /** Capture the new fixed pose after the simulation has advanced. */
+  afterStep() {
+    this.player.eyePosition(this.currentPosition);
+    this.currentYaw = this.player.yaw;
+    this.currentPitch = this.player.pitch;
+  }
+
+  /** Write the render pose, including any mouse delta not consumed by a fixed step yet. */
+  apply(alpha) {
+    const t = clamp(alpha, 0, 1);
+    this.camera.position.lerpVectors(this.previousPosition, this.currentPosition, t);
+
+    let yaw = this.previousYaw + angleDelta(this.previousYaw, this.currentYaw) * t;
+    let pitch = this.previousPitch + (this.currentPitch - this.previousPitch) * t;
+    if (this.input.locked && !this.player.station) {
+      yaw -= this.input.mouse.dx * CFG.player.lookSensitivity;
+      pitch -= this.input.mouse.dy * CFG.player.lookSensitivity;
+    }
+    pitch = clamp(pitch, -CFG.player.pitchLimit, CFG.player.pitchLimit);
+    this.camera.rotation.set(pitch, yaw, 0, "YXZ");
+  }
+}
+
 /**
  * Camera shake, and the reason it exists is the fortress's own feet.
  *
@@ -337,9 +425,9 @@ export class Post {
  * moving skybox. Shake is the only channel that says "you are standing on
  * machinery" while the player is looking at the horizon.
  *
- * Applied AFTER the player controller has written the camera transform, because
- * the controller sets position and rotation outright every frame -- anything
- * added before it is discarded.
+ * Applied AFTER CameraPresentation restores the base transform every rendered
+ * frame. Shake is additive, so restoring only on fixed steps would accumulate
+ * offsets across high-refresh frames that run no simulation step.
  */
 export class Shake {
   constructor() {
