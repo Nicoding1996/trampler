@@ -47,15 +47,18 @@ export class Grapple {
   }
 
   #buildVisuals(scene) {
-    const ropeMat = new THREE.MeshBasicMaterial({ color: 0x2b2b30 });
-    this.rope = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 1, 6), ropeMat);
+    const ropeMat = new THREE.MeshBasicMaterial({ color: CFG.grapple.ropeColor });
+    this.rope = new THREE.Mesh(
+      new THREE.CylinderGeometry(CFG.grapple.ropeRadius, CFG.grapple.ropeRadius, 1, 6),
+      ropeMat,
+    );
     this.rope.visible = false;
     this.rope.frustumCulled = false;
     scene.add(this.rope);
 
     this.hook = new THREE.Mesh(
-      new THREE.SphereGeometry(0.22, 10, 8),
-      new THREE.MeshBasicMaterial({ color: 0xffd27a }),
+      new THREE.SphereGeometry(CFG.grapple.hookRadius, 10, 8),
+      new THREE.MeshBasicMaterial({ color: CFG.grapple.hookColor }),
     );
     this.hook.visible = false;
     scene.add(this.hook);

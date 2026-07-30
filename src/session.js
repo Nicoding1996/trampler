@@ -45,7 +45,7 @@ import { enemyCfg } from "./config.js";
 import {
   packHullBits, unpackHullBits, packPhaseBits, unpackPhaseBits,
   packEnemyBits, unpackEnemyBits, packOperativeBits, unpackOperativeBits,
-  HELD_BIT, EDGE_BIT,
+  packWeaponBits, unpackWeaponBits, packGrappleBits, HELD_BIT, EDGE_BIT,
 } from "./snapshot.js";
 
 /** Scratch, hoisted. `snapshotOf` runs 20 times a second over up to 420 bodies. */
@@ -803,6 +803,13 @@ export function operativesOf(sim) {
     const p = op.player;
     const current = operativePose(sim, op);
     const ack = op.ackPose ?? current;
+    const grappleActive = !!op.grapple?.active;
+    const grappleAnchor = grappleActive
+      ? (op.grapple.onHull ? op.grapple.anchorLocal : op.grapple.anchorWorld)
+      : null;
+    const weapon = op.weapon;
+    const shotStart = weapon?.lastShotStart;
+    const shotEnd = weapon?.lastShotEnd;
     out.push({
       seat: op.seat,
       ackSeq: op.input.ackSeq ?? 0,
@@ -828,9 +835,22 @@ export function operativesOf(sim) {
       earnedSalvage: op.economy?.earned?.salvage ?? 0,
       purchases: op.economy?.purchases ?? 0,
       refitCallouts: op.economy?.refitCallouts ?? 0,
-      weaponSlot: op.weapon?.slot ?? 0,
-      weaponCooldown: Math.max(0, op.weapon?.cooldown ?? 0),
-      weaponSwaps: op.weapon?.swaps ?? 0,
+      weaponBits: packWeaponBits({
+        slot: weapon?.slot,
+        cooldown: weapon?.cooldown,
+        shots: weapon?.shotCues,
+      }),
+      weaponSwaps: weapon?.swaps ?? 0,
+      shotStartX: shotStart?.x ?? 0,
+      shotStartY: shotStart?.y ?? 0,
+      shotStartZ: shotStart?.z ?? 0,
+      shotEndX: shotEnd?.x ?? 0,
+      shotEndY: shotEnd?.y ?? 0,
+      shotEndZ: shotEnd?.z ?? 0,
+      grappleX: grappleAnchor?.x ?? 0,
+      grappleY: grappleAnchor?.y ?? 0,
+      grappleZ: grappleAnchor?.z ?? 0,
+      grappleBits: packGrappleBits({ active: grappleActive, onHull: op.grapple?.onHull }),
       bits: current.bits,
     });
   }
@@ -1047,10 +1067,14 @@ function applyProgression(sim, state) {
       .map((encoded) => encoded - 1);
     economy.applyAll();
 
-    const slot = Math.max(0, Math.min(op.weapon.profiles.length - 1, wire.weaponSlot ?? 0));
+    const weaponState = unpackWeaponBits(wire.weaponBits ?? 0);
+    const slot = Math.max(
+      0,
+      Math.min(op.weapon.profiles.length - 1, weaponState.slot),
+    );
     op.weapon.slot = slot;
     op.weapon.profile = op.weapon.profiles[slot];
-    op.weapon.cooldown = Math.max(0, wire.weaponCooldown ?? 0);
+    op.weapon.cooldown = weaponState.cooldown;
     op.weapon.swaps = wire.weaponSwaps ?? op.weapon.swaps;
     op.bayOpen = unpackOperativeBits(wire.bits).bayOpen;
   }

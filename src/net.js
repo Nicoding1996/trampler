@@ -54,12 +54,33 @@ import { CFG } from "./config.js";
 import { Look, operativeGeometry } from "./look.js";
 import { clamp01, damp, lerp } from "./util.js";
 import {
-  decode, encodeInput, lerpSnapshot, SnapshotError, unpackOperativeBits,
+  decode, encodeInput, lerpSnapshot, SnapshotError,
+  unpackGrappleBits, unpackOperativeBits, unpackWeaponBits,
 } from "./snapshot.js";
 import { applyEntities, applySnapshot, readInput, reconcile, resetSession } from "./session.js";
 
 const WS_OPEN = 1;
 const _v = new THREE.Vector3();
+const _remoteHand = new THREE.Vector3();
+const _remoteAnchor = new THREE.Vector3();
+const _remoteDirection = new THREE.Vector3();
+const _remoteMidpoint = new THREE.Vector3();
+const _remoteRight = new THREE.Vector3();
+const _remoteForward = new THREE.Vector3();
+const _remoteQuaternion = new THREE.Quaternion();
+const _remoteShotStart = new THREE.Vector3();
+const _remoteShotEnd = new THREE.Vector3();
+const _remoteShotDirection = new THREE.Vector3();
+const _remoteShotMidpoint = new THREE.Vector3();
+const REMOTE_UP = new THREE.Vector3(0, 1, 0);
+const REMOTE_ROPE_MAT = new THREE.MeshBasicMaterial({ color: CFG.grapple.ropeColor });
+const REMOTE_HOOK_MAT = new THREE.MeshBasicMaterial({ color: CFG.grapple.hookColor });
+const REMOTE_SHOT_MAT = new THREE.MeshBasicMaterial({
+  color: CFG.combat.weapon.tracerColor,
+  transparent: true,
+  opacity: CFG.combat.weapon.tracerOpacity,
+  depthWrite: false,
+});
 /** Scratch for the avatar draw, hoisted so a frame with three crewmates allocates nothing. */
 const _pose = { x: 0, y: 0, z: 0, yaw: 0, based: false };
 const _seen = new Set();
@@ -1151,6 +1172,8 @@ export class Net {
       r.lastAt = performance.now();
       this.#animate(r, _pose, dt);
       this.#place(r.avatar, _pose);
+      this.#drawRemoteGrapple(r, w);
+      this.#drawRemoteShot(r, w, dt);
     }
 
     // A seat the snapshot has stopped describing has gone. Dropped from what the world
@@ -1268,6 +1291,98 @@ export class Net {
     avatar.visible = true;
   }
 
+  #remoteHandPosition(r, pitch, out) {
+    r.avatar.updateWorldMatrix(true, false);
+    r.avatar.getWorldPosition(out);
+    r.avatar.getWorldQuaternion(_remoteQuaternion);
+
+    _remoteRight.set(1, 0, 0).applyQuaternion(_remoteQuaternion);
+    _remoteForward.set(0, Math.sin(pitch), -Math.cos(pitch))
+      .applyQuaternion(_remoteQuaternion);
+
+    out.y += CFG.player.eyeHeight - CFG.player.height / 2;
+    out.addScaledVector(_remoteRight, 0.28);
+    out.addScaledVector(_remoteForward, 0.35);
+    out.y -= 0.22;
+    return out;
+  }
+
+  /** Draw the delayed observer cue for an authoritative grapple pull. */
+  #drawRemoteGrapple(r, wire) {
+    const grapple = unpackGrappleBits(wire.grappleBits);
+    if (!grapple.active) {
+      r.rope.visible = false;
+      r.hook.visible = false;
+      return;
+    }
+
+    _remoteAnchor.set(wire.grappleX, wire.grappleY, wire.grappleZ);
+    if (grapple.onHull) this.trampler.localToWorld(_remoteAnchor);
+    this.#remoteHandPosition(r, wire.pitch, _remoteHand);
+
+    _remoteDirection.subVectors(_remoteAnchor, _remoteHand);
+    const length = _remoteDirection.length();
+    _remoteMidpoint.addVectors(_remoteHand, _remoteAnchor).multiplyScalar(0.5);
+
+    r.rope.position.copy(_remoteMidpoint);
+    r.rope.scale.set(1, Math.max(length, 0.001), 1);
+    r.rope.quaternion.setFromUnitVectors(REMOTE_UP, _remoteDirection.normalize());
+    r.rope.visible = true;
+    r.hook.position.copy(_remoteAnchor);
+    r.hook.visible = true;
+  }
+
+  /** Draw one observer-only cue when the authoritative rolling shot sequence advances. */
+  #drawRemoteShot(r, wire, dt) {
+    const { shots } = unpackWeaponBits(wire.weaponBits);
+
+    // A crewmate may enter view after firing. Baseline rather than replaying their last shot as
+    // a historical flash; only a sequence change observed while this avatar exists is an event.
+    if (r.lastWeaponShots === null) {
+      r.lastWeaponShots = shots;
+      r.shotLife = 0;
+      r.tracer.visible = false;
+      r.muzzle.visible = false;
+      return;
+    }
+
+    const changed = shots !== r.lastWeaponShots;
+    if (changed) {
+      r.lastWeaponShots = shots;
+      _remoteShotStart.set(wire.shotStartX, wire.shotStartY, wire.shotStartZ);
+      _remoteShotEnd.set(wire.shotEndX, wire.shotEndY, wire.shotEndZ);
+      _remoteShotDirection.subVectors(_remoteShotEnd, _remoteShotStart);
+      const length = _remoteShotDirection.length();
+
+      if (length < 1e-4) {
+        r.shotLife = 0;
+        r.tracer.visible = false;
+        r.muzzle.visible = false;
+      } else {
+        _remoteShotMidpoint.addVectors(_remoteShotStart, _remoteShotEnd).multiplyScalar(0.5);
+        const w = CFG.combat.weapon;
+        const radius = w.tracerRadius + length * w.tracerWiden;
+
+        r.tracer.position.copy(_remoteShotMidpoint);
+        r.tracer.scale.set(radius, length, radius);
+        r.tracer.quaternion.setFromUnitVectors(
+          REMOTE_UP,
+          _remoteShotDirection.divideScalar(length),
+        );
+        r.tracer.visible = true;
+        r.muzzle.position.copy(_remoteShotStart);
+        r.muzzle.visible = true;
+        r.shotLife = w.tracerLife;
+      }
+    } else if (r.shotLife > 0) {
+      r.shotLife = Math.max(0, r.shotLife - dt);
+      if (r.shotLife === 0) {
+        r.tracer.visible = false;
+        r.muzzle.visible = false;
+      }
+    }
+  }
+
   #remote(seat) {
     let r = this.remotes.get(seat);
     if (r) return r;
@@ -1284,6 +1399,10 @@ export class Net {
       lastX: 0,
       lastZ: 0,
       lastBased: null,
+      // Observer-only shot state. Null suppresses a historical flash when the avatar is first
+      // seen; subsequent modulo-sequence changes arm one short-lived tracer and muzzle cue.
+      lastWeaponShots: null,
+      shotLife: 0,
     };
     this.remotes.set(seat, r);
     return r;
@@ -1360,26 +1479,70 @@ export class Net {
     legL.position.set(-parts.hip.x, parts.hip.y, 0);
     legR.position.set(parts.hip.x, parts.hip.y, 0);
 
+    // World-space observer effects. They cannot be children of the avatar because a hull-local
+    // avatar may connect to world geometry, and a fired tracer is the frozen world-space ray
+    // the authority actually drew. Keeping both ends in one frame makes that choice explicit.
+    const effects = new THREE.Group();
+    effects.name = `crew-${seat}-effects`;
+
+    const rope = new THREE.Mesh(
+      new THREE.CylinderGeometry(CFG.grapple.ropeRadius, CFG.grapple.ropeRadius, 1, 6),
+      REMOTE_ROPE_MAT,
+    );
+    rope.name = `crew-${seat}-grapple-rope`;
+    rope.frustumCulled = false;
+    rope.visible = false;
+    effects.add(rope);
+
+    const hook = new THREE.Mesh(
+      new THREE.SphereGeometry(CFG.grapple.hookRadius, 10, 8),
+      REMOTE_HOOK_MAT,
+    );
+    hook.name = `crew-${seat}-grapple-hook`;
+    hook.visible = false;
+    effects.add(hook);
+
+    const tracer = new THREE.Mesh(
+      new THREE.CylinderGeometry(1, 1, 1, 6),
+      REMOTE_SHOT_MAT,
+    );
+    tracer.name = `crew-${seat}-shot-tracer`;
+    tracer.frustumCulled = false;
+    tracer.visible = false;
+    effects.add(tracer);
+
+    const muzzle = new THREE.Mesh(
+      new THREE.SphereGeometry(CFG.combat.weapon.muzzleRadius, 10, 8),
+      REMOTE_SHOT_MAT,
+    );
+    muzzle.name = `crew-${seat}-muzzle-flash`;
+    muzzle.frustumCulled = false;
+    muzzle.visible = false;
+    effects.add(muzzle);
+
+    this.scene.add(effects);
     avatar.visible = false;
     this.scene.add(avatar);
-    return { avatar, rig, legL, legR };
+    return { avatar, rig, legL, legR, effects, rope, hook, tracer, muzzle };
   }
 
   #dropRemote(seat) {
     const r = this.remotes.get(seat);
     if (!r) return;
     r.avatar.parent?.remove(r.avatar);
-    // Traversed rather than named part by part, so a piece added to
-    // operativeGeometry() later cannot be the one thing nobody remembered to free.
-    // Deduped because both legs share one geometry.
+    r.effects.parent?.remove(r.effects);
+    // Traversed rather than named part by part, so a piece added to either the avatar or its
+    // observer effects cannot be the one thing nobody remembered to free. Deduped because both
+    // legs share one geometry. Materials are shared and deliberately survive a seat leaving.
     const freed = new Set();
-    r.avatar.traverse((o) => {
-      if (o.isMesh && !freed.has(o.geometry)) {
-        freed.add(o.geometry);
-        o.geometry.dispose();
-      }
-    });
-    // The materials are Look-cached and shared, so they are deliberately NOT disposed.
+    for (const root of [r.avatar, r.effects]) {
+      root.traverse((o) => {
+        if (o.isMesh && !freed.has(o.geometry)) {
+          freed.add(o.geometry);
+          o.geometry.dispose();
+        }
+      });
+    }
     this.remotes.delete(seat);
   }
 

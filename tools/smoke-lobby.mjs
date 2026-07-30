@@ -177,23 +177,41 @@ try {
   ok(res.status === 400, "a malformed code is refused with 400", `${res.status}`);
 }
 
-// The root must explain itself rather than 404ing.
-//
-// `wrangler dev` prints a "[b] open a browser" shortcut that lands on exactly this
-// path, so it is the first thing anyone sees after starting the lobby — and a bare
-// "Not Found" there reads as "the thing I just started is broken". It is not; the
-// game is on another port. Asserted because a hint that goes stale is worse than no
-// hint: it would send the next person to a port nothing is listening on.
+// The root has two legitimate shapes. Local wrangler serves only the lobby and must explain
+// where the separately served game lives. Production owns the static assets too, so the same
+// URL must serve the game directly and needs no cross-port override. The previous check asserted
+// the local shape unconditionally and therefore reported two failures against a correctly
+// deployed site before continuing to prove that every multiplayer route worked.
 {
   const res = await fetch(`${BASE}/`);
   const body = await res.text();
+  const hostname = new URL(BASE).hostname;
+  const loopback = hostname === "localhost"
+    || hostname === "127.0.0.1"
+    || hostname === "[::1]";
+
   ok(res.status === 200, "the lobby root answers rather than 404ing", `${res.status}`);
-  ok(body.includes("5173"), "and it names the port the game is actually on");
-  ok(
-    body.includes(`?lobby=${BASE}`),
-    "and hands back a URL that already carries the override",
-    `expected ?lobby=${BASE}`,
-  );
+  if (loopback) {
+    // `wrangler dev` prints a "[b] open a browser" shortcut that lands on exactly this path.
+    // A bare 404 there reads as though the lobby failed to start, so the hint and its complete
+    // override URL are both part of the local-development contract.
+    ok(body.includes("5173"), "and it names the port the game is actually on");
+    ok(
+      body.includes(`?lobby=${BASE}`),
+      "and hands back a URL that already carries the override",
+      `expected ?lobby=${BASE}`,
+    );
+  } else {
+    ok(
+      body.includes('id="c"'),
+      "the deployed root serves the game on the lobby's own origin",
+    );
+    ok(
+      body.includes('id="mp"'),
+      "and that deployed page contains the multiplayer gate",
+    );
+  }
+
   // A mistyped path must still be a 404. A blanket 200 would hide real mistakes,
   // which is the same argument as the shop naming which clause refused it.
   const miss = await fetch(`${BASE}/definitely-not-a-route`);

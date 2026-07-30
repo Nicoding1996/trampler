@@ -59,8 +59,18 @@ export class Weapon {
 
     this.cooldown = 0;
     this.shots = 0;
+    // One observer event per trigger pull. `shots` remains per pellet for existing local
+    // readers; this counter lets a nine-pellet blast collapse to its latest authoritative
+    // tracer without demanding nine remote flashes.
+    this.shotCues = 0;
     this.hits = 0;
     this.kills = 0;
+
+    // The newest tracer exactly as the authoritative weapon drew it, in world space.
+    // Preallocated because every pellet writes these vectors. Snapshots copy the numbers so
+    // observers can draw the cue without replaying the ray, damage, hit bus or recoil.
+    this.lastShotStart = new THREE.Vector3();
+    this.lastShotEnd = new THREE.Vector3();
 
     // NETWORK ARBITRATION, off by default so solo is byte-identical.
     //
@@ -180,7 +190,10 @@ export class Weapon {
     this.tracers = [];
     const beam = new THREE.CylinderGeometry(1, 1, 1, 6);
     const beamMat = new THREE.MeshBasicMaterial({
-      color: 0xfff0b0, transparent: true, opacity: 0.75, depthWrite: false,
+      color: CFG.combat.weapon.tracerColor,
+      transparent: true,
+      opacity: CFG.combat.weapon.tracerOpacity,
+      depthWrite: false,
     });
     for (let i = 0; i < TRACERS; i++) {
       const m = new THREE.Mesh(beam, beamMat);
@@ -389,6 +402,7 @@ export class Weapon {
   shootFrom(origin, dir, profile, muzzle = null, by = this.player, pellet = 0) {
     const w = CFG.combat.weapon;
     this.shots++;
+    if (pellet === 0) this.shotCues++;
 
     // Cone spread, built from a basis around the aim direction.
     // Cone spread, built from a basis around the aim direction.
@@ -516,6 +530,11 @@ export class Weapon {
 
     if (muzzle) _muzzle.copy(muzzle);
     else this.player.handPosition(_muzzle);
+
+    // Published after choosing the real muzzle, so a carried shot and a deck-gun shot expose
+    // the same endpoints their local tracer used. This is presentation state only.
+    this.lastShotStart.copy(_muzzle);
+    this.lastShotEnd.copy(endPoint);
 
     _beamDir.subVectors(endPoint, _muzzle);
     const len = _beamDir.length();

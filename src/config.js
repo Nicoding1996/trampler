@@ -199,6 +199,13 @@ export const CFG = {
     maxTime: 4.0,           // safety valve so you can never be stuck reeling
     cooldown: 0.3,
 
+    // Shared by the local winch and observer avatars. Keeping one set of dimensions and
+    // colours prevents the authoritative remote rope from drifting into a different tool.
+    ropeRadius: 0.05,
+    hookRadius: 0.22,
+    ropeColor: 0x2b2b30,
+    hookColor: 0xffd27a,
+
     // Design question this test exists to answer: should players be able to
     // grapple any surface, or only authored hardpoints? Toggle live with G.
     hardpointsOnly: false,
@@ -517,6 +524,11 @@ export const CFG = {
       tracerLife: 0.07,
       tracerRadius: 0.045,
       tracerWiden: 0.0013,   // extra radius per metre of travel
+      tracerColor: 0xfff0b0,
+      tracerOpacity: 0.75,
+      // A third-person flash is a small mesh at the replicated muzzle; the local
+      // first-person flash remains the particle/light effect owned by fx.js.
+      muzzleRadius: 0.12,
 
       // Impact markers. The first pass was far too aggressive: 0.15 base radius
       // growing 0.022 per metre put a half-metre ball on the ground at 30 m, and

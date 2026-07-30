@@ -41,7 +41,7 @@
 // refused it, because "could not connect" sends someone to check their network when the
 // actual problem is a stale browser tab holding last week's JavaScript. That specific
 // case is not hypothetical for a project with no build step and no cache busting.
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 6;
 
 // Message kinds. One byte, so there is room to add the horde and the operatives in later
 // slices without touching anything here.
@@ -435,9 +435,29 @@ const OPERATIVE = [
   ["earnedSalvage", "float"],
   ["purchases", "tally"],
   ["refitCallouts", "tally"],
-  ["weaponSlot", "count"],
-  ["weaponCooldown", "shortSeconds"],
+  // weapon slot (1 bit) | cooldown in tenths (4 bits) | rolling trigger sequence (3 bits).
+  // Folding values that already belonged to the weapon into one byte leaves the six tracer
+  // coordinates as the only wire growth and keeps the measured four-crew case below 30 KiB/s.
+  ["weaponBits", "bits"],
   ["weaponSwaps", "tally"],
+
+  // The latest authoritative tracer, in world space. An observer draws this once when the
+  // rolling sequence changes; it never replays the ray, damage, hit bus, procs or recoil.
+  ["shotStartX", "metres"],
+  ["shotStartY", "metres"],
+  ["shotStartZ", "metres"],
+  ["shotEndX", "metres"],
+  ["shotEndY", "metres"],
+  ["shotEndZ", "metres"],
+
+  // The active winch anchor, hull-local when grappleBits says it belongs to the fortress and
+  // world-space otherwise. The pull itself is already authoritative movement; these fields
+  // let an observer see the rope that explains it rather than a crewmate apparently flying.
+  ["grappleX", "metres"],
+  ["grappleY", "metres"],
+  ["grappleZ", "metres"],
+  ["grappleBits", "bits"],
+
   // based | repairing | downed | station index (2 bits) | grounded | bay open.
   ["bits", "bits"],
 ];
@@ -847,6 +867,48 @@ export function unpackOperativeBits(bits) {
     station: (bits >> 3) & MAX_WIRE_STATIONS,
     grounded: (bits & 32) !== 0,
     bayOpen: (bits & 64) !== 0,
+  };
+}
+
+// --------------------------------------------------------------------------- weapon bits
+
+const WEAPON_SLOT_MASK = 0x01;
+const WEAPON_COOLDOWN_MASK = 0x0f;
+const WEAPON_SHOT_MASK = 0x07;
+
+/** Weapon slot, cooldown and a rolling trigger sequence, packed into one byte. */
+export function packWeaponBits({ slot, cooldown, shots }) {
+  const s = Math.max(0, Math.trunc(slot ?? 0));
+  if (s > WEAPON_SLOT_MASK) {
+    throw new RangeError(`weapon slot ${s} does not fit the v${PROTOCOL_VERSION} wire`);
+  }
+  const cooldownStep = Math.round(Math.max(0, cooldown ?? 0) * 10);
+  if (cooldownStep > WEAPON_COOLDOWN_MASK) {
+    throw new RangeError(
+      `weapon cooldown ${(cooldown ?? 0).toFixed(2)} does not fit the v${PROTOCOL_VERSION} wire`,
+    );
+  }
+  const sequence = Math.max(0, Math.trunc(shots ?? 0)) & WEAPON_SHOT_MASK;
+  return s | (cooldownStep << 1) | (sequence << 5);
+}
+
+export function unpackWeaponBits(bits) {
+  return {
+    slot: bits & WEAPON_SLOT_MASK,
+    cooldown: ((bits >> 1) & WEAPON_COOLDOWN_MASK) / 10,
+    shots: (bits >> 5) & WEAPON_SHOT_MASK,
+  };
+}
+
+/** Grapple activity and the coordinate frame its anchor is encoded in. */
+export function packGrappleBits({ active, onHull }) {
+  return (active ? 1 : 0) | (active && onHull ? 2 : 0);
+}
+
+export function unpackGrappleBits(bits) {
+  return {
+    active: (bits & 1) !== 0,
+    onHull: (bits & 2) !== 0,
   };
 }
 
