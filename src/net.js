@@ -797,8 +797,15 @@ export class Net {
     const localStation = p.station ? (this.sim.guns?.indexOf(p.station) ?? -1) + 1 : 0;
     const deathChanged = this.authorityDeaths !== null && mine.deaths !== this.authorityDeaths;
     const firstBaseline = this.authorityResetId === null;
+    // Current authority and the live client are only comparable after every local prediction
+    // has been acknowledged. Before then the client may already have jumped or mounted while
+    // this packet still describes the older frame; adopting it would rewind that transition
+    // and its look input, then snap forward again when the exact acknowledgement arrives.
+    const authorityCaughtUp = mine.ackSeq >= this.inputSeq;
+    const currentFrameMismatch = current.based !== localBased
+      || current.station !== localStation;
     const incompatible = generationChanged || firstBaseline || deathChanged
-      || current.based !== localBased || current.station !== localStation;
+      || (authorityCaughtUp && currentFrameMismatch);
 
     this.#syncLocalMetadata(mine, firstBaseline || generationChanged);
     this.authorityResetId = newest.resetId;
@@ -824,6 +831,18 @@ export class Net {
 
     const ackState = unpackOperativeBits(mine.ackBits);
     if (ackState.based !== mark.based) {
+      // A transition may straddle this historical sequence by one tick yet already have
+      // converged by the time its packet arrives (most visibly, two sides landing one tick
+      // apart). Those ack positions are in incompatible frames, so there is no residual to
+      // measure, but adopting CURRENT authority would rewrite an already-correct live frame
+      // and erase every newer mark. Consume only this measurement and let the next ack compare
+      // normally. A transition that is still refused now remains a hard authority change.
+      if (current.based === localBased) {
+        while (this.history.length > 0 && this.history[0].seq <= mine.ackSeq) {
+          this.history.shift();
+        }
+        return;
+      }
       this.#hardAdoptCurrent(mine);
       return;
     }
