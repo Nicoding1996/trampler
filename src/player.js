@@ -87,6 +87,13 @@ export class Player {
     this.grapple = null;   // assigned by main, checked for velocity override
     this.station = null;   // a manned mount takes over movement and the trigger
 
+    // Which repair point this operative is working this frame, or null. Written by their
+    // own Repair and read by everyone else's, which is how a leg admits one welder.
+    // It lives on the Player rather than inside Repair because it is the answer to a
+    // question OTHER operatives ask, and they can reach a Player through the crew
+    // without needing a registry of Repair instances to exist.
+    this.repairing = null;
+
     this.respawnOnDeck();
   }
 
@@ -530,11 +537,10 @@ export class Player {
   }
 
   respawnOnDeck() {
-    // Dying throws you off the gun.
-    if (this.station) {
-      this.station.mounted = false;
-      this.station = null;
-    }
+    // Dying throws you off the gun. Through the mount, so the seat learns it is empty
+    // -- writing `station.mounted = false` from out here left the gun's own idea of its
+    // occupant untouched, which is survivable with one operative and not with four.
+    this.station?.dismount(this);
     this.trampler.deckSpawn(this.position);
     // Set the frame directly rather than going through attachTo: we want to be
     // at rest RELATIVE to the deck, not at rest in world space.
@@ -546,10 +552,9 @@ export class Player {
   }
 
   dropToGround() {
-    if (this.station) {
-      this.station.mounted = false;
-      this.station = null;
-    }
+    this.station?.dismount(this);
+    // After the dismount, which parks the operative back on the hull -- this is the
+    // one release that wants to end up off it.
     this.base = null;
     this.velocity.set(0, 0, 0);
     this.trampler.groundAhead(34, this.position);

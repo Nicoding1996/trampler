@@ -30,10 +30,18 @@ export const PHASE = {
 };
 
 export class Director {
-  constructor(horde, trampler, player, seed = CFG.waves.seed) {
+  /**
+   * @param crew a Crew, not a Player. The director is one of exactly three places
+   *        that asks about the crew as a GROUP rather than about one operative --
+   *        pacing is gated on how much trouble the CREW is in, and with four people
+   *        aboard "the player's health" is not a question with one answer. Wired to a
+   *        single operative it would have kept pacing off one person's health and
+   *        spawned into three corpses.
+   */
+  constructor(horde, trampler, crew, seed = CFG.waves.seed) {
     this.horde = horde;
     this.trampler = trampler;
-    this.player = player;
+    this.crew = crew;
     this.seed = seed;
 
     // Set by the Run when there is one. Absent, the director behaves exactly as it
@@ -91,6 +99,27 @@ export class Director {
     this.calledEarly = false;
   }
 
+  // ------------------------------------------------------------------- crew size
+
+  /**
+   * How much bigger a wave is for this crew. Exactly 1.0 for one operative.
+   *
+   * The 1.0 is structural rather than arithmetic: `1 + perHead * (size - 1)` cannot come
+   * out as anything else at one member, whatever the coefficient is set to. That matters
+   * because "solo is untouched" is the acceptance test for this whole change, and a form
+   * like `perHead * size + base` would have made it a property of two numbers agreeing.
+   *
+   * Note what this is NOT read by. Nothing about pacing, pressure, composition, enemy
+   * health or the roster's caps consults it -- only the count. Section 106 measured the
+   * baseline it moves off: before this, crew size scaled the fight not at all, in any
+   * dimension. It now scales exactly one, and 106 still holds the other half by asserting
+   * that pacing is unchanged while volume is not.
+   */
+  get crewScale() {
+    const size = this.crew?.size ?? 1;
+    return 1 + CFG.waves.crewCountPerHead * Math.max(0, size - 1);
+  }
+
   // ----------------------------------------------------------------- pressure
 
   /**
@@ -101,13 +130,21 @@ export class Director {
    */
   #pressureOf(withHull) {
     const p = CFG.waves.pressure;
-    const pl = this.player;
+    const crew = this.crew;
 
-    let v = p.hurtWeight * (1 - pl.hp / pl.maxHp);
+    // The two crew terms go through the aggregate rather than reading one operative.
+    // At a crew of one these are arithmetically identical to the old `pl.hp/pl.maxHp`
+    // and `pl.timeSinceHurt`, which is what makes this change verifiable at all.
+    //
+    // WHICH aggregate is deliberately not decided here -- see the note on Crew's
+    // aggregates. Worst-case is the starting position and it is unobservable until
+    // there are two operatives, so it is the pressure-aggregation change's job to
+    // measure it, not this one's job to assume it.
+    let v = p.hurtWeight * (1 - crew.worstHealthFraction());
     v += p.underWeight * Math.min(1, (this.horde.underHull ?? 0) / p.underFull);
     v += p.aboardWeight * Math.min(1, (this.horde.aboard ?? 0) / p.aboardFull);
     if (withHull && this.trampler.immobilised) v += p.immobileWeight;
-    if (pl.timeSinceHurt < p.recentHurtWindow) v += p.recentHurtWeight;
+    if (crew.secondsSinceAnyHurt() < p.recentHurtWindow) v += p.recentHurtWeight;
 
     return Math.min(1, v);
   }
@@ -259,8 +296,10 @@ export class Director {
    * Specials SUBSTITUTE for chewers rather than adding to the total. The wave-size
    * curve was tuned against measured pacing, and growing it at the same time as
    * changing its composition moves two variables at once -- after which no
-   * difficulty change can be attributed to either. Road modifiers are the one
-   * thing allowed to change the count, and they are explicit about it.
+   * difficulty change can be attributed to either.
+   *
+   * TWO things are allowed to change the count, and both are explicit about it: a road
+   * modifier, and the size of the crew. Everything else substitutes.
    *
    * Waves one and two are chewers and climbers only. Those are the two pressures
    * the whole design rests on and they deserve to be learned without noise.
@@ -273,9 +312,19 @@ export class Director {
   buildWave(wave, tier = wave) {
     const w = CFG.waves;
     const c = CFG.enemies.composition;
+    // The crew multiplier applies to the SIZE CURVE ONLY, and the road's flat bonus is
+    // added afterwards rather than multiplied with it.
+    //
+    // That ordering is a legibility decision, not an implementation detail. The route
+    // panel tells the player a road costs "+4 enemies per wave" and `run.modifiers`
+    // repeats it for the rest of the biome. Multiplying that by the crew would make both
+    // readouts wrong by a factor nothing on screen mentions -- which is the failure
+    // invariant 23b's three named refusals exist to prevent, in a new place. A road's
+    // stated cost stays literally what it says.
     const count = Math.max(
       1,
-      w.baseCount + w.perWave * (wave - 1) + (this.run?.extraCount ?? 0),
+      Math.round((w.baseCount + w.perWave * (wave - 1)) * this.crewScale)
+      + (this.run?.extraCount ?? 0),
     );
 
     const types = [];

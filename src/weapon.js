@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { CFG, enemyCfg, armourAt } from "./config.js";
-import { makeRandom } from "./util.js";
+import { hashUnit, makeRandom } from "./util.js";
 
 // Hitscan rifle. Deliberately plain -- it exists so there is something to do
 // about the horde, not because gunplay is the question under test.
@@ -23,6 +23,36 @@ const TRACERS = 12;
 const IMPACTS = 16;
 
 export class Weapon {
+  /**
+   * Throw unless this weapon belongs to `operative`.
+   *
+   * A WIRING GUARD, and it exists because the mistake it catches is silent and severe.
+   * Every personal item recomputes absolutely from its stack count -- `rifle` writes
+   * `weapon.damageScale`, `trigger` writes `fireRateScale`, `sabot` writes `armourPierce`
+   * -- which is correct with one owner and destructive with two. Measured: two operatives
+   * sharing one Weapon, crew 1 buys four rifle calibrations for a damageScale of 2.00, crew
+   * 2 recomputes their own unrelated kit, and it drops to 1.00. Four stacks gone, stack
+   * counts intact, nothing thrown. Exactly the shape of the fortress collision.
+   *
+   * `Items.update` makes it worse by being a second writer: it clears and rebuilds
+   * `damageBonus` from current conditions every frame, so two Items over one Weapon would
+   * fight over the field every frame and one operative's position would buff the other.
+   *
+   * The fortress case was fixed by SHARING the counts, because fortress refits genuinely
+   * are the crew's. Personal kit is the opposite -- it must not be shared, so there is
+   * nothing to unify and the only defence is refusing the arrangement. Same reasoning as
+   * exporting `isSubmerged` and `causedBy`: turn a wrong answer into a load failure.
+   */
+  assertOperative(operative) {
+    if (this.player && operative && this.player !== operative) {
+      throw new Error(
+        "Weapon belongs to a different operative: personal upgrades recompute absolutely "
+        + "from stack counts, so two operatives over one Weapon silently wipe each "
+        + "other's kit. Give each operative their own Weapon.",
+      );
+    }
+  }
+
   constructor(scene, player, horde, world, trampler) {
     this.player = player;
     this.horde = horde;
@@ -31,6 +61,19 @@ export class Weapon {
     this.shots = 0;
     this.hits = 0;
     this.kills = 0;
+
+    // NETWORK ARBITRATION, off by default so solo is byte-identical.
+    //
+    // `arbitrated` makes a shot presentation-only: it still traces, still clips on geometry, still
+    // flashes and still counts, but deals no damage and publishes nothing on the bus. Set by the
+    // client once the server is authoritative. See the long note in `shootFrom`.
+    this.arbitrated = false;
+
+    // The input sequence a shot belongs to, for deterministic cone spread. 0 means "no agreed
+    // index", and the seeded stream is used instead — which is the solo path and is unchanged.
+    // `shotsThisKey` distinguishes two shots that land on the same sequence.
+    this.spreadKey = 0;
+    this.shotsThisKey = 0;
     this.blockedByHull = 0; // diagnostic: shots that hit the fortress instead
     this.hitFlash = 0;      // drives the crosshair hitmarker
 
@@ -88,6 +131,36 @@ export class Weapon {
     // Cone spread is seeded, like every other stochastic part of the sim. At
     // 0.007 rad it scatters a shot by ~0.2 m at 30 m, which was enough to make a
     // measured tracer length differ between otherwise identical runs.
+    //
+    // THIS STREAM CANNOT SURVIVE CLIENT PREDICTION, AND IT IS THE ONLY ONE THAT CANNOT.
+    //
+    // A STREAM IS ORDER-DEPENDENT. Its next value depends on how many draws came before
+    // it, so a client and a server holding separate `makeRandom(sameSeed)` agree only
+    // while they make identical draws in identical order. They will not: the shot below
+    // draws two values PER PELLET, a client mispredicts a shot the server refused for
+    // heat or for a station change, and from that moment the two streams are permanently
+    // one draw apart. Not drift -- two different sequences. The client's tracer then
+    // points somewhere the authoritative round did not go, forever.
+    //
+    // So when the client starts firing locally for feedback, spread stops being drawn
+    // from here and becomes a HASH OF AN AGREED INDEX: the input sequence number, the
+    // shot's index within that sequence, and the pellet's index within the shot. All
+    // three are values both sides already have -- the server knows which input sequence
+    // it processed -- and a hash of them is order-INdependent, so a mispredicted shot
+    // costs nothing because the next agreed index is unchanged.
+    //
+    // THE GENERAL RULE, worth stating because it decides where every future stochastic
+    // value goes: anything the CLIENT must agree with the server about is keyed on an
+    // agreed index; anything the server decides alone keeps its stream, because the
+    // client is told the outcome rather than reproducing it. Spawn bearings, wave
+    // composition, road offers, shop stock and item procs are all the second kind and
+    // are untouched. Surveyed, and cone spread is the only value of the first kind in
+    // the project -- player.js, grapple.js, deckgun.js, repair.js and emitters.js hold
+    // no seeded stream at all, and `items.js`'s proc stream never advances on a client
+    // because a client deals no damage.
+    //
+    // Invariant 21 is preserved either way: a hash of a sequence number is still
+    // reproducible, and still has no `Math.random` in it.
     this.random = makeRandom(CFG.combat.weapon.seed);
 
     // Railings are collision geometry for BODIES, not for bullets. They are
@@ -287,9 +360,14 @@ export class Weapon {
     for (let i = 0; i < p.pellets; i++) {
       this.player.eyePosition(_origin);
       this.player.lookDirection(_dir);
-      const hit = this.shootFrom(_origin, _dir, p, null);
+      // The pellet index is handed down so the spread can be keyed on it. Without it every
+      // pellet of one blast would take the same key and land in a single point.
+      const hit = this.shootFrom(_origin, _dir, p, null, this.player, i);
       if (hit && !first) first = hit;
     }
+    // Counts shots taken against the CURRENT key, so two shots in one tick get different
+    // spread. Reset by whoever sets the key.
+    this.shotsThisKey++;
     return first;
   }
 
@@ -300,17 +378,42 @@ export class Weapon {
    *
    * `profile` supplies damage, spread and range. `muzzle` is where the tracer is
    * drawn from; null means the player's hand.
+   *
+   * `by` is WHO fired, and it defaults to this weapon's own operative because that is
+   * true for the rifle. A manned deck gun passes its OCCUPANT instead: the gun routes
+   * through here precisely so the occlusion and armour rules cannot drift between
+   * weapons, and with a crew the person in the seat is not necessarily the person this
+   * Weapon belongs to. Invariant 2b-i counts a manned gun as the crew because somebody
+   * is sitting in it -- so the attribution has to be that somebody, by name.
    */
-  shootFrom(origin, dir, profile, muzzle = null) {
+  shootFrom(origin, dir, profile, muzzle = null, by = this.player, pellet = 0) {
     const w = CFG.combat.weapon;
     this.shots++;
 
     // Cone spread, built from a basis around the aim direction.
+    // Cone spread, built from a basis around the aim direction.
+    //
+    // KEYED ON AN AGREED INDEX WHEN THERE IS ONE, drawn from the stream otherwise. `spreadKey`
+    // is the input sequence the shot belongs to, set by whoever is driving this weapon over a
+    // network; solo it stays 0 and the seeded stream behaves exactly as it always has, which is
+    // what keeps every existing measurement in these files valid.
+    //
+    // Two indices on top of the sequence, and both are needed. `pellet` separates the rounds of
+    // one shotgun blast, which otherwise all take the same key and land in one point. `shotIndex`
+    // separates two shots that fall in the same tick — possible at a high enough fire rate, and
+    // an aliasing bug that would present as a burst suddenly becoming pinpoint accurate.
     if (profile.spread > 0) {
       _right.crossVectors(dir, UP_Y).normalize();
       _up.crossVectors(_right, dir).normalize();
-      const a = this.random() * Math.PI * 2;
-      const r = Math.sqrt(this.random()) * profile.spread;
+      const keyed = this.spreadKey > 0;
+      const u1 = keyed
+        ? hashUnit(this.spreadKey, this.shotsThisKey, pellet, 1)
+        : this.random();
+      const u2 = keyed
+        ? hashUnit(this.spreadKey, this.shotsThisKey, pellet, 2)
+        : this.random();
+      const a = u1 * Math.PI * 2;
+      const r = Math.sqrt(u2) * profile.spread;
       dir.addScaledVector(_right, Math.cos(a) * r).addScaledVector(_up, Math.sin(a) * r).normalize();
     }
 
@@ -337,8 +440,9 @@ export class Weapon {
       // absolutely from stack counts, and a timed effect writing into it would
       // either be lost on the next recompute or accumulate forever.
       const dealt = profile.damage * (this.damageScale + this.damageBonus);
-      // "player" because both the rifle and the manned deck guns come through here,
-      // and a manned gun is the crew aiming. Only automation is excluded.
+      // Attributed to `by` -- this operative for the rifle, the seat's occupant for a
+      // manned gun. Both route through here, and a manned gun is the crew aiming; only
+      // automation is excluded, and it is excluded by never being a Player.
       //
       // TWO pierce terms, added together, and expressing the flank as a pierce is what
       // keeps armour resolved in exactly one place (Horde.damage) rather than growing a
@@ -351,13 +455,34 @@ export class Weapon {
       // every type whose armour is omnidirectional.
       const cfg = enemyCfg(hit.enemy.type);
       const flank = cfg.armour - armourAt(cfg, hit.enemy.yaw, dir.x, dir.z);
-      if (this.horde.damage(hit.enemy, dealt, "player", this.armourPierce + flank)) {
-        this.kills++;
+
+      // ARBITRATED: THE CLIENT FIRES FOR FEEDBACK AND DEALS NOTHING.
+      //
+      // Everything above this point is presentation — the ray, the geometry clip, the enemy the
+      // beam ends on, the hit flash. Everything below is consequence, and consequence belongs to
+      // the authority. A client that ran it would damage its own copy of a body the server still
+      // has alive, watch the next snapshot resurrect it 50 ms later, and be paid salvage for a
+      // kill nobody made. That flicker is the most visible thing a half-shared game does.
+      //
+      // The bus is skipped for the same reason and it matters more than the damage: `Items`
+      // subscribes to onHit AND onKill, so a local shot would fire procs — splash, arc chain,
+      // executioner — for hits the server never registered. Invariant 2b-i's whole argument is
+      // about procs happening where they should not.
+      //
+      // `hitFlash` and `hits` are deliberately still set. They are the only "that connected"
+      // signal in the game (invariant 8a), and withholding them until a round trip completes
+      // would make every shot feel 120 ms late. The honest cost is that a client can briefly see
+      // a hitmarker for a shot the server disagreed about — which is the standard trade, and far
+      // cheaper than the alternative.
+      if (!this.arbitrated) {
+        if (this.horde.damage(hit.enemy, dealt, by, this.armourPierce + flank)) {
+          this.kills++;
+        }
+        // After the damage, so an on-hit item sees the enemy in the state the shot
+        // left it in -- including dead, which is what lets "on hit" and "on kill"
+        // items stack on the same shot rather than racing each other.
+        this.events?.emitHit(hit.enemy, dealt, by);
       }
-      // After the damage, so an on-hit item sees the enemy in the state the shot
-      // left it in -- including dead, which is what lets "on hit" and "on kill"
-      // items stack on the same shot rather than racing each other.
-      this.events?.emitHit(hit.enemy, dealt);
     } else if (solid.length > 0) {
       this.blockedByHull++;
     }

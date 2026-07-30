@@ -1,6 +1,7 @@
 # Trampler — code structure
 
-26 modules, ~11,900 lines in `src/`, plus a ~7,300-line headless harness.
+28 modules, ~14,900 lines in `src/`, plus an ~11,300-line headless harness and a
+~900-line Worker.
 
 Line counts below are rounded to the nearest ten and are there for a sense of
 weight, not as a fact to rely on. They drift every commit.
@@ -9,48 +10,63 @@ weight, not as a fact to rely on. They drift every commit.
 index.html          canvas, HUD markup, importmap, click-to-play gate
 server.mjs          loopback-only static server
 verify.mjs          headless harness — every simulation module, no DOM, no GL
+wrangler.jsonc      deployed: static assets + the Worker, scoped to /lobby/*
+wrangler.dev.jsonc  local: the lobby only, no assets block — see its own comment
+worker/
+  index.js     600  the Worker + the Lobby Durable Object: join codes, 4 seats,
+                    a 60 Hz accumulator tick, pose fan-out, named refusals
+  sim-check.js 300  SPIKE: can the real simulation load and step inside workerd?
 tools/
   audit.mjs         static checks the harness structurally cannot make
   scene-cost.mjs    draw calls, triangles, shadow casters, lights — no renderer
   fetch-assets.mjs  pulls the CC0 art from Poly Haven, md5-checked, idempotent
   check-imports.mjs resolves every import against index.html's real importmap
   smoke-serve.mjs   asks the running server for every file the page needs
+  smoke-lobby.mjs   asks a running lobby for its tick rate and its refusals
+  sim-check.mjs     reads the spike from a running Worker, and TIMES it itself
+  sim-check-node.mjs  runs the spike in plain node, no wrangler needed
+  sim-cost-window.mjs per-frame cost across a run, to catch a density effect
+  tick-granularity.mjs  the ~15.5 ms timer floor that forced the accumulator
+  per-operative-probe.mjs  crew-scaling measurements
+  economy-collision.mjs    shop/pick/road key-routing collisions
   diff-runs.mjs     two runs must differ only in the wall-clock timing
   summarise.mjs     failures + totals from a run, since the output is 700 lines
 assets/             vendored CC0 textures + HDRI, plus manifest.json
 src/
-  config.js   1800  every tunable, with a comment explaining each value
+  config.js   2110  every tunable, with a comment explaining each value
   util.js       60  box(), boxToMesh(), seeded RNG, clamp/lerp/damp/smoothstep
   look.js      480  HEADLESS-SAFE materials, UV tiling, enemy silhouettes
   collision.js 180  space-agnostic AABB resolve, ground probe, mantle search
   world.js     440  terrain, lighting, scatter, horizon silhouettes, fog
-  trampler.js 1000  the fortress: geometry, gait, spatial damage, transforms
+  trampler.js 1290  the fortress: geometry, gait, spatial damage, transforms
   player.js    570  FPS controller, based movement, mantle, health
-  grapple.js   260  winch: hull-local anchors, brake, cut-vs-arrive release
-  enemies.js  1090  pooled horde, instanced draw, spatial hash, wounded tint
-  waves.js     400  director: pacing, size vs roster tier, composition, the boss
-  run.js       360  legs, the pick cadence, road choice, cumulative modifiers
-  weapon.js    350  the single hitscan path, the aim scan, tracers, impacts
-  deckgun.js   250  manned mounts, hull-local traverse arcs, heat
-  repair.js    180  contextual repair, ground markers, grace window
-  emitters.js  290  hull-mounted shock emitters: the tower-defence layer
+  crew.js      140  1-4 operatives: the roster, and the aggregates ABOUT them
+  grapple.js   280  winch: hull-local anchors, brake, cut-vs-arrive release
+  enemies.js  1560  pooled horde, instanced draw, spatial hash, wounded tint
+  waves.js     510  director: pacing, size vs roster tier, composition, the boss
+  run.js       500  legs, the pick cadence, road vote, cumulative modifiers
+  weapon.js    490  the single hitscan path, the aim scan, tracers, impacts
+  deckgun.js   300  manned mounts, hull-local traverse arcs, heat, one operator
+  repair.js    260  contextual repair, one welder per point, ground markers
+  emitters.js  300  hull-mounted shock emitters: the tower-defence layer
   modules.js   200  three hardpoints, six modules, absolute-from-count effects
-  events.js    120  the kill/hit bus items hang procs off, with a depth cap
-  items.js     350  the salvage table: static effects, conditionals, procs
-  economy.js   810  two purses, the re-rolled shop, the pick, the buy window
-  hud.js       780  gauges, prompts, shop, bay, pick, route, target, buffs
+  events.js    130  the kill/hit bus items hang procs off, with a depth cap
+  items.js     370  the salvage table: static effects, conditionals, procs
+  economy.js  1170  a shared Treasury + one Economy per operative, shop, pick
+  hud.js      1020  gauges, prompts, shop, bay, pick, route, target, buffs
   render.js    390  renderer, EffectComposer chain, camera shake
   fx.js        470  one pooled particle system, muzzle light
-  viewmodel.js 160  the rifle in your hands
+  viewmodel.js 290  the rifle in your hands
   audio.js     290  synthesised mixer, no audio files
+  net.js       490  BROWSER-ONLY multiplayer client — today a pose RELAY
   input.js      90  keyboard/mouse, pointer lock
-  main.js      430  wiring and the frame loop
+  main.js      570  wiring, the fixed-timestep accumulator, and the frame loop
 ```
 
 ## The headless boundary
 
-This is the most important structural rule in the project, and it is what makes a
-7,000-line test harness possible at all.
+This is the most important structural rule in the project, and it is what makes an
+11,000-line test harness possible at all — and, it turns out, an authoritative server.
 
 The harness constructs the **real** `World`, `Trampler`, `Player`, `Horde`,
 `Director`, `Weapon`, `Repair`, `DeckGun`, `Emitters`, `Modules`, `Events`,
@@ -83,6 +99,29 @@ The harness constructs the **real** `World`, `Trampler`, `Player`, `Horde`,
 `npm run imports` enforces the resolution half of this by parsing the importmap
 out of `index.html` and checking every specifier. In a project with no build step,
 a mistyped path is a blank canvas and one line in the console.
+
+### And the boundary paid for itself somewhere it was not designed for
+
+The rule was written so a test harness could exist. Its unplanned dividend is that
+**the simulation runs unmodified inside a Cloudflare Durable Object** — measured, not
+assumed: `npm run sim:worker` constructs the real `World`, `Trampler`, `Player`, `Crew`,
+`Horde`, `Director`, `Weapon` and `Events` in workerd, fills a 400-body pool and steps
+it, with every position finite. That is the question that could have torn up the netcode
+plan, and the answer is yes with roughly a 17x margin inside a 16.7 ms tick.
+
+workerd is a *stricter* environment than the harness, which is worth stating because it
+inverts the usual reading of this rule. Node has no `document` either, but `look.js`
+degrades to flat materials and carries on. workerd has no DOM and no shim for one, so the
+same reach is a load failure at import time — before any of the server's own error
+reporting runs, which is how it would present as "the simulation cannot run here".
+`npm run audit` now holds the boundary over `worker/` for exactly that reason, and holds
+the no-`Math.random` rule there too: on the authority, an unseeded draw desyncs every
+client at once and presents as rubber-banding rather than as a determinism bug.
+
+One caveat on the bundle. Every simulation module imports `Vector3` or `Matrix4`, so
+three.js is in the deployed Worker unconditionally — about 921 KB. That is the
+architecture's cost, not the spike's, which settles the question of whether
+`worker/sim-check.js` earns its place: it is free, and it stays.
 
 ## Architectural patterns
 
@@ -130,8 +169,42 @@ including them would push every boarder off the ship.
 
 Enemies are plain objects in a fixed pool, drawn with `InstancedMesh`, with a
 uniform spatial hash for neighbour separation. There is no `Object3D` per enemy.
-400 enemies simulate in about 0.40 ms/frame. Built this way from the start because
-retrofitting crowd tech is a rewrite.
+Built this way from the start because retrofitting crowd tech is a rewrite.
+
+**Cost is a function of DENSITY, not of head count, and the figure in these files was
+taken at the cheapest moment in a run.** 0.40 ms/frame was quoted here and in `tech.md`
+for a long time. It is what test 17 measures, and test 17 times a short window straight
+after 400 bodies spawn — on a ring 63 m out, maximally dispersed, sharing almost no
+spatial-hash cells. Then they converge under an 8 m hull.
+
+Measured with `node tools/sim-cost-window.mjs`, 400 chewers over 1200 frames:
+
+| crowd spread, hull space | ms/frame |
+|---|---|
+| 34 m — just spawned, on the ring | 0.30 |
+| 20 m — closing | 1.12 |
+| 9 m — packed under the hull | 1.25 – 1.95 |
+
+Whole run: **0.6 – 0.95 ms/frame, so roughly 40 – 55 ms of CPU per wall-clock second.**
+Six-fold between the cheapest and dearest phases, and the expensive phase is the one the
+game is actually about — bodies contending around the legs is the under-hull arena, not
+an edge case.
+
+**Quote that as a range, because it will not reproduce tighter than that.** Four runs of
+identical code on one machine gave 0.62, 0.83, 0.88 and 0.94 ms/frame; the spread is
+background load, and the earlier single-figure readings in these files were each one
+sample presented as a measurement. The *ratio* between phases is solid — both clocks
+agree to three decimals within a run — and it is the ratio that carries the lesson. Any
+budget argument that needs better than ±35% on the absolute number needs a repeated
+measurement first.
+
+Two things follow. Quote the whole-run figure, not test 17's, for anything that is a
+budget. And note that this is the same trap the test suite has been caught by three
+times: *sampling at the wrong moment in a sequence*. It happened here in a profiler,
+with a number that then sat in two steering files for months.
+
+The pool cap is `CFG.enemies.max` at 420; 400 is what test 17 fills and what every
+measurement above is taken against.
 
 Six types, one `InstancedMesh` each, plus one for the spoil heaps that mark a
 burrowing enemy. Per-type numbers come from `enemyCfg(type)` — there are **no**
@@ -229,6 +302,54 @@ Two things about it are load-bearing:
   splash that kills two more, which is automation compounding itself with nobody
   present — invariant 2b failing in a way nothing looks wrong about. Income
   deliberately ignores `source` and pays either way.
+
+### What a predicting client may and may not run
+
+Two decisions taken before the snapshot layer exists, because both are hazards *now* —
+the code that would trip them is the next thing anyone writes, and both fail silently.
+Recorded at their hazards as well, in `economy.js` and `weapon.js`.
+
+**A CLIENT DEALS NO DAMAGE.** Its shot is presentation only: muzzle, tracer, recoil,
+audio. It never routes through `Horde.damage`, so `emitKill` and `emitHit` never fire
+locally, so no local kill, no local proc, no local income. The server runs the real
+`shootFrom` and the snapshot carries the consequences.
+
+This is load-bearing rather than tidy, because of a rule that is already true: every
+`Economy` and every `Treasury` subscribes to the kill bus in its constructor and
+listeners are **deliberately never removed**. A client still needs an Economy —
+`applyAll()` is what writes `weapon.damageScale`, `player.maxHp` and the rest, and
+predicting your own movement and damage needs those right locally — so a client Economy
+that also heard kills would be a second writer to a purse the snapshot overwrites twenty
+times a second. The symptom is an income tick that flickers or double-counts, which
+nobody would read as a netcode bug. `Items` subscribes to `onHit` as well, so the same
+mistake fires procs and advances the proc stream too.
+
+Guarded twice on purpose. A client passes **no bus** at all: `events` is read for nothing
+except the subscription, so `events: null` yields a fully working Economy that cannot pay
+anybody, and the existing `?.` makes that free. Rule one is the design; rule two is what
+holds when somebody later has a good reason to emit locally.
+
+**A STREAM IS ORDER-DEPENDENT, SO ANYTHING THE CLIENT MUST AGREE ABOUT IS KEYED ON AN
+INDEX INSTEAD.** `shootFrom` draws cone spread from `CFG.combat.weapon.seed`, two values
+per pellet. A client and a server each holding `makeRandom(sameSeed)` agree only while
+they make identical draws in identical order — and they will not, because a client
+mispredicts a shot the server refused for heat or for a station change. From that frame
+the two are permanently one draw apart. Not drift: two different sequences, and a tracer
+that points where the authoritative round did not go, for the rest of the run.
+
+So spread becomes a hash of `(input sequence, shot index, pellet index)` — values both
+sides already have, since the server knows which input sequence it processed. Order-
+independent, so a mispredicted shot costs nothing. Invariant 21 is untouched: a hash of a
+sequence number is still reproducible and still has no `Math.random` in it.
+
+The general form is the useful part. **Anything the client must agree with the server
+about is keyed on an agreed index; anything the server decides alone keeps its stream,
+because the client is told the outcome rather than reproducing it.** Spawn bearings, wave
+composition, road offers, shop stock and item procs are all the second kind and change
+not at all. Surveyed, and cone spread is the *only* value of the first kind in the
+project — `player.js`, `grapple.js`, `deckgun.js`, `repair.js` and `emitters.js` hold no
+seeded stream, and `items.js`'s proc stream never advances on a client that deals no
+damage.
 
 ### Wave SIZE and wave ROSTER run on different counters
 

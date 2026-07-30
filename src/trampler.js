@@ -979,7 +979,12 @@ export class Trampler {
    * and an automated defence that holds a position is the one thing invariant 2b
    * forbids outright.
    */
-  resolveStomps(horde, player) {
+  /**
+   * @param crew a Crew, not a Player. The third and last of the crew-wide sites: a
+   *        foot coming down crushes whoever is underneath it, and wired to one
+   *        operative the other three could stand under a descending leg untouched.
+   */
+  resolveStomps(horde, crew) {
     this.lastStompHits = 0;
     this.playerStomped = false;
     if (this.footfalls.length === 0) return 0;
@@ -994,17 +999,30 @@ export class Trampler {
         );
       }
 
-      // The player gets crushed, and this is the whole point of the feature: the
+      // An operative gets crushed, and this is the whole point of the feature: the
       // under-hull arena was dark but harmless, and a 26 m walker whose feet pass
       // through you is not a place that feels dangerous. Only on foot -- riding the
       // deck or manning a gun puts you above the machinery.
-      if (player && player.base === null && !player.station) {
-        const dx = player.position.x - _footWorld.x;
-        const dz = player.position.z - _footWorld.z;
-        const dy = player.position.y - _footWorld.y;
-        if (dx * dx + dz * dz < s.radius * s.radius && Math.abs(dy) < 2.6) {
-          player.hurt(s.playerDamage);
-          this.playerStomped = true;
+      //
+      // Every member, with no break: unlike a chewer's swing there is no cooldown
+      // being consumed here, so a foot landing on two people crushing both is simply
+      // what a foot does. It also cannot inflate anything the invariants measured --
+      // invariant 2c is that the feet deal no damage to ENEMIES, and this touches only
+      // the crew.
+      if (crew) {
+        for (const p of crew) {
+          if (!p || p.base !== null || p.station) continue;
+          const dx = p.position.x - _footWorld.x;
+          const dz = p.position.z - _footWorld.z;
+          const dy = p.position.y - _footWorld.y;
+          if (dx * dx + dz * dz < s.radius * s.radius && Math.abs(dy) < 2.6) {
+            p.hurt(s.playerDamage);
+            // Read by main.js to shake the camera, so it means "somebody was
+            // stomped". Once each client predicts its own operative it will have to
+            // mean "the LOCAL one was", or everybody's view shakes when one person is
+            // crushed. Noted rather than fixed: there is no local operative yet.
+            this.playerStomped = true;
+          }
         }
       }
     }

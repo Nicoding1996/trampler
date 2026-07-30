@@ -616,6 +616,69 @@ export const CFG = {
     // runs. Change this number to get a different but still reproducible fight.
     seed: 20260725,
 
+    // THE WALK CYCLE. Presentation only -- nothing here is read by the simulation,
+    // and every value is applied in a vertex shader against per-instance data.
+    //
+    // These are amplitudes for a whole crowd, not for one body being inspected, and
+    // what sets the ceiling on them is invariant 8: the drawn silhouette has to keep
+    // agreeing with the box a shot tests against, which is `radius * 1.2 * bulk` in x
+    // and z against `height / 2 + hitPad` in y.
+    //
+    // MEASURED, by sweeping a full phase cycle at full amplitude against every
+    // vertex of all six types. The finding that matters is not the one that was
+    // expected:
+    //
+    //   Worst extent ADDED anywhere: 0.099 m, the titan in x -- and the titan is
+    //   2.134 static against a 2.460 box, so it stays inside.
+    //
+    //   Several silhouettes ALREADY sat outside the box before any of this existed.
+    //   A chewer's mandibles reach 1.080 against a 0.780 box; a titan's horns 3.203
+    //   against 2.780. Thin protrusions nobody aims at, and pre-existing.
+    //
+    //   The animation NEWLY crosses the box in exactly two places, both by a sliver
+    //   on the outermost part of a body: the climber in y by 18 mm at the top of its
+    //   head, and the bulwark in z by 59 mm at the tip of a rear leg.
+    //
+    // Those two crossings are not a tuning failure and cannot be tuned away. The
+    // climber's head sits 17 mm below its own box top and the bulwark's rear leg 9 mm
+    // inside its own, so ANY animation at all crosses somewhere -- the choice is how
+    // much, not whether. Raising hitPad would close it, and that is deliberately not
+    // done here: hitPad is read by every hit test in the game, and widening the box
+    // to flatter the artwork would invalidate every combat measurement in the
+    // invariants. A presentation change does not get to move a simulation number.
+    //
+    // Re-measure rather than reason if any of these move, and re-measure if a
+    // silhouette or hitPad changes. The arithmetic spans two files and would drift
+    // silently. `node tools/gait-extents.mjs` prints the table above.
+    gait: {
+      // Radians per second of gait phase, before the per-type divisor below. Fast
+      // enough to read as scurrying on a chewer, which is the commonest body on
+      // screen and the one that sets the tone.
+      rate: 9.0,
+
+      // Peak limb swing, as a multiplier on how far a vertex hangs below its pivot.
+      // So a leg h*0.5 long sweeps about h*0.5 * 0.55 at full amplitude -- a real
+      // stride rather than a twitch.
+      swing: 0.55,
+
+      // Vertical body bob, in metres. Deliberately tiny: it applies to limbs as
+      // well, so it lifts the feet, and this is the number that pays for not
+      // building a proper two-bone leg.
+      bob: 0.035,
+
+      // Yaw sway, radians. Small on purpose -- it is doing a statistical job across
+      // forty bodies rather than a visible one on any single body, and past about
+      // 0.1 a crowd starts to look drunk instead of alive.
+      sway: 0.06,
+
+      // Bigger things stride slower. `rate` is divided by bulk raised to this power,
+      // so a titan at bulk 2.4 runs its cycle at about 60% of a chewer's rather than
+      // pedalling like one. Derived rather than a per-type knob because the
+      // relationship is the point: mass sets cadence, and six numbers that could
+      // disagree about that would eventually disagree.
+      bulkDrag: 0.65,
+    },
+
     // Chewers attack the legs from INBOARD, under the hull slab. That is not
     // decoration: the deck physically blocks line of sight to anything directly
     // beneath it, so they cannot be answered from up top. This is the forcing
@@ -1103,6 +1166,32 @@ export const CFG = {
 
     baseCount: 10,
     perWave: 5,
+
+    // How much bigger a wave gets per EXTRA operative, multiplying the size curve
+    // above. One operative is x1.0 by construction, not by arithmetic that happens to
+    // come out right: the term is `1 + perHead * (size - 1)`, so solo is untouched and
+    // this whole knob is invisible until somebody joins.
+    //
+    // 0.5 is Risk of Rain 2's shipped coefficient for the same job -- their spawn credit
+    // is `0.5 * playerCount + 0.5`, which is the identical curve written from the other
+    // end. Borrowed rather than invented because it is the one number here with a decade
+    // of live-service tuning behind it, and because starting from a known-good value is
+    // what makes the first measurement mean something.
+    //
+    // COUNT ONLY, and that restriction is the point. Invariant 19e says the size curve was
+    // tuned against measured pacing and that moving size and composition together makes a
+    // later difficulty change impossible to attribute to either. So this scales how MANY
+    // arrive and nothing else: the roster's per-type caps (bulwarkMax, sapperMax) are
+    // untouched, which means a crew of four meets proportionally more chewers and the same
+    // number of specials. Whether that is right is the NEXT question, and test 111
+    // measures it rather than leaving it to be guessed.
+    //
+    // Deliberately NOT scaled: enemy health. Health is invisible -- a playtester cannot
+    // tell a 1.5x chewer from a 1.0x one, they can only tell that shooting feels
+    // unrewarding -- so it is the wrong lever for making a crowd matter and the right
+    // lever for making a fight feel bad.
+    crewCountPerHead: 0.5,
+
     climberShare: 0.3,
     spawnRadius: 74,
     // Trickle, do not dump. At 9/s a wave of twenty was fully on the field in
@@ -1198,6 +1287,11 @@ export const CFG = {
     // 30-45 minute target, but this is one biome, and biomes are the unit that
     // repeats.
     legs: 4,
+
+    // Keep the loss on screen long enough to read before the whole encounter rewinds. This
+    // used to be a literal in main.js; the authoritative Worker needs the same transition,
+    // so one shared value now owns both paths. The value is unchanged.
+    resetDelay: 3.5,
 
     // Two roads offered at each landmark. Three would be more choice and less
     // decision: with three, one is almost always obviously worst, which just adds
@@ -1834,6 +1928,234 @@ export const CFG = {
     // 4 is deep enough that a chain reaction reads as one, and shallow enough that
     // the worst case is 4 nested loops over a handful of listeners.
     maxProcDepth: 4,
+  },
+
+  // The frame loop's own timing.
+  //
+  // WHY THIS EXISTS AT ALL. Until now the loop stepped on however long the last
+  // frame took, clamped to 1/30 -- so the simulation advanced by a different amount
+  // on every machine and on every frame. Two consequences, and the second is the
+  // one that forced this:
+  //
+  //   * The harness has always used a fixed DT of 1/60. So 829 assertions measured
+  //     a timestep the game never actually ran. Every number in the steering files
+  //     was taken at 1/60; the game was running something else.
+  //   * Client prediction requires the client and the server to step the same
+  //     simulation with the same dt, or the server's version of your last second
+  //     disagrees with yours and you get corrected constantly. Two clients at
+  //     different refresh rates already diverged before a network was involved.
+  //
+  // Note what determinism does NOT require: a fixed number of steps per rendered
+  // frame. Only the dt of each step has to be constant. That is why this is an
+  // accumulator rather than a fixed render rate, and why it costs nothing on a
+  // display that is not 60 Hz.
+  loop: {
+    stepHz: 60,
+
+    // The most real time one rendered frame may absorb. An alt-tab, a breakpoint or
+    // a first-frame texture upload can hand back a frame worth seconds; without a
+    // cap the accumulator would owe hundreds of steps and spend them all at once,
+    // which reads as a freeze followed by a teleport.
+    //
+    // Dropping the excess is the correct failure rather than a lossy one: a server
+    // counts ticks, not seconds, so time the simulation never sees cannot desync
+    // it. It also bounds steps-per-frame by construction -- 250 ms of catch-up is
+    // 15 steps at 60 Hz -- which is why there is no separate step cap. A second
+    // knob meaning the same thing is a knob that can disagree with itself.
+    maxCatchUpMs: 250,
+  },
+
+  // Multiplayer, and specifically the CLIENT half of it. The server's own numbers
+  // -- tick rate, snapshot rate, crew cap, the wake interval -- live in
+  // worker/index.js, because a Durable Object cannot import this file.
+  //
+  // That split is a real cost and worth naming: `sendHz` here and `SNAPSHOT_EVERY`
+  // there are two halves of one decision, in two files, with nothing checking they
+  // agree. tools/smoke-lobby.mjs asserts the server's advertised rates match what
+  // this expects, so the pair cannot drift silently -- the same reason the refit
+  // terminal's distance to the reactor is asserted rather than left in a comment.
+  net: {
+    // Client pose rate. Matches the server's 20 Hz broadcast: sending faster would
+    // put two poses in one relayed frame and the second would overwrite the first
+    // before anyone saw it.
+    sendHz: 20,
+
+    // Commands buffered per operative on the authority. Sixteen covers the Worker's bounded
+    // 250 ms catch-up (15 ticks) without turning a transient runtime stall into dropped input;
+    // anything deeper would preserve stale intent long enough to become input latency instead.
+    inputQueue: 16,
+
+    // A missing packet may repeat held levels briefly, never indefinitely. Three ticks bridge
+    // one late 20 Hz snapshot interval; after 50 ms the authority releases movement, fire and
+    // repair so a backgrounded or disconnected tab cannot keep acting for its absent player.
+    inputGraceTicks: 3,
+
+    // A visible multiplayer frame may catch up at most six simulation steps. The authority has
+    // already advanced during a stall, so replaying the solo loop's full 250 ms would emit 15
+    // historical commands at once and predict the client past the snapshot it just received.
+    // Focus/visibility resume drops the gap entirely; this cap handles an ordinary slow frame.
+    maxClientCatchUpMs: 100,
+
+    // Eight 20 Hz packets retain 350 ms of server-tick history. That is enough for the
+    // 120 ms playback delay plus one ordinary TCP head-of-line burst; a four-packet buffer
+    // discarded the missing interval before the renderer could play it at a steady cadence.
+    snapshotBuffer: 8,
+
+    // How far behind live to render other players.
+    //
+    // This is the whole latency answer for remote bodies, and it is a deliberate
+    // trade rather than a tuning knob: you buy smoothness with lag. One snapshot
+    // interval (50 ms) leaves nothing to interpolate between the moment a packet is
+    // late, and the avatar stalls. Two intervals plus a margin rides out a single
+    // late or reordered packet without ever extrapolating.
+    //
+    // 120 rather than 100 because this rides on WebSockets, which is TCP: a lost
+    // packet is not skipped, it is retransmitted, and everything behind it waits.
+    // Cloudflare Workers accept HTTP and WebSockets but not WebTransport datagrams,
+    // so there is no unreliable option on this host and the buffer pays for it.
+    interpDelayMs: 120,
+
+    // Drop an avatar that has said nothing for this long. Two seconds is well past
+    // any plausible retransmit and well short of a player wondering why a ghost is
+    // standing on the deck.
+    staleMs: 2000,
+
+    // How fast a prediction error is paid off, as an exponential rate in reciprocal seconds.
+    //
+    // 12 settles about 95% of a correction in a quarter second. The band it has to sit in is
+    // narrow at both ends and neither end is a matter of taste. Too slow and the operative
+    // visibly lags its own controls while the offset drains, which is the responsiveness
+    // prediction exists to provide, given away. Too fast and it is a snap in all but name —
+    // invariant 20 forbids anything that reads as a body teleporting, and that rule does not
+    // stop applying because the body is yours.
+    //
+    // Exponential rather than linear because that is what every other smoothed quantity in this
+    // project uses (`damp` in util.js), so a correction behaves like the camera and the recoil
+    // rather than being a third kind of motion.
+    correctionRate: 12,
+
+    // Above this, a correction is a SNAP rather than a smooth. Past a couple of metres the
+    // prediction is not slightly wrong, it is wrong about what happened — refused by a station,
+    // stopped by geometry, killed and respawned — and easing toward the truth would drag the
+    // player across the deck instead of putting them where they are.
+    correctionSnapAt: 2.0,
+
+    // Below this, ignored. Position is quantised at 1 cm on each axis, so a correction chasing
+    // anything smaller would be fighting the wire's own precision for ever.
+    correctionDeadZone: 0.03,
+
+    // A crew member. These size the figure: feet at -avatarHeight/2, helmet at
+    // +avatarHeight/2, torso and shoulders scaled off avatarRadius.
+    //
+    // THIS WAS ONE BOX, and the note here defended it: a relay demo exists to measure
+    // whether a body stays welded to a walking, yawing deck, and a detailed model
+    // would cost draw calls to answer a question a box answers. That was right, and it
+    // has expired -- the box answered it, the body stays welded, and what is left is
+    // the only thing one player ever sees of another. A glowing crate is now the least
+    // finished object in the game by a wide margin.
+    //
+    // The draw-call half of the argument turned out to be cheap. A figure is four
+    // meshes (body, seat signal, two legs) against a measured 181 per-frame calls and
+    // a budget of 220, and you never draw yourself, so a full crew of four is three
+    // avatars and twelve calls. Invariant 32's real rule is that anything STATIC
+    // sharing a material gets merged; the legs are separate precisely because they are
+    // not static, which is the exemption and not a violation of it.
+    avatarHeight: 1.7,
+    avatarRadius: 0.42,
+
+    // THE OPERATIVE'S OWN COLOURS, which are not the seat's.
+    //
+    // Two tones, and the split is what stops the figure reading as a mannequin. One
+    // colour over a whole body is a mannequin whatever the colour is; a helmet plainly
+    // made of different stuff from a coat is a person. Chosen to sit in the same
+    // desaturated earthy family as the six enemy skins and the fortress, because the
+    // first pass painted the whole body in a SEAT colour and the result was a bright
+    // violet toy standing in a dieselpunk desert.
+    //
+    // Deliberately olive rather than tan: the sand is tan, and a crewmate the colour of
+    // the ground is a crewmate you cannot find. The nearest enemy skin is the bulwark's
+    // 0x5c6068, which is greyer and blue-shifted, and silhouette separates them anyway --
+    // one is a human on a deck, the other a hulking quadruped under it.
+    bodyColor: 0x596048,
+    gearColor: 0x33363a,
+
+    // One colour per seat, in seat order, so "who is that" needs no nameplate.
+    //
+    // SIGNAL ONLY now, on the goggle band, the shoulder bands, the pack lamp and the
+    // chest patch. Those are much larger than the pips they replaced, and that is the
+    // trade being made deliberately: a drab body is harder to spot in the hull's shadow
+    // than a glowing one, so the identity cue has to be big enough to carry the job the
+    // body used to. Emissive rather than lit for the same reason -- under the hull is the
+    // one place the sun never reaches, and lights are a budget of four (invariant 32).
+    //
+    // Seat 2 is VIOLET, not the cyan it started as. The first pass used 0x6fd0ff
+    // against the grapple aim ring's 0x6fd3ff -- three units apart in one channel,
+    // which is the same colour to any eye. So a crewmate and the reticle telling you
+    // where your winch would land were indistinguishable, in a game whose whole
+    // premise is knowing where the other person is. Any new seat colour has to be
+    // checked against the signal colours already in use, not just against the other
+    // seats: the ring is 0x6fd3ff, repair markers and hardpoints are their own
+    // emissive signals, and there are only so many hues that read at distance.
+    seatColors: [0xffaa50, 0xb98cff, 0x9de06a, 0xff7fa8],
+    seatEmissive: 0.55,
+
+    // THE WALK CYCLE, and the one structural decision in it: the gait is driven by
+    // DISTANCE TRAVELLED, never by a clock.
+    //
+    // A clock-driven cycle scissors the legs of a crewmate standing still and slides
+    // the feet of one who is walking, and both read as broken rather than as
+    // unfinished. Phase accumulated per metre cannot do either -- it stops when they
+    // stop, by construction, with no threshold to tune.
+    //
+    // It also collects a free dividend from the frame choice this module already
+    // made. A pose aboard is sent in HULL-LOCAL space, so a crewmate standing on a
+    // deck walking at 4.5 m/s has travelled nothing and their legs correctly do not
+    // move. Relayed in world space they would sprint on the spot for the whole run.
+
+    // Metres of travel per full two-step cycle. Deliberately longer than a human
+    // stride, because walkSpeed is 7 m/s -- a game speed, not a human one -- and a
+    // true stride at that pace turns the legs into an eggbeater.
+    gaitStride: 2.0,
+
+    // Peak leg swing, radians. About 35 degrees, which reads as walking from across
+    // the deck without looking like a march.
+    gaitSwing: 0.62,
+
+    // Weight shift, radians, at TWICE the stride frequency -- weight moves on every
+    // step, not every cycle.
+    //
+    // A roll rather than a vertical bob, and that is not a style choice: a bob lifts
+    // the boots off the deck, and this project has a whole invariant about bodies not
+    // floating off the deck footprint. Roll pivots at the origin, so the feet stay
+    // where they are.
+    gaitRoll: 0.05,
+
+    // Forward lean at full speed, radians. Somebody moving at 7 m/s is not upright.
+    gaitLean: 0.14,
+
+    // Smoothing rate for the SPEED that scales the three amplitudes above.
+    //
+    // Poses arrive at 20 Hz and are interpolated, so the per-frame step length is
+    // jittery enough to make the amplitude visibly flutter. Only the amplitude is
+    // smoothed -- the phase stays welded to real distance, or the property above is
+    // lost to get a nicer-looking number.
+    gaitEase: 9,
+
+    // LOCAL DEVELOPMENT ONLY, and the reason these two numbers are here rather than
+    // implicit is that the split between them is confusing enough to have already
+    // caught someone out.
+    //
+    // Deployed, the page and the lobby share an origin, so a relative "/lobby/..."
+    // is correct and neither of these is read. Locally they cannot share one:
+    // `npm start` serves the page from server.mjs and `npm run dev:mp` serves the
+    // lobby from wrangler, because wrangler dev watches its assets directory and the
+    // assets directory is the repo root, so it reloads itself forever.
+    //
+    // Inferring the lobby from the page's port means the ordinary case needs no
+    // query string at all. The ?lobby= override stays for everything else -- a
+    // tunnel, a second machine, a non-default port.
+    devPagePort: "5173",
+    devLobbyPort: "8787",
   },
 
   debug: {

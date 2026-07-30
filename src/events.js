@@ -68,10 +68,11 @@ export class Events {
    * Deliberately NOT fired for an unpaid removal -- a sapper consumed by its own
    * charge is not a kill, and an on-kill item should not reward failing to stop it.
    *
-   * `source` names what killed it: "player" for anything the crew aimed, "emitter"
-   * for automation. Item procs must gate on it, because a proc that fires for an
-   * emitter kill is automation compounding itself with nobody present, which is
-   * invariant 2b failing quietly. The economy ignores it and pays either way.
+   * `source` is WHOEVER caused it -- the operative for anything the crew aimed, the
+   * subsystem for automation. Item procs must gate on it through `causedBy`, because a
+   * proc that fires for an emitter kill is automation compounding itself with nobody
+   * present, which is invariant 2b failing quietly; and one that fires for a TEAMMATE'S
+   * kill spends your build on their trigger. The economy ignores it and pays either way.
    */
   emitKill(enemy, source = null) {
     if (this.depth >= CFG.events.maxProcDepth) {
@@ -104,8 +105,15 @@ export class Events {
    * proc off a heavy hit should be a heavy proc, and the arc's own damage still goes
    * through `Horde.damage`, so the SECOND target's armour applies normally) but it is
    * not obvious, and a reader assuming otherwise would tune the wrong number.
+   *
+   * `source` carries WHO fired, exactly as the kill channel does, and adding it closed a
+   * real hole rather than tidying a signature. This channel had no source at all, and the
+   * on-hit proc therefore had NO GATE: it was safe only because `shootFrom` is the sole
+   * publisher and every weapon routing through it is crew-aimed. Safe by nobody else
+   * emitting rather than safe by a rule -- so with a crew, one operative's hit rolled
+   * every operative's arc caster.
    */
-  emitHit(enemy, damage) {
+  emitHit(enemy, damage, source = null) {
     if (this.depth >= CFG.events.maxProcDepth) {
       this.suppressed++;
       return;
@@ -114,7 +122,7 @@ export class Events {
     if (this.depth > this.deepest) this.deepest = this.depth;
     try {
       const list = this.hitListeners;
-      for (let i = 0; i < list.length; i++) list[i](enemy, damage);
+      for (let i = 0; i < list.length; i++) list[i](enemy, damage, source);
     } finally {
       this.depth--;
     }

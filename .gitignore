@@ -14,6 +14,17 @@
 # would not untrack what is already tracked, but it would silently drop any file
 # added by a future `npm install`. See the README.
 
+# Wrangler's local state: the miniflare cache, the local Durable Object storage
+# and its temp bundles. Recreated on every `npm run dev:mp` and machine-specific.
+# Also listed in .assetsignore, for a different reason — see that file.
+.wrangler/
+
+# Miniflare drops a second cache HERE, inside node_modules, which matters because
+# node_modules is deliberately committed (see the note above and the README). Without
+# this line, running `npm run dev:mp` once puts a machine-specific cache into the
+# repository along with the vendored dependency it is meant to be sitting beside.
+node_modules/.mf/
+
 # OS and editor cruft.
 .DS_Store
 Thumbs.db

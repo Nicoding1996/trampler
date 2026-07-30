@@ -225,19 +225,35 @@ export class Emitters {
 
   // ------------------------------------------------------------------- update
 
-  update(dt, input, player) {
-    const cfg = CFG.emitters;
-
+  /** Fade transient beams and refresh the charge lamps. Presentation-only. */
+  #updateVisuals(dt) {
     for (const a of this.arcs) {
       if (a.life <= 0) continue;
       a.life -= dt;
       if (a.life <= 0) a.mesh.visible = false;
     }
+    for (const slot of this.slots) {
+      if (!slot.live) continue;
+      slot.head.material.emissiveIntensity = 0.25 + (slot.charge / this.maxCharge) * 1.5;
+    }
+  }
+
+  /**
+   * One authoritative update plus one operative's placement input.
+   *
+   * The session calls this once per operative so every X/C edge is considered, but only
+   * the first call advances shared clocks and damage. Without `advanceShared`, four seats
+   * recharge and fire the same rack four times per server tick.
+   */
+  update(dt, input, player, advanceShared = true) {
+    const cfg = CFG.emitters;
 
     if (input.pressed(cfg.deployKey)) this.deploy(player);
     if (input.pressed(cfg.recallKey)) this.recall(player);
-    // Refreshes `blockReason` for the HUD as before, and now records the answer too.
     this.ready = this.canDeploy(player);
+
+    if (!advanceShared) return;
+    this.#updateVisuals(dt);
 
     const r2 = cfg.radius * cfg.radius;
 
@@ -246,9 +262,6 @@ export class Emitters {
 
       slot.cd -= dt;
       slot.charge = Math.min(this.maxCharge, slot.charge + cfg.recharge * dt);
-
-      // Coil brightness is the charge readout: bright and full, dim and dry.
-      slot.head.material.emissiveIntensity = 0.25 + (slot.charge / this.maxCharge) * 1.5;
 
       if (slot.cd > 0 || slot.charge < 1) continue;
 
@@ -274,11 +287,26 @@ export class Emitters {
       // Named as automation on purpose: item procs refuse to fire for this, so a
       // rack of emitters cannot compound itself into holding the under-hull area
       // with nobody down there. Invariant 2b.
-      this.horde.damage(victim, cfg.damage, "emitter");
+      this.horde.damage(victim, cfg.damage, this);
       slot.charge -= 1;
       slot.cd = cfg.interval;
       this.#arc(_world, _target);
     }
+  }
+
+  /**
+   * Predict only the local readout between snapshots. No placement, targeting or damage:
+   * a network client is a reader of the shared rack, never a second authority for it.
+   */
+  updateClient(dt, player) {
+    const cfg = CFG.emitters;
+    this.ready = this.canDeploy(player);
+    for (const slot of this.slots) {
+      if (!slot.live) continue;
+      slot.cd = Math.max(0, slot.cd - dt);
+      slot.charge = Math.min(this.maxCharge, slot.charge + cfg.recharge * dt);
+    }
+    this.#updateVisuals(dt);
   }
 
   #arc(from, to) {

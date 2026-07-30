@@ -1,0 +1,18 @@
+# Gitignore-style patterns for things that must not be published as static assets.
+#
+# `.wrangler/` is wrangler's own local state -- the miniflare cache, the local
+# Durable Object SQLite files, and its temp bundles. It appears inside the repo
+# root, which is also `assets.directory`, so without this it would be uploaded
+# with the game.
+#
+# Deliberately minimal. Publishing the rest of the tree is an intentional decision
+# recorded in wrangler.jsonc, and trimming it is a separate change with its own
+# reasoning -- not something to slip in alongside a multiplayer feature.
+#
+# NOTE what this does NOT fix, because the first version of this file claimed it
+# did: `wrangler dev` watches `assets.directory` for changes, and this file does
+# not exclude anything from that watcher. With the directory set to the repo root,
+# wrangler's own writes into `.wrangler/tmp` retrigger it, and the server reloads
+# several times a second while answering nothing. That is why local multiplayer
+# development uses wrangler.dev.jsonc, which has no assets block at all.
+.wrangler

@@ -1,6 +1,8 @@
 {
-  // A static-assets-only Worker: no "main", because there is no server-side code
-  // to run. Cloudflare serves the files and nothing else executes.
+  // Static assets plus one Worker, and the Worker exists for exactly one route.
+  // Until multiplayer there was no "main" at all -- Cloudflare served the files
+  // and nothing executed. Adding a script changes routing, so it is scoped
+  // deliberately below rather than left to the default.
   "name": "trampler",
   "compatibility_date": "2026-07-27",
 
@@ -13,6 +15,39 @@
   // one is bound to loopback. It is fine here only because the repo is already
   // public and carries no secrets.
   "assets": {
-    "directory": "./"
-  }
+    "directory": "./",
+
+    // Named so the Worker can hand a request straight back to the asset server
+    // rather than reimplementing a static file server it does not need.
+    "binding": "ASSETS",
+
+    // THE IMPORTANT LINE. `run_worker_first` also accepts `true`, which would put
+    // the Worker in front of every request on the site -- including the 20 MB of
+    // textures. As an array it runs first only for these routes, and everything
+    // else keeps the asset-first behaviour it has today, byte for byte.
+    "run_worker_first": ["/lobby/*"]
+  },
+
+  "main": "worker/index.js",
+
+  // One Durable Object class, one game session per instance, addressed by join
+  // code via idFromName(). See worker/index.js for why that choice removes
+  // matchmaking, NAT traversal, host advantage and host migration all at once.
+  "durable_objects": {
+    "bindings": [
+      { "name": "LOBBY", "class_name": "Lobby" }
+    ]
+  },
+
+  // SQLite-backed, not key-value. Since July 2026 new namespaces must be SQLite
+  // regardless of plan unless the account already has a KV-backed one, and the
+  // Workers Free plan could only ever create SQLite ones. `new_classes` here
+  // would fail at deploy rather than at runtime, which is the good direction.
+  //
+  // Nothing is written to storage yet: a session is entirely in memory and dies
+  // with the last socket. The backend still has to be declared to create the
+  // class.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Lobby"] }
+  ]
 }

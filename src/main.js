@@ -8,6 +8,7 @@ import { Input } from "./input.js";
 import { World } from "./world.js";
 import { Trampler } from "./trampler.js";
 import { Player } from "./player.js";
+import { Crew } from "./crew.js";
 import { Grapple } from "./grapple.js";
 import { Horde } from "./enemies.js";
 import { Director } from "./waves.js";
@@ -25,6 +26,8 @@ import { createRenderer, Post, Shake } from "./render.js";
 import { Fx } from "./fx.js";
 import { ViewModel } from "./viewmodel.js";
 import { Audio } from "./audio.js";
+import { Net } from "./net.js";
+import { resetSession } from "./session.js";
 
 const canvas = document.getElementById("c");
 const gate = document.getElementById("gate");
@@ -48,10 +51,18 @@ function boot() {
   const grapple = new Grapple(scene, player, trampler, world);
   player.grapple = grapple;
 
+  // A crew of one for now. The three systems that ask about the crew as a GROUP take
+  // this; everything else still takes the operative directly, because everything else
+  // is about one specific person and becomes one instance per person later.
+  const crew = new Crew([player]);
+
   const horde = new Horde(scene, trampler);
-  const director = new Director(horde, trampler, player);
+  const director = new Director(horde, trampler, crew);
   const weapon = new Weapon(scene, player, horde, world, trampler);
-  const repair = new Repair(player, trampler, horde);
+  // Repair takes the crew as well as the operative, and it is the one per-operative
+  // system that does: a repair point admits one welder, so it has to be able to ask who
+  // else is on it. At one member the answer is always nobody.
+  const repair = new Repair(player, trampler, horde, crew);
   const guns = CFG.deckGun.mounts.map((m) => new DeckGun(scene, trampler, m));
   const emitters = new Emitters(scene, trampler, horde);
 
@@ -85,12 +96,18 @@ function boot() {
   // while and nothing ever read it -- the shop, the pick panel and the build readout
   // are all driven off the catalogue and `stacks`, so the economy never needs to ask
   // the runtime anything.
-  const run = new Run(director, horde, economy);
+  // The crew, because the road is put to it. At one member a majority is one keypress.
+  const run = new Run(director, horde, economy, crew);
 
-  // Whichever mount the HUD should be talking about: the manned one, else the
-  // one you are standing next to.
+  // Whichever mount the HUD should be talking about: the one THIS operative is in,
+  // else the one they are standing next to.
+  //
+  // `player.station` rather than a search for an occupied gun, for the reason
+  // handleStationInput gives at length: with a crew, "the manned one" is a question
+  // about the ship and this is a question about you. The HUD would otherwise draw
+  // somebody else's heat bar and offer to dismount a seat you are not sitting in.
   const activeGun = () =>
-    guns.find((g) => g.mounted) ?? guns.find((g) => g.canMount) ?? null;
+    player.station ?? guns.find((g) => g.canMount) ?? null;
 
   const input = new Input(canvas, gate);
   const hud = new Hud();
@@ -99,6 +116,31 @@ function boot() {
   const fx = new Fx(scene, camera);
   const viewmodel = new ViewModel(camera);
   const audio = new Audio();
+  // Browser-only, like the four above it, and a RELAY rather than multiplayer: it
+  // broadcasts where this operative is standing and draws where the others are.
+  // Nothing in the simulation knows it exists, and nothing may come to depend on it
+  // -- the harness cannot import this file, so a rule that lived here would have no
+  // test behind it.
+  // The objects a snapshot is applied TO. A bag rather than a growing argument list,
+  // because `applySnapshot` already needs four of them and slices 2 and 3 add the horde and
+  // the operatives. Built here rather than inside Net so that the one place which knows how
+  // this game is wired stays the one place that says so.
+  const localOperative = {
+    // Filled from the lobby hello before the first snapshot. Zero cannot collide with a real
+    // seat and lets sparse IDs remain identities rather than array positions.
+    seat: 0, player, weapon, grapple, repair, items, economy, input, bayOpen: false,
+  };
+  const localSim = {
+    scene, camera, world, trampler, player, crew, grapple, horde, director, weapon,
+    repair, guns, emitters, modules, economy, items, run, events, input,
+    operatives: [localOperative],
+    treasury: economy.treasury,
+    networked: false,
+    autoReset: false,
+    resetId: 0,
+    lossTimer: 0,
+  };
+  const net = new Net(scene, player, trampler, localSim);
 
   // Art is loaded asynchronously and applied to materials that already exist, so
   // the first frames draw in flat colours and then dress themselves. A missing
@@ -109,6 +151,19 @@ function boot() {
   // and the click-to-play gate is exactly that.
   canvas.addEventListener("pointerdown", () => audio.start());
   gate.addEventListener("click", () => audio.start());
+
+  // AND TELL THE SERVER TO BEGIN, which is the message that makes anything shared at all.
+  //
+  // The Durable Object builds its authoritative world on `start` and on nothing else. Without
+  // this line it stayed a lobby: no snapshots, every client running its own complete simulation,
+  // two tabs playing two separate games. That was the state through four slices of otherwise
+  // working netcode, because the only thing that had ever sent `start` was the smoke test.
+  //
+  // Bound to the same gesture as the mixer, and for the same reason: clicking the gate is the
+  // one unambiguous "I am ready to play". Seat 1 only and idempotent, both enforced inside
+  // `net.start()`, so this can fire on every click without consequence.
+  gate.addEventListener("click", () => net.start());
+  canvas.addEventListener("pointerdown", () => net.start());
 
   // Raycasting needs current world matrices. The renderer only refreshes them
   // at draw time, which is after the frame's grapple cast, so seed them once
@@ -122,37 +177,7 @@ function boot() {
   });
 
   function resetEncounter() {
-    horde.clear();
-    emitters.clear();
-    // Wipes both purses AND reverts every upgrade, and calls modules.reset(), which
-    // strips the three hardpoints and restores every module multiplier. Carrying
-    // stats across a restart would make each attempt quietly easier, which defeats
-    // the seeded fight.
-    economy.reset();
-    trampler.repairAll();
-    // Rewind the patrol too, not just the damage. Spawn bearings derive from the
-    // hull's heading, so leaving it mid-patrol makes a restart a different fight
-    // from the same seed.
-    trampler.resetPose();
-    director.reset();
-    // After the director, because the run re-seeds its own road stream and then
-    // reconfigures the director's siege length for landmark one.
-    run.reset();
-    world.setFogScale(1);
-    player.hp = player.maxHp;
-    for (const g of guns) {
-      g.dismount(player);
-      g.heat = 0;
-      g.overheated = false;
-    }
-    player.respawnOnDeck();
-    // LAST, and after the respawn on purpose. It re-seeds the proc stream and clears
-    // every timed buff, so a restarted run rolls the same chances in the same order --
-    // but it also snapshots whether the player is aboard, and running it before the
-    // respawn snapshotted "on the ground" and then saw the respawn as a boarding
-    // transition, arming three seconds of free damage at the start of every restart
-    // that happened from the ground.
-    items.reset();
+    resetSession(localSim);
     hud.closeBay();
     hud.hideBanner();
     lossTimer = 0;
@@ -163,18 +188,10 @@ function boot() {
   // and "this feels awful" is bound to a key, so it can be judged live rather
   // than argued about.
   function toggles() {
-    if (input.pressed("KeyP")) trampler.walking = !trampler.walking;
-    if (input.pressed("KeyY")) trampler.turning = !trampler.turning;
-    if (input.pressed("KeyB")) CFG.trampler.bob = !CFG.trampler.bob;
-    if (input.pressed("KeyG")) CFG.grapple.hardpointsOnly = !CFG.grapple.hardpointsOnly;
-    if (input.pressed("KeyM")) applyReleasePreset(CFG.releasePreset + 1);
+    // Presentation controls stay local in every mode: they alter neither the authoritative
+    // simulation nor any value prediction depends on.
     if (input.pressed("KeyH")) hud.toggleHelp();
     if (input.pressed("Backquote")) hud.toggleDiagnostics();
-    if (input.pressed("KeyR")) player.respawnOnDeck();
-    if (input.pressed("KeyT")) player.dropToGround();
-    // E is held for repair, so calling a wave early moved to Q.
-    if (input.pressed("KeyQ")) director.callEarly();
-    if (input.pressed("KeyK")) resetEncounter();
     if (input.pressed("KeyN")) {
       toast(`POST-PROCESSING ${post.toggle() ? "ON" : "OFF"}`, 1.2);
     }
@@ -196,6 +213,22 @@ function boot() {
         1.8,
       );
     }
+
+    // Every remaining toggle mutates simulation state or a CFG value prediction reads.
+    // In multiplayer its edge must remain untouched for readInput(), or be ignored entirely;
+    // consuming it here would either fork the client or prevent the authority seeing Q/K.
+    if (net.multiplayer) return;
+
+    if (input.pressed("KeyP")) trampler.walking = !trampler.walking;
+    if (input.pressed("KeyY")) trampler.turning = !trampler.turning;
+    if (input.pressed("KeyB")) CFG.trampler.bob = !CFG.trampler.bob;
+    if (input.pressed("KeyG")) CFG.grapple.hardpointsOnly = !CFG.grapple.hardpointsOnly;
+    if (input.pressed("KeyM")) applyReleasePreset(CFG.releasePreset + 1);
+    if (input.pressed("KeyR")) player.respawnOnDeck();
+    if (input.pressed("KeyT")) player.dropToGround();
+    // E is held for repair, so calling a wave early moved to Q.
+    if (input.pressed("KeyQ")) director.callEarly();
+    if (input.pressed("KeyK")) resetEncounter();
 
     const d = CFG.debug;
     if (input.pressed("BracketLeft")) {
@@ -224,6 +257,27 @@ function boot() {
     );
   }
 
+  // The authority publishes a new object only when road history changes. Remember that
+  // identity so a snapshot-driven client shows the arrival once rather than once per step.
+  // Resetting the run clears `lastArrival`, which re-arms the edge for the next attempt.
+  let shownArrival = null;
+
+  function showArrival(a) {
+    world.setFogScale(run.fogScale);
+    // Names the COST as well as the payout, and both through the same describer the
+    // route panel used a moment ago, so the banner cannot promise something the panel
+    // did not. It used to list only the money, which is why a playtester pressed 1,
+    // got paid, and concluded the choice had done nothing.
+    const { costs, pays } = describeRoad(a.road);
+    toast(
+      `ARRIVED — ${a.name}`
+      + `<small>${costs.join(" · ")}, for the rest of the biome`
+      + `<br>paid ${pays.join(" · ")}`
+      + `${a.boss ? "<br>SOMETHING IS WAITING AT THIS ONE" : ""}</small>`,
+      4.5,
+    );
+  }
+
   /**
    * Hand the number keys to whichever of the three competing panels owns them,
    * then deal with the HUD and world side effects the router deliberately does not.
@@ -232,6 +286,27 @@ function boot() {
    * harness cannot import this file, so anything decided here is uncovered.
    */
   function handlePurchasing(dt) {
+    // The authority owns every purchase, vote, pick and bay toggle. The client predicts only
+    // the bay's visibility, then adopts the operative bit repeated by each snapshot.
+    if (net.multiplayer) {
+      if (input.pressed(CFG.fortress.toggleKey)) {
+        localOperative.bayOpen = !localOperative.bayOpen;
+      }
+      if (run.choosing || run.picking) localOperative.bayOpen = false;
+      hud.setBayOpen(localOperative.bayOpen);
+
+      // Road votes resolve on the authority, so there is no local `routed.arrival` to draw.
+      // `applySnapshot` reconstructs this edge from road history; consuming it here keeps the
+      // multiplayer route decision as legible as the unchanged solo path.
+      if (!run.lastArrival) {
+        shownArrival = null;
+      } else if (run.lastArrival !== shownArrival) {
+        shownArrival = run.lastArrival;
+        showArrival(run.lastArrival);
+      }
+      return;
+    }
+
     if (input.pressed(CFG.fortress.toggleKey)) hud.toggleBay();
     // A pick or a road choice is a decision the run is blocked on, so the bay gets
     // out of the way rather than sitting underneath it.
@@ -247,29 +322,60 @@ function boot() {
     }
 
     if (routed.arrival) {
-      const a = routed.arrival;
-      world.setFogScale(run.fogScale);
-      // Names the COST as well as the payout, and both through the same describer the
-      // route panel used a moment ago, so the banner cannot promise something the panel
-      // did not. It used to list only the money, which is why a playtester pressed 1,
-      // got paid, and concluded the choice had done nothing.
-      const { costs, pays } = describeRoad(a.road);
-      toast(
-        `ARRIVED — ${a.name}`
-        + `<small>${costs.join(" · ")}, for the rest of the biome`
-        + `<br>paid ${pays.join(" · ")}`
-        + `${a.boss ? "<br>SOMETHING IS WAITING AT THIS ONE" : ""}</small>`,
-        4.5,
-      );
+      shownArrival = routed.arrival;
+      showArrival(routed.arrival);
     }
   }
 
   // ---- loop ---------------------------------------------------------------
+  // The simulation's one and only dt, in seconds and in milliseconds. Held in both
+  // units because the accumulator works in milliseconds -- performance.now() is
+  // milliseconds, and converting each way per frame is a rounding error nobody
+  // needs in the one number that has to be exact.
+  const STEP = 1 / CFG.loop.stepHz;
+  const STEP_MS = 1000 / CFG.loop.stepHz;
+  let accumulator = 0;
   let last = performance.now();
+  let controlsSuspended = document.hidden || !document.hasFocus() || !input.locked;
   let fpsAccum = 0;
   let fpsFrames = 0;
   let fps = 0;
   let lossTimer = 0;
+
+  // A background tab may receive no animation frames at all, then return with seconds of
+  // elapsed wall time. Release its authority before throttling begins and discard that gap on
+  // return: replaying old W/fire state as a burst is neither prediction nor useful catch-up.
+  // Blur, visibility and pointer-lock loss often fire together, so the state bit makes all
+  // paths idempotent. Pointer lock is part of ownership: Escape can release it without blur,
+  // and that must neutralise the authoritative operative just as quickly as alt-tab does.
+  function suspendControls() {
+    if (controlsSuspended) return;
+    controlsSuspended = true;
+    input.clear();
+    net.suspendInput();
+    accumulator = 0;
+  }
+
+  function resumeControls() {
+    if (!controlsSuspended || document.hidden || !document.hasFocus() || !input.locked) return;
+    controlsSuspended = false;
+    input.clear();
+    net.resumeFromPause();
+    accumulator = 0;
+    last = performance.now();
+  }
+
+  addEventListener("blur", suspendControls);
+  addEventListener("focus", resumeControls);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) suspendControls();
+    else resumeControls();
+  });
+  document.addEventListener("pointerlockchange", () => {
+    if (input.locked) resumeControls();
+    else suspendControls();
+  });
+
   let lastStepCount = 0;
   let lastHurtCount = 0;
   let lastKillRef = null;
@@ -291,42 +397,69 @@ function boot() {
     gun: null, fps: 0, dt: 0,
   };
 
-  function frame(now) {
-    // How long the frame ACTUALLY took, kept separate from the simulation's dt.
-    // The renderer's quality scaler needs this one: the clamp below reports every
-    // frame slower than 30 fps as exactly 33.3 ms, which hides the entire range a
-    // scaler is supposed to react to.
-    const frameMs = now - last;
-    // Clamped so an alt-tab or a stall cannot tunnel the player through the hull.
-    const dt = Math.min(frameMs / 1000, 1 / 30);
-    last = now;
+  /**
+   * ONE FIXED SIMULATION STEP. `dt` is always STEP -- never a measured frame time.
+   *
+   * Extracted from frame() rather than left inline for two reasons. It is the game's
+   * counterpart to verify.mjs's step(), so the two can be read side by side; and
+   * audit check 9 compares the per-frame calls in both, which is the only thing
+   * standing between "the tests pass" and "the tests test what ships". That check
+   * knows to look in here.
+   *
+   * Order matters, and it is the same order the harness uses: the hull moves first
+   * so everything standing on it inherits this step's motion, the grapple fires
+   * before the player so a shot takes effect on the step it was pressed, and the
+   * horde reads the hull's transform after it has moved.
+   *
+   * The banner and toast block stays in here rather than moving to the presentation
+   * layer because what it reads is simulation state and what it can DO is
+   * resetEncounter(). Every branch is either idempotent or guarded by a counter, so
+   * a frame that runs two steps cannot double-fire anything.
+   */
+  function simStep(dt) {
+    // WHAT THE SERVER OWNS ONCE A SNAPSHOT HAS ARRIVED.
+    //
+    // `net.authoritative` is false solo and false until the first snapshot lands, so the solo
+    // path through this function is byte-identical to what it always was. Once it is true,
+    // four things must NOT run locally, and each one would be a distinct bug:
+    //
+    //   resolveStomps   deals damage and pays income. Run locally it would kill bodies that
+    //                   are alive on the server, and credit a purse the snapshot owns.
+    //   director.update advances a phase the snapshot overwrites AND spawns bodies the server
+    //                   never spawned, which then vanish on the next correction.
+    //   run.update      advances legs and offers picks — run state the server decides.
+    //   horde.update    runs enemy AI over positions just handed to this client, so it
+    //                   immediately disagrees with the authority and is corrected 20 times a
+    //                   second. That is rubber-banding, and it is the relay's own failure at
+    //                   a smaller scale.
+    //
+    // `trampler.update` deliberately still runs. The fortress consumes no input, so a client
+    // predicts it exactly rather than approximately — see structure.md on predicting the hull.
+    // src/session.js's stepSessionClient is the same list, and verify.mjs section 119 asserts
+    // a client moves no enemy of its own accord.
+    const authoritative = net.authoritative;
 
-    fpsAccum += dt;
-    fpsFrames++;
-    if (fpsAccum >= 0.5) {
-      fps = Math.round(fpsFrames / fpsAccum);
-      fpsAccum = 0;
-      fpsFrames = 0;
-    }
-
-    toggles();
-
-    // Order matters: the hull moves first so everything standing on it inherits
-    // this frame's motion, the grapple fires before the player so a shot takes
-    // effect on the frame it was pressed, the horde reads the hull's transform
-    // after it has moved, and visuals update last against a fresh camera.
     trampler.update(dt);
     // Immediately after the hull moves, so a foot that came down this frame
     // resolves against where things actually are.
-    trampler.resolveStomps(horde, player);
+    if (!authoritative) trampler.resolveStomps(horde, crew);
 
     if (trampler.destroyed) {
-      lossTimer += dt;
       hud.showBanner("REACTOR LOST<small>resetting…</small>");
-      if (lossTimer > 3.5) resetEncounter();
+      // In multiplayer the shared session owns this timer and reset generation. A local reset
+      // would be overwritten by the still-destroyed authority on the very next snapshot.
+      if (!authoritative) {
+        lossTimer += dt;
+        if (lossTimer > CFG.run.resetDelay) resetEncounter();
+      }
     } else {
-      director.update(dt);
-      run.update();
+      lossTimer = 0;
+      // Both gated: the server owns pacing and the journey. A client running them would be a
+      // second spawner for one horde and a second opinion about which landmark this is.
+      if (!authoritative) {
+        director.update(dt);
+        run.update();
+      }
 
       // Banner priority, highest first: losing the reactor, finishing the run,
       // being asked to choose a road, a tuning toast, being immobilised. Each one
@@ -369,7 +502,10 @@ function boot() {
     weapon.update(dt, input);
     for (const g of guns) g.update(dt, input, player, weapon);
     repair.update(dt, input);
-    emitters.update(dt, input, player);
+    // A client updates placement readiness for its prompt, never the rack clocks, placement
+    // list, targeting or damage. Those are shared state and advance once on the authority.
+    if (authoritative) emitters.updateClient(dt, player);
+    else emitters.update(dt, input, player);
     // After repair and the player, so the conditional bonuses are rebuilt from the
     // position and the health this frame actually ENDED with, and before the horde
     // reads anything.
@@ -412,20 +548,124 @@ function boot() {
       lastRefitCallouts = economy.refitCallouts;
       toast("REFIT OPEN<small>terminal on the bow bridge</small>", 2.5);
     }
-    horde.update(dt, player);
+    // Enemy AI, and the one call the server most definitively owns. Skipped when
+    // authoritative so a client never argues with the positions it was just handed; the
+    // instanced draw is refreshed by the snapshot's own write, not by this.
+    if (!authoritative) horde.update(dt, crew);
     // The kiosk advertises whether it is worth crossing the deck, so use the
     // economy's shared safety half rather than `open`, which only becomes true
     // after the player has already arrived. Emissive materials do the signalling;
     // this does not add a light to the scene.
     trampler.setTerminalAvailable(economy.safeMoment);
-    grapple.updateVisuals(dt);
+    // The winch's cooldown, and only that. Same slot the visual call used to occupy,
+    // so the timing is unchanged -- what changed is that it now ticks on STEP rather
+    // than on however long the last rendered frame took.
+    grapple.update(dt);
+  }
+
+  /**
+   * The rendered frame: absorb real time into whole fixed steps, then draw once.
+   *
+   * `renderDt` is real elapsed time and is what the presentation layer gets. That
+   * split is the point -- particles, camera shake, the mixer and the net client all
+   * want wall-clock time, while the simulation must never see anything but STEP.
+   */
+  function frame(now) {
+    // How long the frame ACTUALLY took, unclamped. The renderer's quality scaler
+    // needs this one: a clamp would report every slow frame as exactly the clamp,
+    // which hides the entire range a scaler is supposed to react to.
+    const frameMs = now - last;
+    last = now;
+
+    // A network client must not emit the solo loop's full 15-step catch-up burst. Six steps
+    // cover an ordinary slow visible frame; focus/visibility resume discards its gap entirely.
+    const catchUpMs = net.multiplayer
+      ? CFG.net.maxClientCatchUpMs
+      : CFG.loop.maxCatchUpMs;
+    const absorbMs = Math.min(frameMs, catchUpMs);
+    const renderDt = absorbMs / 1000;
+
+    fpsAccum += renderDt;
+    fpsFrames++;
+    if (fpsAccum >= 0.5) {
+      fps = Math.round(fpsFrames / fpsAccum);
+      fpsAccum = 0;
+      fpsFrames = 0;
+    }
+
+    toggles();
+
+    // THE SERVER'S CORRECTION GOES IN HERE, BEFORE ANY STEP, AND THE ORDER IS THE POINT.
+    //
+    // `trampler.update` captures the previous frame's inverse transform at its top, and
+    // `player.#applyBasedMovement` uses that capture to carry whoever is standing on the
+    // deck from the old hull frame into the new one. So a correction applied AFTER a step is
+    // read by the following step as though the hull had really travelled that far, and it
+    // drags the local operative along with it — measured at 114 cm of deck-relative shove
+    // from a one-metre correction, several times a second.
+    //
+    // Applied first, the step's own capture happens after the correction and the correction
+    // is invisible to based movement, which is what it should be: it is bookkeeping, not
+    // travel. src/session.js carries the full reasoning, and verify.mjs section 118 asserts
+    // the shove is gone.
+    //
+    // Deliberately NOT inside the accumulator loop. One correction describes one moment; a
+    // frame that owes three steps should apply it once and then predict forward three times,
+    // which is exactly what a client does between packets anyway.
+    net.applyPending(renderDt, frameMs / 1000);
+
+    accumulator += absorbMs;
+    let steps = 0;
+    while (accumulator >= STEP_MS) {
+      accumulator -= STEP_MS;
+      // ONE COMMAND PER STEP, WITH THE EDGES ON THE FIRST ONE ONLY.
+      //
+      // Per step rather than per frame because the two diverge at both ends of the refresh
+      // range: at 144 Hz most frames run no steps at all, and at 30 Hz a frame runs two. The
+      // server ticks 60 times a second regardless, so a client that sent per frame would
+      // either flood a queue with commands there are no ticks for or starve one it has already
+      // simulated past.
+      //
+      // Edges only on the first step because the local Input holds one set of one-shot presses
+      // per frame and `pressed()` consumes them — so exactly one step may legitimately claim
+      // them. Repeating them across a multi-step frame would fire one keypress twice on the
+      // authority, which is a second grapple or a doubled purchase.
+      //
+      // Sent BEFORE the step, so the command and the local prediction describe the same tick.
+      const waitingForBaseline = net.awaitingAuthority;
+      const sent = waitingForBaseline ? false : net.sendInput(input, steps === 0);
+      if (!waitingForBaseline) {
+        simStep(STEP);
+        // AFTER the step, so what is recorded is the OUTCOME of that command rather than the
+        // state before it. Solo steps have no command and therefore no prediction mark.
+        if (sent) net.recordPrediction();
+      }
+      steps++;
+
+      // A physical mouse delta and every one-shot edge belong to ONE fixed step. Clearing
+      // immediately after the first completed step preserves transients across zero-step
+      // high-refresh frames, but prevents a 30 Hz render frame from applying the same turn to
+      // both of its 60 Hz simulation steps.
+      if (steps === 1) input.endFrame();
+    }
+
+    // Delayed network transforms are presentation only. Gameplay above ran against the newest
+    // authority restored by applyPending(); drawing now uses the smooth server-tick cursor.
+    net.applyPresentation(renderDt);
+
+    // Per rendered frame, not per step: it draws the rope against the camera, and
+    // the camera is only final once. Still inside frame() rather than in simStep,
+    // which is what audit check 9 compares -- and the harness drives it per step
+    // because it has no camera and no renderer to be out of date with.
+    grapple.updateVisuals();
 
     world.updateSun(player.position);
 
     // ---- feel: shake, then everything that reads the camera --------------
     //
-    // Shake is applied AFTER player.update, which writes the camera transform
-    // outright every frame. Anything added before it is discarded.
+    // Shake is applied AFTER simStep, which contains player.update, and the
+    // controller writes the camera transform outright. Anything added before it is
+    // discarded.
     if (trampler.stepCount !== lastStepCount) {
       // Attenuated by distance to the nearest foot that landed, so a leg astern
       // does not shake the view as hard as the one you are standing beside.
@@ -451,21 +691,25 @@ function boot() {
         shake.addAt(_v, camera, CFG.render.shake.titan, 60);
       }
     }
-    shake.update(dt, camera);
+    shake.update(renderDt, camera);
 
     ctx.fps = fps;
-    ctx.dt = dt;
+    ctx.dt = renderDt;
     ctx.gun = activeGun();
-    viewmodel.update(dt, ctx);
-    fx.update(dt, ctx);
-    audio.update(dt, ctx);
+    // With the other pure readers, and AFTER player.update, so the pose it sends is
+    // the position this frame actually ended in rather than the one it started from.
+    // It is deliberately not handed `ctx`: it reads the player and the hull directly,
+    // so it never becomes a fifth reader the frame context has to satisfy.
+    net.update(renderDt);
+    viewmodel.update(renderDt, ctx);
+    fx.update(renderDt, ctx);
+    audio.update(renderDt, ctx);
     hud.update(ctx);
 
-    input.endFrame();
     // Hurt tint on the grade pass rises as health falls. Post-processing, unlike
     // the HUD's damage flash, is about the world looking wrong rather than about a
     // number changing.
-    post.render(dt, Math.max(0, 1 - player.hp / player.maxHp) * 0.55, frameMs);
+    post.render(renderDt, Math.max(0, 1 - player.hp / player.maxHp) * 0.55, frameMs);
     requestAnimationFrame(frame);
   }
 

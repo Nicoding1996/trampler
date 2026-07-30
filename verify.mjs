@@ -15,20 +15,32 @@ import {
 import { World } from "./src/world.js";
 import { Trampler } from "./src/trampler.js";
 import { Player } from "./src/player.js";
+import { Crew } from "./src/crew.js";
 import { Grapple } from "./src/grapple.js";
 import {
   Horde, CHEWER, CLIMBER, BULWARK, BURROWER, SAPPER, TITAN, ENEMY_STATE, isSubmerged,
+  causedBy,
 } from "./src/enemies.js";
 import { Director, PHASE } from "./src/waves.js";
 import { Weapon } from "./src/weapon.js";
 import { Repair } from "./src/repair.js";
 import { DeckGun, handleStationInput } from "./src/deckgun.js";
 import { Emitters } from "./src/emitters.js";
-import { Economy, routePurchaseInput } from "./src/economy.js";
+import { Economy, Treasury, routePurchaseInput } from "./src/economy.js";
 import { Events } from "./src/events.js";
 import { Items, ITEM_EFFECTS } from "./src/items.js";
 import { Modules } from "./src/modules.js";
 import { Run, RUN, describeRoad } from "./src/run.js";
+import {
+  encode, decode, snapshotBytes, packHullBits, unpackHullBits, packPhaseBits,
+  unpackPhaseBits, PROTOCOL_VERSION, toleranceOf, LAYOUT, WIRE_PHASES, WIRE_RUN_PHASES,
+  ENTITY_BYTES, OPERATIVE_BYTES, HELD_BIT, EDGE_BIT, encodeInput, decodeInput, INPUT_BYTES,
+  lerpSnapshot,
+} from "./src/snapshot.js";
+import {
+  createSession, stepSession, stepSessionClient, snapshotOf, applySnapshot, hullDivergence,
+  netInput, readInput, reconcile,
+} from "./src/session.js";
 
 const DT = 1 / 60;
 
@@ -77,7 +89,13 @@ function makeInput() {
       this.presses.delete(c);
       return true;
     },
+    // The non-consuming peeks the network layer reads. Present here because this stub is what
+    // stands in for the real Input, and a stub missing a method the code under test calls does
+    // not throw — it returns undefined, which reads as "nothing was pressed" and passes.
+    isPressed(c) { return this.presses.has(c); },
+    isMousePressed(b) { return this.mouseJustPressed.has(b); },
     mouseHeld: new Set(),
+    mouseJustPressed: new Set(),
     mouseDown(b) { return this.mouseHeld.has(b); },
     mousePressed() { return false; },
     endFrame() {
@@ -99,10 +117,16 @@ function makeSim() {
   const grapple = new Grapple(scene, player, trampler, world);
   player.grapple = grapple;
 
+  // A crew of one. Every assertion in this file speaks about `sim.player`, and that
+  // stays exactly what it was -- the crew is what the three crew-wide systems are
+  // handed, and at one member every aggregate it computes is arithmetically identical
+  // to reading that one operative. Byte-identical output is the acceptance test.
+  const crew = new Crew([player]);
+
   const horde = new Horde(scene, trampler);
-  const director = new Director(horde, trampler, player);
+  const director = new Director(horde, trampler, crew);
   const weapon = new Weapon(scene, player, horde, world, trampler);
-  const repair = new Repair(player, trampler, horde);
+  const repair = new Repair(player, trampler, horde, crew);
   const guns = CFG.deckGun.mounts.map((m) => new DeckGun(scene, trampler, m));
   const emitters = new Emitters(scene, trampler, horde);
   // Same wiring as main.js: the bus is created before anything subscribes, and
@@ -123,12 +147,12 @@ function makeSim() {
   const items = new Items({
     economy, player, trampler, weapon, horde, repair, events,
   });
-  const run = new Run(director, horde, economy);
+  const run = new Run(director, horde, economy, crew);
 
   scene.updateMatrixWorld(true);
 
   return {
-    scene, camera, world, trampler, player, grapple,
+    scene, camera, world, trampler, player, crew, grapple,
     horde, director, weapon, repair, guns, gun: guns[0], emitters, economy,
     modules, run, events, items,
     input: makeInput(),
@@ -159,7 +183,7 @@ function step(sim, frames, hook, dt = DT) {
     // Immediately after the hull moves, so a foot that came down this frame
     // resolves against where things actually are. Explicit rather than hidden
     // inside update(), so the frame order stays readable at the call site.
-    sim.trampler.resolveStomps(sim.horde, sim.player);
+    sim.trampler.resolveStomps(sim.horde, sim.crew);
     if (sim.waves) {
       sim.director.update(dt);
       sim.run.update();
@@ -186,8 +210,12 @@ function step(sim, frames, hook, dt = DT) {
       input: sim.input,
       dt,
     });
-    sim.horde.update(dt, sim.player);
-    sim.grapple.updateVisuals(dt);
+    sim.horde.update(dt, sim.crew);
+    // The winch's cooldown, in the same slot updateVisuals() used to occupy so the
+    // timing is unchanged. The visual half is NOT driven here: it raycasts from the
+    // camera and belongs to the rendered frame, and nothing in the suite asserts on
+    // it -- see audit check 9's presentation set.
+    sim.grapple.update(dt);
     sim.input.endFrame();
 
     const p = sim.player.position, v = sim.player.velocity;
@@ -2872,24 +2900,47 @@ console.log("\n61. Kills pay into two separate purses");
 
   ok("both purses start empty", economy.salvage === 0 && economy.scrap === 0);
 
+  // ATTRIBUTED, and it did not used to be. Salvage is now paid to whoever caused the kill,
+  // so a bare `damage(e, 1e6)` correctly pays no personal purse at all -- it is nobody's
+  // kill. These two lines stand in for the operative shooting something, so they say so.
   const chewer = horde.spawn(CHEWER);
-  horde.damage(chewer, 1e6);
+  horde.damage(chewer, 1e6, sim.player);
   const e = CFG.economy.chewer;
   ok("a chewer pays personal salvage", economy.salvage === e.salvage,
     `${economy.salvage} salvage`);
   ok("and a little shared scrap", economy.scrap === e.scrap, `${economy.scrap} scrap`);
 
   const climber = horde.spawn(CLIMBER);
-  horde.damage(climber, 1e6);
+  horde.damage(climber, 1e6, sim.player);
   ok("a climber pays more, because reaching one costs you position",
     economy.salvage === e.salvage + CFG.economy.climber.salvage,
     `${economy.salvage} salvage`);
 
   // Every damage source funnels through Horde.damage, so nothing can pay nothing.
-  const before = economy.salvage;
+  // EVERY KILL STILL PAYS, BUT NOT EVERY KILL PAYS A PERSON.
+  //
+  // This used to assert that an unattributed kill paid salvage, and the claim behind it was
+  // invariant 24's: the hook is on the one choke point all damage routes through, so a
+  // newly added weapon cannot silently pay nothing. That claim is intact and is asserted
+  // below -- on the SHARED purse, which is where a kill nobody made belongs.
+  //
+  // The personal half is now refused, and that is invariant 2b-i rather than arithmetic.
+  // Salvage is what you earn for what YOU kill. Paying it for an emitter's kill would mean
+  // deploying a rack and walking away funds a personal build, which is automation doing a
+  // job the player has to be present for -- the same argument that stops a proc firing off
+  // an emitter kill, applied to income.
+  const salvageBefore = economy.salvage;
+  const scrapBefore = economy.scrap;
   const viaEmitter = horde.spawn(CHEWER);
-  horde.damage(viaEmitter, 1e6);
-  ok("kills from any source pay, not just the rifle", economy.salvage > before);
+  horde.damage(viaEmitter, 1e6, sim.emitters);
+  ok("an automated kill still pays, because nothing may kill for free",
+    economy.scrap > scrapBefore,
+    `${scrapBefore} -> ${economy.scrap} scrap from a kill the crew's emitter made`);
+  ok("but it pays the CREW, not a personal purse — automation cannot fund your build",
+    economy.salvage === salvageBefore,
+    economy.salvage === salvageBefore
+      ? `salvage unchanged at ${economy.salvage}`
+      : `PAID ${economy.salvage - salvageBefore} SALVAGE FOR AN UNATTENDED KILL`);
 
   // Damage that does NOT kill must not pay, or chip damage becomes an income farm.
   const survivor = horde.spawn(CHEWER);
@@ -3267,7 +3318,7 @@ console.log("\n63. Buying happens at a PLACE, and between waves");
         best = e;
         break;
       }
-      if (best) live.horde.damage(best, 1e6, "player");
+      if (best) live.horde.damage(best, 1e6, live.player);
     });
     // The fortress is kept walking, because an immobilised one halts the pacing outright
     // (invariant 19) and the siege would stop progressing -- which would measure the
@@ -3352,8 +3403,11 @@ console.log("\n64. Calling a wave early pays more, and skipping the fight pays l
       if (callEarly && !called && director.phase === PHASE.PREP) {
         called = director.callEarly();
       }
-      // Stand in for a competent crew so waves keep resolving either way.
-      for (const e of horde.pool) if (e.alive) horde.damage(e, 1e6);
+      // Stand in for a competent crew so waves keep resolving either way. Attributed to
+      // the operative, because this section is about what the CREW earns for a gamble and
+      // salvage is now paid to whoever made the kill -- an anonymous cull earns the
+      // personal purse nothing, which would have measured only the scrap half.
+      for (const e of horde.pool) if (e.alive) horde.damage(e, 1e6, sim.player);
       trampler.repairAll();
     });
     return { earned: economy.earned, resolved: director.resolved, wave: director.wave, called };
@@ -3383,7 +3437,10 @@ console.log("\n64. Calling a wave early pays more, and skipping the fight pays l
 
   const before = economy.salvage;
   const e = horde.spawn(CHEWER);
-  horde.damage(e, 1e6);
+  // Attributed: this reads the PERSONAL purse, which is now paid only to whoever caused
+  // the kill. Anonymous, the multiplier would have been measured against a purse that
+  // never moves, and the assertion would have been about nothing.
+  horde.damage(e, 1e6, sim.player);
   ok("so a kill during it pays the bonus rate",
     Math.abs((economy.salvage - before) - CFG.economy.chewer.salvage * economy.bonus) < 1e-9,
     `paid ${(economy.salvage - before).toFixed(1)} for a ${CFG.economy.chewer.salvage} kill`);
@@ -5243,6 +5300,12 @@ console.log("\n82. A full restart replays the same run, modules and roads includ
 
   // Drive a proc before the reset, so the seeded stream inside the item runtime has
   // genuinely been consumed and rewinding it is a real claim rather than a formality.
+  //
+  // The hit is ATTRIBUTED, and it did not used to be. The on-hit channel carried no
+  // source at all, so an anonymous `emitHit` procced happily; once it carried one, this
+  // scaffolding started rolling zero arcs and the non-vacuity check above failed --
+  // correctly. An unattributed hit belongs to nobody and must proc nothing, which is the
+  // rule section 110 exists for. Naming the operative is the repair, not loosening it.
   sim.economy.stacks.arc = 20;
   sim.economy.applyAll();
   const procBefore = [];
@@ -5252,7 +5315,7 @@ console.log("\n82. A full restart replays the same run, modules and roads includ
     b.x = a.x + 2;
     b.y = a.y;
     b.z = a.z;
-    sim.events.emitHit(a, 20);
+    sim.events.emitHit(a, 20, sim.player);
     procBefore.push(sim.items.procs.arc);
   }
   ok("the item runtime's seeded stream was actually used (test is not vacuous)",
@@ -5297,7 +5360,7 @@ console.log("\n82. A full restart replays the same run, modules and roads includ
     b.x = a.x + 2;
     b.y = a.y;
     b.z = a.z;
-    sim.events.emitHit(a, 20);
+    sim.events.emitHit(a, 20, sim.player);
     procAfter.push(sim.items.procs.arc);
   }
   ok("and the proc stream rolls the same chances in the same order after a restart",
@@ -5799,6 +5862,77 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
       && carriedHud.routeCarried.innerHTML.includes(boneyard.name),
       `"${carriedHud.routeCarried.innerHTML.replace(/<[^>]+>/g, "")}"`);
 
+    // ---- the live vote tally, and the solo case that must stay silent.
+    //
+    // Test 109 owns the voting rule. What lives here is the drawing of it, and none of
+    // it is reachable with one operative -- so without this the "N OF M AGREE" head, the
+    // per-road seat line and the deadlock banner are three templates nothing ever runs.
+    ok("a solo road choice says nothing about agreement, because there is none to reach",
+      !routeHud.routeHead.textContent.includes("AGREE")
+      && !routeHud.routeItems.innerHTML.includes("CREW "),
+      `"${routeHud.routeHead.textContent}"`);
+
+    const voteSim = makeSim();
+    const voteHud = new Hud();
+    for (let i = 1; i < 4; i++) {
+      const cam = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 1400);
+      cam.rotation.order = "YXZ";
+      voteSim.crew.add(new Player(cam, voteSim.world, voteSim.trampler));
+    }
+    voteSim.director.phase = PHASE.HELD;
+    voteSim.run.update();
+    voteSim.economy.takePick(0);
+    voteSim.run.update();
+    const voteCtx = () => ({
+      ...voteSim, guns: voteSim.guns, input: voteSim.input, gun: null, fps: 60, dt: DT,
+    });
+    const [v1, v2, v3, v4] = voteSim.crew.members;
+
+    try {
+      voteSim.run.vote(v1, 0);
+      voteSim.run.vote(v2, 0);
+      voteHud.update(voteCtx());
+    } catch (err) {
+      failures.push(`route vote: ${err.message}`);
+    }
+    ok("the run is genuinely mid-ballot with a crew of four (test is not vacuous)",
+      voteSim.run.choosing && voteSim.crew.size === 4 && voteSim.run.tally[0] === 2,
+      `[${voteSim.run.tally.join(",")}] of ${voteSim.crew.size}`);
+    ok("with a crew, the head says how many have to agree",
+      voteHud.routeHead.textContent.includes("3 OF 4 AGREE"),
+      `"${voteHud.routeHead.textContent}"`);
+    ok("and each road names the SEATS backing it, not just a count",
+      voteHud.routeItems.innerHTML.includes("CREW 1, 2"),
+      `${(voteHud.routeItems.innerHTML.match(/class="rv">([^<]*)</g) ?? []).join(" | ")}`);
+
+    // The tally has to REDRAW as votes land. The panel caches on a signature, and the
+    // offers do not change while the crew is deciding -- so if the signature ignored the
+    // votes, every vote after the first would be invisible, which is the one thing a live
+    // tally must not be.
+    const beforeThird = voteHud.routeItems.innerHTML;
+    try {
+      voteSim.run.vote(v3, 1);
+      voteHud.update(voteCtx());
+    } catch (err) {
+      failures.push(`route vote redraw: ${err.message}`);
+    }
+    ok("a further vote redraws the panel rather than leaving a stale tally",
+      voteHud.routeItems.innerHTML !== beforeThird
+      && voteHud.routeItems.innerHTML.includes("CREW 3"),
+      `road 2 now backed by crew ${voteSim.run.voteSeats[1].join(", ")}`);
+
+    try {
+      voteSim.run.vote(v4, 1);
+      voteHud.update(voteCtx());
+    } catch (err) {
+      failures.push(`route deadlock: ${err.message}`);
+    }
+    ok("an even split is drawn as a SPLIT that names the fix, not a stalled run",
+      voteSim.run.deadlocked
+      && voteHud.routeHead.textContent.includes("SPLIT 2")
+      && voteHud.routeHead.textContent.includes("CHANGE THEIR MIND"),
+      `"${voteHud.routeHead.textContent}"`);
+
     // ---- repair, contested repair, and the fuse warning
     const repairSim = makeSim();
     const repairHud = new Hud();
@@ -5850,6 +5984,65 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
       repairHud.prompt.className.includes("contested")
       && repairHud.promptLabel.textContent.includes("CONTESTED"),
       `"${repairHud.promptLabel.textContent}" class "${repairHud.prompt.className}"`);
+
+    // ---- and a point a TEAMMATE is already welding, which is the third reading.
+    //
+    // The rule itself lives in repair.js and test 108 owns it. What lives here is the
+    // string, and a string nothing ever executes is the "a rule with no test because it
+    // only exists in the HUD" trap: a typo in this template throws at the exact moment
+    // two operatives stand at one leg, which is the first thing co-op ever does.
+    //
+    // It reads in the BLOCKED style rather than the contested one, and that distinction
+    // is the point. Contested work is a trade the player can choose to make and the bar
+    // is still filling; a second welder is no work at all and nothing to trade. So this
+    // one names the teammate, because "hold E and nothing happens" would send the player
+    // to fix the wrong thing, and the actual answers -- cover them, or take another leg
+    // -- are not things a generic refusal would ever suggest.
+    const takenSim = makeSim();
+    const takenHud = new Hud();
+    takenSim.trampler.walking = false;
+    takenSim.trampler.turning = false;
+    const mateCam = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 1400);
+    mateCam.rotation.order = "YXZ";
+    const mate = new Player(mateCam, takenSim.world, takenSim.trampler);
+    takenSim.crew.add(mate);
+    const mateRepair = new Repair(mate, takenSim.trampler, takenSim.horde, takenSim.crew);
+    const mateInput = makeInput();
+    mateInput.keys.add(CFG.repair.key);
+
+    takenSim.trampler.damageLeg(0, 1e6);
+    const legSpot = takenSim.trampler.legAttackWorld(0, new THREE.Vector3());
+    for (const who of [takenSim.player, mate]) {
+      who.position.set(legSpot.x, 1.2, legSpot.z);
+      who.base = null;
+      who.velocity.set(0, 0, 0);
+    }
+
+    try {
+      // The mate first, so THEY own the point and the local operative is the one refused
+      // -- which is the case the HUD has to draw. Seat 2, since the crew is [player, mate].
+      for (let i = 0; i < 4; i++) {
+        mateRepair.update(DT, mateInput);
+        takenSim.repair.update(DT, takenSim.input);
+      }
+      takenHud.update({
+        ...takenSim, guns: takenSim.guns, input: takenSim.input, gun: null, fps: 60, dt: DT,
+      });
+    } catch (err) {
+      failures.push(`repair taken: ${err.message}`);
+    }
+    ok("the mate genuinely owns the leg (test is not vacuous)",
+      mate.repairing === "leg:0" && takenSim.repair.takenBy === 2,
+      `mate claim ${mate.repairing}, local takenBy ${takenSim.repair.takenBy}`);
+    ok("a leg a teammate is welding says so by SEAT, in the blocked style",
+      takenHud.promptLabel.textContent.includes("CREW 2 IS ON IT")
+      && takenHud.promptLabel.textContent.includes("PORT FORE LEG")
+      && takenHud.prompt.className.includes("blocked"),
+      `"${takenHud.promptLabel.textContent}" class "${takenHud.prompt.className}"`);
+    ok("and it does not claim to be contested, which would say the bar is still filling",
+      !takenHud.prompt.className.includes("contested")
+      && !takenHud.promptLabel.textContent.includes("CONTESTED"),
+      `class "${takenHud.prompt.className}"`);
 
     // A sapper is a timer, and this prompt is its only warning.
     const fuseSim = makeSim();
@@ -6209,7 +6402,7 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     const paidFor = paySim.horde.spawn(CHEWER);
     const salvBefore = paySim.economy.earned.salvage;
     const scrapBefore = paySim.economy.earned.scrap;
-    paySim.horde.damage(paidFor, paidFor.maxHp * 10, "player");
+    paySim.horde.damage(paidFor, paidFor.maxHp * 10, paySim.player);
     const paidSalv = paySim.economy.earned.salvage - salvBefore;
     const paidScrap = paySim.economy.earned.scrap - scrapBefore;
     try {
@@ -6231,7 +6424,7 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     // the frame happened to offer could pass on a single kill and prove nothing.
     const firstReading = payHud.tickSalvage.textContent;
     const alsoPaid = paySim.horde.spawn(CHEWER);
-    paySim.horde.damage(alsoPaid, alsoPaid.maxHp * 10, "player");
+    paySim.horde.damage(alsoPaid, alsoPaid.maxHp * 10, paySim.player);
     try {
       payHud.update(pctx());
     } catch (err) {
@@ -6259,7 +6452,7 @@ console.log("\n84. The HUD runs every branch it has against the real simulation"
     // A restart zeroes `earned`, which reads as a negative delta. The figure must go with
     // it -- a +N left hanging over a fresh run is reporting the previous run's money.
     const lastPaid = paySim.horde.spawn(CHEWER);
-    paySim.horde.damage(lastPaid, lastPaid.maxHp * 10, "player");
+    paySim.horde.damage(lastPaid, lastPaid.maxHp * 10, paySim.player);
     try {
       payHud.update(pctx());
     } catch (err) {
@@ -6642,12 +6835,15 @@ console.log("\n86. Exactly one panel owns the number keys per frame");
       sim.bayOpen = bayOpen;
       sim.player.position.set(700, 1.2, 700);
       sim.player.base = null;
+      // Attributed, because the assertion below reads BOTH purses and salvage is paid to
+      // whoever caused the kill. An anonymous cull pays the crew's scrap and nobody's
+      // salvage, which would have made this measure half of what it claims to.
       step(sim, 60 * 5, () => {
-        for (const e of sim.horde.pool) if (e.alive) sim.horde.damage(e, 1e6);
+        for (const e of sim.horde.pool) if (e.alive) sim.horde.damage(e, 1e6, sim.player);
       });
       // Resolve a wave so the shared payout fires.
       step(sim, 60 * 60, () => {
-        for (const e of sim.horde.pool) if (e.alive) sim.horde.damage(e, 1e6);
+        for (const e of sim.horde.pool) if (e.alive) sim.horde.damage(e, 1e6, sim.player);
         sim.player.hp = sim.player.maxHp;
         sim.player.timeSinceHurt = 99;
       });
@@ -7417,8 +7613,9 @@ console.log("\n93. Conditional items pay only under their condition");
 // made weak and finite to avoid, and it would arrive as an item nobody thought of
 // as defensive.
 //
-// The gate is `source === "player"`, and a manned deck gun counts as the player
-// because somebody is sitting in it.
+// The gate is `causedBy(source, thisOperative)`, and a manned deck gun counts as the crew
+// because somebody is sitting in it -- attributed to whoever that is. Section 110 owns the
+// identity half; this section owns the automation half, which is the older claim.
 console.log("\n94. Procs fire for the crew's kills and for nothing else");
 {
   // ---- the proc works at all. Without this the zero below proves nothing.
@@ -7438,7 +7635,7 @@ console.log("\n94. Procs fire for the crew's kills and for nothing else");
     cluster.push(e);
   }
   const neighbourHpBefore = cluster.slice(1).map((e) => e.hp);
-  sim.horde.damage(cluster[0], 1e6, "player");
+  sim.horde.damage(cluster[0], 1e6, sim.player);
   const splashed = cluster.slice(1).filter((e, i) => e.hp < neighbourHpBefore[i]).length;
   ok("a kill the crew caused splashes the bodies around it",
     splashed > 0 && sim.items.procs.fragment === 1,
@@ -7556,7 +7753,7 @@ console.log("\n94. Procs fire for the crew's kills and for nothing else");
   heal.economy.stacks.executioner = 1;
   heal.economy.applyAll();
   heal.player.hp = 50;
-  heal.horde.damage(heal.horde.spawn(CHEWER), 1e6, "player");
+  heal.horde.damage(heal.horde.spawn(CHEWER), 1e6, heal.player);
   ok("and a kill heals with the executioner fitted, and is counted",
     heal.player.hp === 50 + CFG.items.executioner && heal.items.procs.executioner === 1,
     `hp 50 -> ${heal.player.hp}, ${heal.items.procs.executioner} procs`);
@@ -7569,7 +7766,7 @@ console.log("\n94. Procs fire for the crew's kills and for nothing else");
   const full = makeSim();
   full.economy.stacks.executioner = 5;
   full.economy.applyAll();
-  full.horde.damage(full.horde.spawn(CHEWER), 1e6, "player");
+  full.horde.damage(full.horde.spawn(CHEWER), 1e6, full.player);
   ok("but it never heals past full",
     full.player.hp === full.player.maxHp && full.items.procs.executioner === 1,
     `hp ${full.player.hp} / ${full.player.maxHp}, ${full.items.procs.executioner} procs`);
@@ -7626,7 +7823,7 @@ console.log("\n94. Procs fire for the crew's kills and for nothing else");
     + ` inside a ${CFG.items.fragment.radius} m splash and a ${CFG.items.arc.range} m arc`);
 
   // Kill the neighbour with the crew's own damage, so both procs are eligible to fire.
-  dig.horde.damage(surfacer, 1e6, "player");
+  dig.horde.damage(surfacer, 1e6, dig.player);
   ok("the splash did fire, and reached the SURFACE neighbour (test is not vacuous)",
     dig.items.procs.fragment > 0 && witness.hp < witnessHp,
     `${dig.items.procs.fragment} splash procs, surface neighbour`
@@ -8853,6 +9050,3813 @@ console.log("\n105. A crippled fortress still gets credit for clearing the field
   step(sim, 60 * (CFG.waves.prepTime + 3));
   ok("repairing the legs releases the next wave", director.wave > waveAt,
     `wave ${waveAt} -> ${director.wave}`);
+}
+
+// ---------------------------------------------------------------------------
+// The crew aggregates, measured with a crew rather than reasoned about.
+//
+// `#pressureOf` reads two things about the operative -- how hurt they are, and how
+// recently -- and at one member every possible aggregator returns the same number, so
+// the choice between worst-case, mean and anything else is UNOBSERVABLE until there
+// are two. That is exactly why it must not be treated as settled: pacing is gated on
+// this (invariant 19), and a crew of four is the case the whole thing was never
+// written for.
+//
+// Worst-case was chosen as the starting position on Left 4 Dead's argument -- a
+// director should respond to whoever is in trouble rather than to an average that
+// hides them. This section is where that stops being an argument.
+//
+// The extra operatives are updated by hand in the step hook, and that is deliberate:
+// without it `timeSinceHurt` never advances for them (it is incremented inside
+// `player.update`), the recent-hurt term would peg at zero for ever, and this section
+// would report a finding that was purely an artefact of its own scaffolding. The hook
+// runs before the hull moves, so they lag the deck by one frame, which is irrelevant
+// to a question about health and worth naming rather than hiding.
+console.log("\n106. The crew aggregates read the worst-off operative, not an average");
+{
+  const idle = makeInput();
+  idle.locked = false; // no look, no movement input, but health still ticks
+
+  /** Grow `sim.crew` to `n` operatives, spread along the deck's clear lane. */
+  const addCrew = (sim, n) => {
+    const extra = [];
+    for (let i = 1; i < n; i++) {
+      const cam = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 1400);
+      cam.rotation.order = "YXZ";
+      const p = new Player(cam, sim.world, sim.trampler);
+      // Local z = -4 is the one lane clear of the mast, the crates, the bow step and
+      // the engine block -- test 2's comment, reused for the same reason.
+      p.position.copy(sim.trampler.localToWorld(new THREE.Vector3(-5 + i * 2.5, 1.0, -4)));
+      p.base = sim.trampler;
+      p.velocity.set(0, 0, 0);
+      sim.crew.add(p);
+      extra.push(p);
+    }
+    return extra;
+  };
+  const driveExtra = (extra) => { for (const p of extra) p.update(DT, idle); };
+
+  /**
+   * Put the whole crew under the hull at the legs, which is where the danger is.
+   *
+   * The first version of this section left the extra operatives on the bow deck, where
+   * chewers converging on the legs and climbers heading for the reactor pass nowhere
+   * near them. Every measurement at four operatives came out BYTE-IDENTICAL to one --
+   * 1115 hurt-frames both ways, 3.4% recent-hurt occupancy both ways, 94 spawns both
+   * ways -- because the three extra bodies were never touched. The section passed and
+   * measured nothing, which is this project's most-repeated failure wearing a new hat.
+   *
+   * The non-vacuity guard was the reason it got through: it asserted that SOMEBODY was
+   * hurt, and the primary operative satisfied that on its own. A scenario about a crew
+   * has to check that the CREW was involved.
+   */
+  const placeCrewAtLegs = (sim) => {
+    const legs = sim.trampler.legHp.length;
+    let i = 0;
+    for (const m of sim.crew) {
+      const at = sim.trampler.legAttackWorld(i % legs, new THREE.Vector3());
+      // World x/z from the leg, y set outright: local y = 0 is the DECK surface, so
+      // deriving a height from the leg point would put an operative in mid-air.
+      m.position.set(at.x, 1.2, at.z);
+      m.base = null;
+      m.velocity.set(0, 0, 0);
+      m.grapple?.cancel();
+      i++;
+    }
+  };
+
+  const p = CFG.waves.pressure;
+
+  // ---- an untouched crew of four must read exactly as calm as one of one.
+  //
+  // The cleanest assertion available here, and the one that would catch the most
+  // damaging possible mistake: crew SIZE must not be pressure by itself, or a bigger
+  // crew is handed a slower game for existing.
+  {
+    const solo = makeSim();
+    const four = makeSim();
+    addCrew(four, 4);
+    solo.player.position.set(700, 1.2, 700);
+    solo.player.base = null;
+    step(solo, 3);
+    step(four, 3);
+
+    ok("the crew really is four (test is not vacuous)", four.crew.size === 4,
+      `${four.crew.size} operatives`);
+    ok("and an untouched crew of four is exactly as calm as one operative",
+      Math.abs(four.director.pressure - solo.director.pressure) < 1e-9
+      && four.director.calm,
+      `four ${(four.director.pressure * 100).toFixed(1)}% vs solo`
+      + ` ${(solo.director.pressure * 100).toFixed(1)}%`);
+  }
+
+  // ---- one badly hurt operative among three healthy ones.
+  //
+  // The measurement that distinguishes the aggregators. At 30% health on one of four:
+  //   worst-case  0.40 * 0.70          = 0.280
+  //   mean        0.40 * 0.70 / 4      = 0.070
+  // Both are printed, so the number in the output says which rule is in force rather
+  // than leaving a reader to infer it from a passing assertion.
+  {
+    const sim = makeSim();
+    const extra = addCrew(sim, 4);
+    sim.player.position.set(700, 1.2, 700);
+    sim.player.base = null;
+    step(sim, 3);
+
+    const calm = sim.director.pressure;
+    const victim = extra[1];
+    victim.hp = victim.maxHp * 0.3;
+    // No step: the hurt term is read straight off the aggregate, and stepping would
+    // let regeneration start moving the number being measured.
+    const withOneHurt = sim.director.pressure;
+
+    const wantWorst = p.hurtWeight * 0.7;
+    const wantMean = wantWorst / 4;
+
+    ok("one operative at 30% raises pressure by the WORST-case amount, not an average",
+      Math.abs((withOneHurt - calm) - wantWorst) < 1e-6,
+      `+${((withOneHurt - calm) * 100).toFixed(1)} points;`
+      + ` worst-case would be +${(wantWorst * 100).toFixed(1)},`
+      + ` a mean +${(wantMean * 100).toFixed(1)}`);
+    // AND IT IS NOT ENOUGH TO HOLD THE PACING, WHICH IS A FINDING RATHER THAN A FAULT.
+    //
+    // The first version of this asserted the opposite -- that one operative at 30%
+    // health would hold the next wave -- and it failed, correctly, because the
+    // arithmetic says otherwise: 0.40 * 0.70 is 0.28 against a calmBelow of 0.35. That
+    // was a hope asserted instead of a measurement, which is the trap this file already
+    // carries three lessons about, and the honest repair is to state what the model
+    // actually does.
+    //
+    // What it does: the hurt term alone crosses calmBelow only below 12.5% health --
+    // `hurtWeight * (1 - f) >= calmBelow` needs `f <= 0.125`. So health is a
+    // CONTRIBUTOR to pacing and never a gate on its own, unlike `immobileWeight`, which
+    // is deliberately weighted above calmBelow so a crippled hull halts reinforcements
+    // by itself. Whether a badly hurt crew SHOULD hold a wave on its own is a design
+    // question this measurement raises and does not answer.
+    const gateAt = 1 - p.calmBelow / p.hurtWeight;
+    ok("but health alone is a contributor to pacing, never a gate on its own",
+      sim.director.calm && gateAt < 0.2,
+      `${(withOneHurt * 100).toFixed(0)}% pressure against calmBelow`
+      + ` ${(p.calmBelow * 100).toFixed(0)}% — the hurt term alone only crosses it below`
+      + ` ${(gateAt * 100).toFixed(1)}% health, unlike immobileWeight`
+      + ` ${(p.immobileWeight * 100).toFixed(0)}% which is a hard gate by design`);
+
+    // The converse: hurting a SECOND operative less badly must change nothing, or the
+    // aggregate is quietly summing rather than taking a maximum.
+    extra[0].hp = extra[0].maxHp * 0.8;
+    ok("a second, less hurt operative adds nothing -- it is a maximum, not a sum",
+      Math.abs(sim.director.pressure - withOneHurt) < 1e-9,
+      `still ${(sim.director.pressure * 100).toFixed(1)}%`);
+
+    // And healing the worst one must hand the reading to the next worst, rather than
+    // dropping it to calm.
+    victim.hp = victim.maxHp;
+    const wantSecond = p.hurtWeight * 0.2;
+    ok("healing the worst hands the reading to the next worst",
+      Math.abs((sim.director.pressure - calm) - wantSecond) < 1e-6,
+      `+${((sim.director.pressure - calm) * 100).toFixed(1)} points from the 80% operative`);
+  }
+
+  // ---- THE RECENT-HURT TERM, which is the one predicted to misbehave.
+  //
+  // `secondsSinceAnyHurt() < 3.0` is a minimum across the crew, so with four bodies in
+  // a fight "somebody was hit in the last three seconds" is close to always true. If
+  // it is, the term stops being a signal and becomes a constant +0.15 on a crew of
+  // four -- which is not a tuning error, it is a term that has silently stopped
+  // carrying information.
+  //
+  // Measured as OCCUPANCY: what fraction of frames the term is contributing, at one
+  // operative and at four, under a real wave with nobody defending.
+  {
+    // A FIXED enemy set rather than a live director, and the operatives held at the
+    // legs where the chewers go. Invariant 19c's rule applied to crew size: under a live
+    // director, killing things lowers pressure and brings the next wave sooner, so a
+    // long fight measures the director compensating rather than the aggregate.
+    const occupancy = (n) => {
+      const sim = makeSim();
+      const extra = addCrew(sim, n);
+      placeCrewAtLegs(sim);
+      for (let i = 0; i < 14; i++) sim.horde.spawn(CHEWER);
+      let on = 0;
+      let frames = 0;
+      step(sim, 60 * 30, () => {
+        driveExtra(extra);
+        // Held at the legs: standing in the danger, not walking to it, because what is
+        // under test is the aggregate rather than pathfinding.
+        placeCrewAtLegs(sim);
+        if (sim.crew.secondsSinceAnyHurt() < p.recentHurtWindow) on++;
+        frames++;
+      });
+      return {
+        share: on / frames,
+        frames,
+        extraHits: extra.reduce((a, m) => a + m.hurtCount, 0),
+        primaryHits: sim.player.hurtCount,
+      };
+    };
+
+    const one = occupancy(1);
+    const four = occupancy(4);
+
+    // THE guard, and the one the first version got wrong: the EXTRA operatives have to
+    // have taken damage, or n=4 is just n=1 with three statues and every number below
+    // is meaningless.
+    ok("the extra operatives were genuinely in the fight (test is not vacuous)",
+      four.extraHits > 0 && one.primaryHits > 0,
+      `solo took ${one.primaryHits} hits; the three extra took ${four.extraHits}`
+      + ` on top of the primary's ${four.primaryHits}`);
+
+    // Reported rather than asserted against a threshold, because there is no defensible
+    // threshold yet -- the whole point is that this number has never been looked at.
+    // What IS asserted is the direction, which is arithmetic: a minimum over more
+    // samples cannot be occupied less often.
+    ok("the recent-hurt term is occupied at least as often with four as with one",
+      four.share >= one.share - 1e-9,
+      `occupied ${(one.share * 100).toFixed(1)}% of frames solo`
+      + ` vs ${(four.share * 100).toFixed(1)}% with four`
+      + ` — worth ${(p.recentHurtWeight * 100).toFixed(0)} points whenever it is on`);
+
+    // And the consequence, stated in the units that matter. If the term is nearly
+    // always on for a crew, it is a permanent floor rather than a reading, and a floor
+    // of 0.15 against a calmBelow of 0.35 is 43% of the pacing budget spent on a
+    // constant.
+    ok("and it is recorded whether that has become a floor rather than a signal",
+      Number.isFinite(four.share),
+      four.share > 0.9
+        ? `FLOOR: on for ${(four.share * 100).toFixed(0)}% of frames — `
+          + `${(p.recentHurtWeight * 100).toFixed(0)} of the ${(p.calmBelow * 100).toFixed(0)}`
+          + ` point calm budget is now a constant, which is a term carrying no information`
+        : `signal: on for ${(four.share * 100).toFixed(0)}% of frames, still varying`);
+  }
+
+  // ---- AND THE THING THAT WOULD ACTUALLY BE A BUG: a bigger crew getting an easier
+  // game. Pacing is gated on pressure, pressure aggregates upward, so more operatives
+  // taking damage means fewer waves. Measured in waves spawned over a fixed window.
+  {
+    // DRIVEN DIRECTLY, not waited for. Health is PINNED rather than fought down, which
+    // is the only way to make the two crew sizes comparable: the question is whether
+    // the same worst-case health produces the same pacing regardless of how many
+    // healthy operatives stand beside it, and a real fight would vary the input as well
+    // as the output.
+    //
+    // The field is kept clear so pacing is what advances (test 54's helper does the
+    // same, for the same reason). Under a MEAN aggregate, four operatives at
+    // 50/100/100/100 would read 87.5% and be markedly calmer than one at 50%, so they
+    // would receive more waves. Under worst-case both read 50% and get the same.
+    const spawnsAtHalfHealth = (n) => {
+      const sim = makeSim();
+      const extra = addCrew(sim, n);
+      sim.waves = true;
+      let spawned = 0;
+      const orig = sim.horde.spawn.bind(sim.horde);
+      sim.horde.spawn = (t, s, a) => {
+        const e = orig(t, s, a);
+        if (e) spawned++;
+        return e;
+      };
+      // Sampled in the HOOK, immediately after pinning, which is the value the director
+      // actually acts on: the hook runs before the frame, and `director.update` comes
+      // before `player.update` in the frame order, so this is what pressure is computed
+      // from. Reading it after the loop instead measured a value regeneration had
+      // already nudged off 0.5 -- which failed a `< 1e-9` assertion while printing
+      // "50%", an assertion tighter than the thing it was asserting about.
+      let worstActedOn = 1;
+      step(sim, 60 * 90, () => {
+        driveExtra(extra);
+        sim.horde.clear();
+        sim.trampler.repairAll();
+        // The primary is pinned at half health; everyone else stays whole. Re-pinned
+        // every frame because regeneration would otherwise walk it back up.
+        sim.player.hp = sim.player.maxHp * 0.5;
+        sim.player.timeSinceHurt = 99; // isolate the hurt term from the recent-hurt one
+        for (const m of extra) {
+          m.hp = m.maxHp;
+          m.timeSinceHurt = 99;
+        }
+        worstActedOn = sim.crew.worstHealthFraction();
+      });
+      return {
+        spawned,
+        wave: sim.director.wave,
+        worst: worstActedOn,
+        pressure: sim.director.pressure,
+      };
+    };
+
+    const one = spawnsAtHalfHealth(1);
+    const four = spawnsAtHalfHealth(4);
+
+    ok("waves arrive for a solo operative at half health (test is not vacuous)",
+      one.spawned > 0, `${one.spawned} spawned, reached wave ${one.wave}`);
+    ok("and both crews really are reading the same worst-case health (not vacuous)",
+      Math.abs(one.worst - 0.5) < 1e-9 && Math.abs(four.worst - 0.5) < 1e-9,
+      `solo ${(one.worst * 100).toFixed(0)}%, four ${(four.worst * 100).toFixed(0)}%`
+      + ` — a mean would have read ${(((0.5 + 3) / 4) * 100).toFixed(1)}% for four`);
+    // PRESSURE, asserted directly, because that is what this block has always been
+    // about and it is now the only thing left that is genuinely crew-blind.
+    //
+    // The original assertion here was `one.spawned === four.spawned` and it was correct:
+    // nothing scaled with crew size in any dimension, and recording that was the finding.
+    // Crew count scaling invalidated it on purpose. The first repair restated it as
+    // `one.wave === four.wave` and THAT failed too -- solo reached wave 3 and a crew of
+    // four reached wave 2 -- which was worth chasing rather than loosening, because it
+    // looked like pressure had become crew-sensitive.
+    //
+    // It has not. `spawnRate` is a fixed 2.5 enemies a second, so a wave 2.5x the size
+    // takes 2.5x as long to finish arriving, and fewer waves fit in a fixed window. The
+    // cadence moved because the VOLUME moved, one layer down. Asserting on the pressure
+    // number removes that confound entirely.
+    ok("so the pressure a hurt operative generates is identical whatever the crew size",
+      Math.abs(one.pressure - four.pressure) < 1e-9,
+      `${(one.pressure * 100).toFixed(1)}% either way from the same worst-case health —`
+      + ` a mean aggregate would have read four operatives as markedly calmer`);
+    // The volume half, and the finding that fell out of chasing the failure above. Test
+    // 111 owns the exact multiplier off `buildWave`; what is worth recording HERE is the
+    // second-order effect a fixed spawn rate produces, because it is the next question
+    // this change raises and it is not the one the coefficient was chosen to answer:
+    // a bigger crew currently gets a LONGER wave rather than a denser one.
+    ok("while the volume does move, though a fixed spawn rate stretches it over time",
+      four.spawned > one.spawned,
+      `${one.spawned} spawns solo -> ${four.spawned} with four in the same 90 s`
+      + ` (a factor of ${(four.spawned / one.spawned).toFixed(2)}, not the`
+      + ` x${1 + CFG.waves.crewCountPerHead * 3} the wave itself grew by) —`
+      + ` at ${CFG.waves.spawnRate}/s a 2.5x wave takes 2.5x as long to arrive, so`
+      + ` whether spawnRate should scale too is the next variable, alone`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A mount has exactly ONE occupant, and only that occupant can act through it or
+// leave it.
+//
+// This is the first co-op DEFECT rather than a co-op design question, and it was found
+// by reading rather than by playing, because with one operative every expression
+// involved is correct. `handleStationInput` asked `guns.find((g) => g.mounted)` -- "is
+// any gun manned" -- and then dismounted whatever it found, passing the operative who
+// pressed the key. `dismount` cleared `player.station` only `if (player.station === this)`,
+// so with crew 1 sitting in the bow gun and crew 2 pressing F anywhere on the deck:
+//
+//   bowGun.mounted = false        the seat believes it is empty
+//   crew 1 .station = bowGun      but crew 1 is still pinned to it by player.update
+//   bowGun.canMount = true        so a third operative can sit in it as well
+//
+// Two operatives constrained to one seat, and no exception anywhere. `update()` had the
+// same hole one clause further on: it gated firing on `mounted`, so any operative's mouse
+// fired an occupied gun and the heat it built landed on somebody else's weapon.
+//
+// Measured against the original code, this section reported ten failures: the seat
+// released by a keypress 7.1 m away against a 2.8 m reach, the mount and its occupant
+// disagreeing about who was in it, a second operative displacing the first while standing
+// on the same pad, `canMount` true on an occupied seat, and four rounds fired plus 0.133
+// heat built on somebody else's weapon. Worth recording because every one of those is
+// correct behaviour with one operative.
+//
+// The fix is to name the occupant instead of counting them -- the same move as exporting
+// `isSubmerged` rather than testing a `burrowed` field that does not exist. `mounted` is
+// derived from `operator`, so the wrong question cannot be asked: there is no longer a
+// boolean that says somebody is here without saying who.
+console.log("\n107. A gun mount has one occupant, and only they can use or leave it");
+{
+  /** A second operative, standing on the deck's clear lane. */
+  const secondOperative = (sim, lx = -1.5) => {
+    const cam = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 1400);
+    cam.rotation.order = "YXZ";
+    const p = new Player(cam, sim.world, sim.trampler);
+    // Local z = -4 is the lane clear of the mast, the crates, the bow step and the
+    // engine block -- test 2's comment, borrowed for the same reason.
+    p.position.copy(sim.trampler.localToWorld(new THREE.Vector3(lx, 1.0, -4)));
+    p.base = sim.trampler;
+    p.velocity.set(0, 0, 0);
+    sim.crew.add(p);
+    return p;
+  };
+
+  /** Stand an operative on a mount's operator pad, so the seat is in reach. */
+  const atPad = (sim, who, gun) => {
+    who.position.copy(gun.operatorWorld(new THREE.Vector3()));
+    who.base = sim.trampler;
+    who.velocity.set(0, 0, 0);
+  };
+
+  // ---- the structural guard, first, because it is what makes the rest unspellable.
+  {
+    const sim = makeSim();
+    const gun = sim.guns[0];
+    ok("an empty mount reports itself empty, and names nobody",
+      gun.mounted === false && gun.operator === null,
+      `operator ${gun.operator}`);
+
+    // Modules are strict, so assigning to a getter-only property throws. Two of the
+    // three sites that used to write `mounted` were releasing a seat without saying
+    // whose, and this is what stops a fourth being typed.
+    let threw = false;
+    try {
+      gun.mounted = false;
+    } catch {
+      threw = true;
+    }
+    ok("`mounted` is derived and cannot be assigned, so a release must name who",
+      threw && gun.operator === null, threw ? "TypeError" : "ASSIGNMENT SUCCEEDED");
+  }
+
+  // ---- THE BUG. Crew 2 presses F across the deck; crew 1 keeps their seat.
+  {
+    const sim = makeSim();
+    const gun = sim.guns[0];
+    const crew1 = sim.player;
+    const crew2 = secondOperative(sim);
+    const input2 = makeInput();
+
+    atPad(sim, crew1, gun);
+    step(sim, 5);
+    sim.input.presses.add(CFG.deckGun.key);
+    step(sim, 1);
+    ok("crew 1 is in the bow gun (test is not vacuous)",
+      gun.mounted && gun.operator === crew1 && crew1.station === gun,
+      `operator ${gun.operator === crew1 ? "crew 1" : "NOBODY"}`);
+
+    const away = gun.mountWorld(new THREE.Vector3()).distanceTo(crew2.position);
+    ok("and crew 2 is nowhere near it (test is not vacuous)",
+      away > CFG.deckGun.mountRange,
+      `${away.toFixed(1)} m from the mount vs a ${CFG.deckGun.mountRange} m reach`);
+
+    input2.presses.add(CFG.deckGun.key);
+    handleStationInput(sim.guns, input2, crew2);
+
+    ok("crew 2 pressing F across the deck does not take crew 1's seat away",
+      gun.mounted && gun.operator === crew1 && crew1.station === gun,
+      gun.operator === crew1
+        ? "crew 1 still aboard the mount"
+        : `SEAT RELEASED BY A KEYPRESS ${away.toFixed(1)} m AWAY`);
+    ok("and crew 2 did not end up attached to it either",
+      crew2.station === null, `crew 2 station ${crew2.station ? "SET" : "null"}`);
+    // Null-safe on purpose. The first version read `gun.operator.station` outright, and
+    // when the assertion above failed against the old code this THREW instead of
+    // reporting -- which aborted the run and took every check after it with it. A test
+    // for a broken state must survive that state.
+    ok("so the seat and its occupant never disagree about who is in it",
+      gun.operator !== null && gun.operator.station === gun,
+      gun.operator ? "the mount and its occupant agree" : "MOUNT RELEASED, NOBODY IN IT");
+
+    // The press really did reach the router -- so the assertions above are about
+    // ownership rather than about an input that went nowhere.
+    sim.input.presses.add(CFG.deckGun.key);
+    step(sim, 1);
+    ok("while the same key from crew 1 does release it, so the press was live",
+      !gun.mounted && gun.operator === null && crew1.station === null,
+      gun.operator === null
+        ? "released by its occupant"
+        : `still occupied by ${gun.operator === crew1 ? "crew 1" : "crew 2"}`);
+  }
+
+  // ---- an occupied seat refuses a second occupant, even standing on the pad.
+  {
+    const sim = makeSim();
+    const gun = sim.guns[0];
+    const crew1 = sim.player;
+    const crew2 = secondOperative(sim);
+    const input2 = makeInput();
+
+    atPad(sim, crew1, gun);
+    step(sim, 5);
+    gun.mount(crew1);
+
+    atPad(sim, crew2, gun);
+    const reach = gun.mountWorld(new THREE.Vector3()).distanceTo(crew2.position);
+    ok("crew 2 is standing on the same pad, well inside reach (test is not vacuous)",
+      reach <= CFG.deckGun.mountRange,
+      `${reach.toFixed(2)} m from the mount vs a ${CFG.deckGun.mountRange} m reach`);
+
+    input2.presses.add(CFG.deckGun.key);
+    handleStationInput(sim.guns, input2, crew2);
+    ok("an occupied mount refuses a second operative rather than displacing the first",
+      gun.operator === crew1 && crew2.station === null,
+      `operator ${gun.operator === crew1 ? "crew 1" : "crew 2"}`);
+    ok("and it says so through canMount, which is what the prompt reads",
+      gun.updateCanMount(crew2) === false, `canMount ${gun.canMount}`);
+    ok("mount() reports the refusal rather than failing silently",
+      gun.mount(crew2) === false && gun.operator === crew1);
+
+    // And the press must fall THROUGH to a free mount rather than being swallowed,
+    // because two operatives manning the two guns is the intended split.
+    atPad(sim, crew2, sim.guns[1]);
+    input2.presses.add(CFG.deckGun.key);
+    handleStationInput(sim.guns, input2, crew2);
+    ok("but the other mount is still theirs to take, which is the intended split",
+      sim.guns[1].operator === crew2 && sim.guns[0].operator === crew1,
+      `${sim.guns[0].name}: crew 1, ${sim.guns[1].name}: crew 2`);
+    ok("so both mounts can be manned at once, by different people",
+      sim.guns.filter((g) => g.mounted).length === 2
+      && new Set(sim.guns.map((g) => g.operator)).size === 2);
+  }
+
+  // ---- the trigger is owned as well as the seat.
+  {
+    const sim = makeSim();
+    const gun = sim.guns[0];
+    const crew1 = sim.player;
+    const crew2 = secondOperative(sim);
+    const input2 = makeInput();
+
+    atPad(sim, crew1, gun);
+    step(sim, 5);
+    gun.mount(crew1);
+    gun.heat = 0;
+    gun.cooldown = 0;
+
+    // Crew 2, nowhere near the gun, holding the button down.
+    input2.mouseHeld.add(0);
+    const before = gun.shots;
+    for (let i = 0; i < 20; i++) gun.update(DT, input2, crew2, sim.weapon);
+    ok("another operative's trigger cannot fire a gun they are not sitting in",
+      gun.shots === before,
+      gun.shots === before
+        ? `${before} shots, unchanged`
+        : `FIRED ${gun.shots - before} ROUNDS FOR SOMEBODY ELSE`);
+    ok("and it built no heat on the occupant's weapon either", gun.heat === 0,
+      `heat ${gun.heat.toFixed(3)}`);
+
+    // The occupant's own trigger does work, so the zero above is ownership and not a
+    // gun that has stopped firing.
+    const input1 = makeInput();
+    input1.mouseHeld.add(0);
+    for (let i = 0; i < 20; i++) gun.update(DT, input1, crew1, sim.weapon);
+    ok("while the occupant's own trigger fires it, so the refusal was ownership",
+      gun.shots > before, `${gun.shots - before} rounds from the operator`);
+  }
+
+  // ---- every release path goes through the mount, so the seat always learns.
+  //
+  // `respawnOnDeck` and `dropToGround` both used to write `station.mounted = false`
+  // from outside, which cleared the flag and left the gun's own idea of its occupant
+  // untouched. Survivable with one operative; with four it leaves a seat that reports
+  // itself empty while still holding somebody.
+  for (const [name, release] of [
+    ["dying", (p) => p.respawnOnDeck()],
+    ["dropping to the ground", (p) => p.dropToGround()],
+  ]) {
+    const sim = makeSim();
+    const gun = sim.guns[0];
+    atPad(sim, sim.player, gun);
+    step(sim, 5);
+    gun.mount(sim.player);
+    ok(`manned before ${name} (test is not vacuous)`, gun.operator === sim.player);
+
+    release(sim.player);
+    ok(`${name} releases the seat, and the seat knows it`,
+      gun.operator === null && gun.mounted === false && sim.player.station === null,
+      `operator ${gun.operator}, mounted ${gun.mounted}`);
+    ok("so it can be taken again rather than being permanently occupied",
+      (atPad(sim, sim.player, gun), gun.updateCanMount(sim.player)),
+      `canMount ${gun.canMount}`);
+  }
+
+  // ---- a restart clears every seat without knowing who was in it.
+  //
+  // Invariant 25: a restart reverts everything. `dismount` takes the operative and
+  // refuses for anyone else, which is right for a keypress and wrong for a reset -- with
+  // a crew it would have left the other mounts occupied across a restart. `evict` is the
+  // reset's verb, and it delegates to `dismount` so there is still exactly one release
+  // path rather than two that must be kept in step.
+  {
+    const sim = makeSim();
+    const crew1 = sim.player;
+    const crew2 = secondOperative(sim);
+    atPad(sim, crew1, sim.guns[0]);
+    step(sim, 5);
+    sim.guns[0].mount(crew1);
+    sim.guns[1].mount(crew2);
+    ok("both mounts are occupied by different operatives (test is not vacuous)",
+      sim.guns.every((g) => g.mounted) && sim.guns[0].operator !== sim.guns[1].operator);
+
+    for (const g of sim.guns) g.evict();
+    ok("a restart empties every seat, whoever was in it",
+      sim.guns.every((g) => !g.mounted && g.operator === null)
+      && crew1.station === null && crew2.station === null,
+      sim.guns.map((g) => `${g.name}: ${g.operator ? "OCCUPIED" : "clear"}`).join(", "));
+    ok("and evicting an empty mount is a no-op rather than an error",
+      sim.guns[0].evict() === false);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A repair point admits ONE welder, and repair runs in parallel across points.
+//
+// This is the co-op rule rather than a defect, and the argument is invariant 12b's own
+// measurement read forwards. 110 hp/s was chosen against chewer damage of 48-154 hp/s,
+// deliberately landing INSIDE that band, so a single welder wins against a few chewers
+// and loses against a crowd. Two welders on one leg is 220, which clears the top of that
+// band outright and turns the under-hull fight from a race into a formality.
+//
+// What the second person should be doing was already decided. 12c measures hostiles near
+// the PLAYER on purpose, so that "a teammate defending you would not freeze the work" --
+// the design had already settled that the second operative at a broken leg is covering,
+// not welding. This makes that explicit and names it on the prompt.
+//
+// It is the same mechanism as `reactorSlotCount` capping simultaneous attackers, pointed
+// the other way, and it borrows that code's discipline exactly: the claim is written
+// absolutely every frame from current conditions and never released by a separate path,
+// because a claim maintained across frames drifts and a drifted claim fails silently.
+console.log("\n108. A repair point admits one welder, and repairs run in parallel");
+{
+  const R = CFG.repair;
+
+  /** A sim with a second operative and a second Repair, hull frozen. */
+  const twoWelders = () => {
+    const sim = makeSim();
+    sim.trampler.walking = false;
+    sim.trampler.turning = false;
+    const cam = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 1400);
+    cam.rotation.order = "YXZ";
+    const crew2 = new Player(cam, sim.world, sim.trampler);
+    sim.crew.add(crew2);
+    // The same crew object the sim's own Repair was handed, so adding a member is
+    // visible to it -- which is the whole point of the roster living on the Crew.
+    const r2 = new Repair(crew2, sim.trampler, sim.horde, sim.crew);
+    return {
+      sim, crew1: sim.player, crew2, r1: sim.repair, r2,
+      in1: makeInput(), in2: makeInput(),
+    };
+  };
+
+  /** Put an operative on the sand at a leg's repair point. */
+  const standAtLeg = (sim, who, legIndex) => {
+    const at = sim.trampler.legAttackWorld(legIndex, new THREE.Vector3());
+    // x/z from the point, y set outright: local y = 0 is the DECK surface, so deriving a
+    // height from a leg point would put an operative in mid-air above the hull.
+    who.position.set(at.x, 1.2, at.z);
+    who.base = null;
+    who.velocity.set(0, 0, 0);
+  };
+
+  /**
+   * Drive the given repairs for `frames`, in the order handed over.
+   *
+   * Deliberately NOT through step()'s hook. The hook runs before the frame while
+   * `sim.repair.update` runs inside it, so driving a second repairer from the hook would
+   * make the harness's own plumbing decide which operative wins the race -- test
+   * scaffolding supplying the mechanism it is testing. The real loop calls them in crew
+   * order, so this does too, explicitly.
+   *
+   * Nothing else needs stepping: Repair reads positions, hull health, the horde and the
+   * crew, and the hull is frozen. The horde is empty, so nothing is contested.
+   */
+  const weld = (frames, pairs) => {
+    for (const [, inp] of pairs) inp.keys.add(R.key);
+    for (let i = 0; i < frames; i++) {
+      for (const [rep, inp] of pairs) rep.update(DT, inp);
+    }
+  };
+
+  const FRAMES = 30; // half a second: 55 hp at 110 hp/s, well inside a 120 hp leg
+
+  // ---- the geometry that makes the two-pass selection a real case rather than a
+  // hypothetical one. Measured rather than assumed, and the assumption was WRONG: the
+  // first draft of this rule reasoned that legs are 8.5 m apart against a 4.5 m reach and
+  // therefore only one point is ever available. Reach is a radius, so the window is 9.0 m
+  // and standing midway puts BOTH in range with 0.25 m to spare.
+  {
+    const sim = makeSim();
+    const pts = [];
+    for (let i = 0; i < sim.trampler.legHp.length; i++) {
+      pts.push(sim.trampler.legAttackLocal(i, new THREE.Vector3()));
+    }
+    let closest = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      for (let j = i + 1; j < pts.length; j++) {
+        closest = Math.min(closest, pts[i].distanceTo(pts[j]));
+      }
+    }
+    ok("two leg points can be in reach of one operative at once, so the choice is real",
+      closest < R.range * 2,
+      `closest pair ${closest.toFixed(2)} m against a ${(R.range * 2).toFixed(1)} m window`
+      + ` (reach ${R.range} m) — ${(R.range * 2 - closest).toFixed(2)} m of overlap`);
+
+    // And the reactor is never one of the pair, which is why the two jobs pull in
+    // opposite directions in the first place.
+    const legW = sim.trampler.legAttackWorld(0, new THREE.Vector3());
+    const surf = sim.trampler.reactorSurfaceWorld(legW, new THREE.Vector3());
+    ok("but a leg and the reactor never are, because one is under the hull and one is on it",
+      legW.distanceTo(surf) > R.range,
+      `${legW.distanceTo(surf).toFixed(2)} m apart, over a ${CFG.trampler.deckHeight} m deck`);
+  }
+
+  // ---- one welder, alone. The baseline every comparison below is against.
+  let soloGain = 0;
+  {
+    const { sim, crew1, r1, in1 } = twoWelders();
+    sim.trampler.damageLeg(0, 1e6);
+    standAtLeg(sim, crew1, 0);
+    weld(FRAMES, [[r1, in1]]);
+    soloGain = sim.trampler.legHp[0];
+    ok("one welder restores a leg at the configured rate (test is not vacuous)",
+      Math.abs(soloGain - R.legRate * (FRAMES / 60)) < 1e-6,
+      `${soloGain.toFixed(1)} hp in ${(FRAMES / 60).toFixed(2)} s at ${R.legRate} hp/s`);
+  }
+
+  // ---- THE RULE. Two welders on the same leg is not faster than one.
+  {
+    const { sim, crew1, crew2, r1, r2, in1, in2 } = twoWelders();
+    sim.trampler.damageLeg(0, 1e6);
+    standAtLeg(sim, crew1, 0);
+    standAtLeg(sim, crew2, 0);
+
+    // Both genuinely in reach and both genuinely asking, or the zero below is about
+    // scaffolding rather than about the rule.
+    const at = sim.trampler.legAttackWorld(0, new THREE.Vector3());
+    ok("both operatives are standing at the same leg, in reach (test is not vacuous)",
+      crew1.position.distanceTo(at) < R.range && crew2.position.distanceTo(at) < R.range,
+      `crew 1 ${crew1.position.distanceTo(at).toFixed(2)} m,`
+      + ` crew 2 ${crew2.position.distanceTo(at).toFixed(2)} m, reach ${R.range} m`);
+
+    weld(FRAMES, [[r1, in1], [r2, in2]]);
+
+    ok("both are offered the same leg, so neither was simply out of range",
+      r1.target?.key === "leg:0" && r2.target?.key === "leg:0",
+      `crew 1 -> ${r1.target?.key}, crew 2 -> ${r2.target?.key}`);
+    ok("exactly one of them is actually working it",
+      r1.active !== r2.active,
+      `crew 1 active ${r1.active}, crew 2 active ${r2.active}`);
+    ok("and two welders on one leg is no faster than one -- repair does not stack",
+      Math.abs(sim.trampler.legHp[0] - soloGain) < 1e-6,
+      `${sim.trampler.legHp[0].toFixed(1)} hp with two against ${soloGain.toFixed(1)} with one`);
+
+    // The refusal has to NAME the teammate. "Hold E and nothing happens" is the same
+    // illegibility the shop's three separate reasons exist to prevent, and the answer
+    // here -- go and cover them, or take another leg -- is not something a generic
+    // refusal would ever suggest.
+    const blocked = r1.active ? r2 : r1;
+    const working = r1.active ? r1 : r2;
+    ok("the one that is refused names which seat has the point",
+      blocked.takenBy === sim.crew.seatOf(working.player) && blocked.takenBy > 0,
+      `refused with "CREW ${blocked.takenBy} IS ON IT"`);
+    ok("while the one doing the work is told nobody is in its way",
+      working.takenBy === 0, `takenBy ${working.takenBy}`);
+
+    // Crew order decides it, and crew order is join order. Not a coin toss, and not
+    // dependent on which update happened to run first in the harness.
+    ok("and the winner is the earlier seat, because crew order is join order",
+      working.player === crew1,
+      `seat ${sim.crew.seatOf(working.player)} of ${sim.crew.size} took it`);
+  }
+
+  // ---- PARALLEL ACROSS POINTS, which is the half that makes a second welder useful.
+  {
+    const { sim, crew1, crew2, r1, r2, in1, in2 } = twoWelders();
+    sim.trampler.damageLeg(0, 1e6);
+    sim.trampler.damageLeg(1, 1e6);
+    standAtLeg(sim, crew1, 0);
+    standAtLeg(sim, crew2, 1);
+    weld(FRAMES, [[r1, in1], [r2, in2]]);
+
+    ok("two welders on two legs both work, and neither is refused",
+      r1.active && r2.active && r1.takenBy === 0 && r2.takenBy === 0,
+      `crew 1 -> ${r1.target?.key}, crew 2 -> ${r2.target?.key}`);
+    ok("so the crew's total repair rate does double across separate jobs",
+      Math.abs((sim.trampler.legHp[0] + sim.trampler.legHp[1]) - soloGain * 2) < 1e-6,
+      `${(sim.trampler.legHp[0] + sim.trampler.legHp[1]).toFixed(1)} hp across two legs`
+      + ` against ${soloGain.toFixed(1)} on one`);
+  }
+
+  // ---- and the two-pass selection: a FREE point beats a closer taken one.
+  //
+  // Without it, a single "nearest wins" pass would park crew 2 on the leg crew 1 already
+  // has and report a refusal, while a free leg sat 4.25 m away. Same starvation buildWave
+  // allocates in two passes to avoid.
+  {
+    const { sim, crew1, crew2, r1, r2, in1, in2 } = twoWelders();
+    sim.trampler.damageLeg(0, 1e6);
+    sim.trampler.damageLeg(1, 1e6);
+    standAtLeg(sim, crew1, 0);
+
+    // Just short of midway between the two port legs, so BOTH are in reach and the TAKEN
+    // one is nearer by a hair. A tie would make the assertion meaningless.
+    //
+    // Placed by lerping between the two points rather than by nudging a world coordinate,
+    // and that is a correction: the first version subtracted 0.2 from world z expecting to
+    // move toward leg 0, and the fortress starts on a heading of pi, so local -z maps to
+    // world +z and it moved the other way. The free leg came out nearer, "nearest free"
+    // picked it trivially, and the behavioural assertion below passed for entirely the
+    // wrong reason. Only the non-vacuity check caught it. Lerping cannot get this wrong
+    // because it never mentions an axis.
+    const a = sim.trampler.legAttackWorld(0, new THREE.Vector3());
+    const b = sim.trampler.legAttackWorld(1, new THREE.Vector3());
+    crew2.position.copy(a).lerp(b, 0.48);
+    crew2.position.y = 1.2;
+    crew2.base = null;
+    crew2.velocity.set(0, 0, 0);
+    ok("crew 2 has both legs in reach, with the taken one nearer (test is not vacuous)",
+      crew2.position.distanceTo(a) < R.range && crew2.position.distanceTo(b) < R.range
+      && crew2.position.distanceTo(a) < crew2.position.distanceTo(b),
+      `leg 0 at ${crew2.position.distanceTo(a).toFixed(2)} m,`
+      + ` leg 1 at ${crew2.position.distanceTo(b).toFixed(2)} m`);
+
+    weld(FRAMES, [[r1, in1], [r2, in2]]);
+    ok("so crew 2 takes the FREE leg rather than being refused on the nearer one",
+      r2.target?.key === "leg:1" && r2.active && r2.takenBy === 0,
+      `crew 2 -> ${r2.target?.key}, active ${r2.active}, takenBy ${r2.takenBy}`);
+    ok("and both legs came back", sim.trampler.legHp[0] > 0 && sim.trampler.legHp[1] > 0,
+      `leg 0 ${sim.trampler.legHp[0].toFixed(0)} hp, leg 1 ${sim.trampler.legHp[1].toFixed(0)} hp`);
+  }
+
+  // ---- standing beside a leg is not a claim. Only working it is.
+  {
+    const { sim, crew1, crew2, r1, r2, in1, in2 } = twoWelders();
+    sim.trampler.damageLeg(0, 1e6);
+    standAtLeg(sim, crew1, 0);
+    standAtLeg(sim, crew2, 0);
+
+    // Crew 1 is right there and is offered the repair, but never presses the key.
+    for (let i = 0; i < 4; i++) r1.update(DT, in1);
+    ok("crew 1 is offered the leg but is not working it (test is not vacuous)",
+      r1.target?.key === "leg:0" && !r1.active,
+      `target ${r1.target?.key}, active ${r1.active}`);
+
+    weld(FRAMES, [[r2, in2]]);
+    ok("so crew 2 is not locked out by somebody merely standing there",
+      r2.active && r2.takenBy === 0 && sim.trampler.legHp[0] > 0,
+      `crew 2 active ${r2.active}, takenBy ${r2.takenBy},`
+      + ` leg at ${sim.trampler.legHp[0].toFixed(0)} hp`);
+  }
+
+  // ---- the claim is released by stopping, with no release path to forget.
+  {
+    const { sim, crew1, crew2, r1, r2, in1, in2 } = twoWelders();
+    sim.trampler.damageLeg(0, 1e6);
+    standAtLeg(sim, crew1, 0);
+    standAtLeg(sim, crew2, 0);
+    weld(4, [[r1, in1], [r2, in2]]);
+    ok("crew 1 holds the point and crew 2 is refused (test is not vacuous)",
+      crew1.repairing === "leg:0" && r2.takenBy === 1,
+      `crew 1 claim ${crew1.repairing}, crew 2 takenBy ${r2.takenBy}`);
+
+    // Crew 1 lets go. The claim is rebuilt from conditions every frame, so it clears
+    // itself -- nothing releases it.
+    in1.keys.delete(R.key);
+    r1.update(DT, in1);
+    ok("letting go of the key clears the claim on its own",
+      crew1.repairing === null && !r1.active, `claim ${crew1.repairing}`);
+
+    const before = sim.trampler.legHp[0];
+    for (let i = 0; i < FRAMES; i++) {
+      r1.update(DT, in1);
+      r2.update(DT, in2);
+    }
+    ok("and crew 2 picks the point up",
+      r2.active && r2.takenBy === 0 && sim.trampler.legHp[0] > before,
+      `${before.toFixed(1)} -> ${sim.trampler.legHp[0].toFixed(1)} hp, takenBy ${r2.takenBy}`);
+  }
+
+  // ---- AND AN OPERATIVE WHO LEAVES THE CREW TAKES THEIR CLAIM WITH THEM.
+  //
+  // This is why the claim is read through the roster rather than kept in a registry of
+  // Repair instances: there is no release path to forget, so a disconnect cannot leave a
+  // repair point that nobody is able to work for the rest of the run. The stale field is
+  // deliberately NOT cleared -- it simply stops being reachable.
+  {
+    const { sim, crew1, crew2, r1, r2, in1, in2 } = twoWelders();
+    sim.trampler.damageLeg(0, 1e6);
+    standAtLeg(sim, crew1, 0);
+    standAtLeg(sim, crew2, 0);
+
+    // Crew 2 first this time, so crew 2 owns the point and is the one who leaves.
+    weld(4, [[r2, in2], [r1, in1]]);
+    ok("crew 2 holds the point and crew 1 is refused (test is not vacuous)",
+      crew2.repairing === "leg:0" && r1.takenBy === 2,
+      `crew 2 claim ${crew2.repairing}, crew 1 takenBy ${r1.takenBy}`);
+
+    ok("crew 2 leaves the crew", sim.crew.remove(crew2) && sim.crew.size === 1,
+      `${sim.crew.size} left`);
+    const before = sim.trampler.legHp[0];
+    for (let i = 0; i < FRAMES; i++) r1.update(DT, in1);
+
+    ok("their claim goes with them, even though the field was never cleared",
+      crew2.repairing === "leg:0" && r1.active && r1.takenBy === 0,
+      `stale claim still reads "${crew2.repairing}" and is simply unreachable`);
+    ok("so the point is workable again rather than locked for the rest of the run",
+      sim.trampler.legHp[0] > before,
+      `${before.toFixed(1)} -> ${sim.trampler.legHp[0].toFixed(1)} hp`);
+  }
+
+  // ---- the reactor follows the same rule, since it is the same code path.
+  {
+    const { sim, crew1, crew2, r1, r2, in1, in2 } = twoWelders();
+    sim.trampler.damageReactor(200);
+    const standAtReactor = (who) => {
+      who.position.copy(sim.trampler.localToWorld(new THREE.Vector3(0, 1.2, 2.0)));
+      who.base = sim.trampler;
+      who.velocity.set(0, 0, 0);
+    };
+    standAtReactor(crew1);
+    standAtReactor(crew2);
+
+    const solo = makeSim();
+    solo.trampler.walking = false;
+    solo.trampler.turning = false;
+    solo.trampler.damageReactor(200);
+    solo.player.position.copy(solo.trampler.localToWorld(new THREE.Vector3(0, 1.2, 2.0)));
+    solo.player.base = solo.trampler;
+    const soloIn = makeInput();
+    const reactorBefore = solo.trampler.reactorHp;
+    weld(FRAMES, [[solo.repair, soloIn]]);
+    const soloReactorGain = solo.trampler.reactorHp - reactorBefore;
+
+    const twoBefore = sim.trampler.reactorHp;
+    weld(FRAMES, [[r1, in1], [r2, in2]]);
+    const twoGain = sim.trampler.reactorHp - twoBefore;
+
+    ok("one operative repairs the reactor (test is not vacuous)",
+      soloReactorGain > 0 && r1.target?.key === "reactor",
+      `${soloReactorGain.toFixed(1)} hp at ${R.reactorRate} hp/s`);
+    ok("and two on the reactor is no faster than one either",
+      Math.abs(twoGain - soloReactorGain) < 1e-6,
+      `${twoGain.toFixed(1)} hp with two against ${soloReactorGain.toFixed(1)} with one`);
+    ok("with the second told who has it",
+      (r1.active ? r2 : r1).takenBy > 0,
+      `takenBy ${(r1.active ? r2 : r1).takenBy}`);
+  }
+
+  // ---- and WHY, from config, so the rule is defended by arithmetic rather than by
+  // this comment. 110 sits inside the measured 48-154 hp/s chewing band on purpose:
+  // a lone welder wins against a few and loses against a crowd, which is what makes
+  // patching under fire a race. Doubling it clears the band outright.
+  const CHEW_PEAK = 154; // measured, quoted in invariant 12b
+  ok("a single welder can still lose the race, which is the tension being protected",
+    R.legRate < CHEW_PEAK,
+    `${R.legRate} hp/s against up to ${CHEW_PEAK} hp/s of chewing`);
+  ok("while two on one leg would have beaten the worst of it outright",
+    R.legRate * 2 > CHEW_PEAK,
+    `${R.legRate * 2} hp/s against ${CHEW_PEAK} hp/s — the race stops existing`);
+}
+
+// ---------------------------------------------------------------------------
+// The road is put to the crew, because it is the only decision the whole crew lives with.
+//
+// A road's modifiers are cumulative for the rest of the biome and there are exactly three
+// road choices in a run, so a vote is affordable here in a way it would not be for
+// anything frequent -- Ghost Ship's negotiated upgrades were divisive because they were
+// every negotiation. It also costs no tempo, structurally: a held siege already sits in
+// CHOOSING until a human presses a key, so this spends time the run was already spending.
+//
+// The half worth testing hardest is that SOLO IS UNCHANGED. A majority of one is one
+// keypress, so every existing assertion about `run.choose` and about key routing has to
+// still hold byte-for-byte, and the whole mechanism has to be invisible until there is
+// somebody to disagree with.
+console.log("\n109. The road is a crew decision, and a majority carries it");
+{
+  /** A run parked in CHOOSING with a crew of `n`, ready to be voted on. */
+  const ballot = (n) => {
+    const sim = makeSim();
+    for (let i = 1; i < n; i++) {
+      const cam = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 1400);
+      cam.rotation.order = "YXZ";
+      sim.crew.add(new Player(cam, sim.world, sim.trampler));
+    }
+    sim.director.phase = PHASE.HELD;
+    sim.run.update();
+    // Holding a siege pays a pick, and the road waits behind it. Take it to reach the
+    // state this section is about -- test 79 owns the ordering.
+    sim.economy.takePick(0);
+    sim.run.update();
+    return sim;
+  };
+
+  // ---- solo: a majority of one, so nothing changed at all.
+  {
+    const sim = ballot(1);
+    ok("a solo run is asking for a road (test is not vacuous)",
+      sim.run.choosing && sim.run.offers.length === CFG.run.branches,
+      `phase ${sim.run.phase}, ${sim.run.offers.length} roads`);
+    ok("and one operative is a majority of one, so no agreement is needed",
+      sim.run.votesNeeded === 1, `${sim.run.votesNeeded} of ${sim.crew.size}`);
+
+    const leg = sim.run.leg;
+    const arrival = sim.run.vote(sim.player, 0);
+    ok("so a single vote takes the road on the frame it is cast",
+      !!arrival && sim.run.leg === leg + 1 && !sim.run.choosing,
+      `took ${arrival?.name}, leg ${leg} -> ${sim.run.leg}`);
+    ok("and a solo crew is never deadlocked", !sim.run.deadlocked);
+  }
+
+  // ---- and through the real key router, which is how a press actually gets there.
+  {
+    const sim = ballot(1);
+    const leg = sim.run.leg;
+    sim.input.presses.add(CFG.economy.keys[0]);
+    const routed = routePurchaseInput({
+      economy: sim.economy, run: sim.run, bayOpen: true, input: sim.input, dt: DT,
+    });
+    ok("pressing 1 solo still takes the road through the router, bay open and all",
+      routed.owner === "route" && !!routed.arrival && sim.run.leg === leg + 1,
+      `owner ${routed.owner}, took ${routed.arrival?.name}`);
+  }
+
+  // ---- four operatives: a majority is three, and two is not enough.
+  {
+    const sim = ballot(4);
+    const [a, b, c, d] = sim.crew.members;
+    ok("the crew is four and a majority is three", sim.crew.size === 4
+      && sim.run.votesNeeded === 3, `${sim.run.votesNeeded} of ${sim.crew.size}`);
+
+    const leg = sim.run.leg;
+    ok("one vote does not move the run",
+      sim.run.vote(a, 0) === null && sim.run.leg === leg,
+      `tally [${sim.run.tally.join(",")}]`);
+    ok("nor does a second", sim.run.vote(b, 0) === null && sim.run.leg === leg,
+      `tally [${sim.run.tally.join(",")}]`);
+    ok("and the tally reports the split as it stands",
+      sim.run.tally[0] === 2 && sim.run.tally[1] === 0,
+      `[${sim.run.tally.join(",")}]`);
+    ok("naming which seats are backing which road, so a voter can see their own",
+      sim.run.voteSeats[0].join(",") === "1,2" && sim.run.voteSeats[1].length === 0,
+      `road 1 backed by crew ${sim.run.voteSeats[0].join(", ") || "nobody"}`);
+
+    const arrival = sim.run.vote(c, 0);
+    ok("the third carries it, without waiting for the fourth to speak",
+      !!arrival && sim.run.leg === leg + 1 && !sim.run.choosing,
+      `took ${arrival?.name} on 3 of 4, with crew ${sim.crew.seatOf(d)} silent`);
+  }
+
+  // ---- a vote is changeable, and changing one does not add one.
+  {
+    const sim = ballot(4);
+    const [a, b] = sim.crew.members;
+    sim.run.vote(a, 0);
+    sim.run.vote(b, 0);
+    ok("two votes for the same road (test is not vacuous)", sim.run.tally[0] === 2,
+      `[${sim.run.tally.join(",")}]`);
+
+    sim.run.vote(a, 1);
+    ok("changing a vote moves it rather than adding a second",
+      sim.run.tally[0] === 1 && sim.run.tally[1] === 1,
+      `[${sim.run.tally.join(",")}]`);
+    ok("and voting the same way twice is idempotent",
+      (sim.run.vote(b, 0), sim.run.tally[0] === 1 && sim.run.tally[1] === 1),
+      `[${sim.run.tally.join(",")}]`);
+    ok("and the run has not moved", sim.run.choosing, `phase ${sim.run.phase}`);
+  }
+
+  // ---- A TIE IS NOT RESOLVED, AND IT SAYS SO.
+  //
+  // This is a correction to the design I proposed, which was "ties break to the quiet
+  // road". The data does not support it: two of six routes are offered and exactly one
+  // route has no cost at all, so most ties would have no quiet road on the menu.
+  //
+  // The alternatives measured worse. Ranking by payout gets the order wrong -- asserted
+  // below, because it is the argument and not just a claim. Scoring the modifiers means
+  // inventing weights across health, count, speed and visibility. "Key 1 wins" is
+  // illegible. So a tie stays a tie and any one operative can end it.
+  {
+    const sim = ballot(4);
+    const [a, b, c, d] = sim.crew.members;
+    const leg = sim.run.leg;
+    sim.run.vote(a, 0);
+    sim.run.vote(b, 0);
+    sim.run.vote(c, 1);
+    ok("three of four voted, still no majority (test is not vacuous)",
+      !sim.run.deadlocked && sim.run.leg === leg,
+      `[${sim.run.tally.join(",")}] with one still to vote — not a deadlock yet`);
+
+    sim.run.vote(d, 1);
+    ok("an even split with everyone voted is a deadlock, and reports itself",
+      sim.run.deadlocked && sim.run.tally[0] === 2 && sim.run.tally[1] === 2,
+      `[${sim.run.tally.join(",")}]`);
+    ok("nothing is chosen for the crew, so half of them are never overridden",
+      sim.run.choosing && sim.run.leg === leg,
+      `phase ${sim.run.phase}, leg ${sim.run.leg}`);
+
+    // The way out is a thing a player does, which is why no timer is needed.
+    const broke = sim.run.vote(d, 0);
+    ok("and any one of them can end it by changing their mind",
+      !!broke && sim.run.leg === leg + 1 && !sim.run.deadlocked,
+      `took ${broke?.name} on [3,1]`);
+  }
+
+  // ---- ties are only reachable at an even crew size, which is why three is safe.
+  {
+    const sim = ballot(3);
+    const [a, b, c] = sim.crew.members;
+    ok("three operatives need two to agree", sim.run.votesNeeded === 2,
+      `${sim.run.votesNeeded} of 3`);
+    sim.run.vote(a, 0);
+    sim.run.vote(b, 1);
+    const arrival = sim.run.vote(c, 1);
+    ok("so with two roads a third vote always decides it — no tie is possible",
+      !!arrival && !sim.run.deadlocked,
+      `took ${arrival?.name} on [1,2]`);
+  }
+
+  // ---- the arithmetic behind rejecting a payout-ranked tie-break.
+  //
+  // Asserted rather than asserted-in-a-comment, because "the boneyard pays least and is
+  // riskiest" is exactly the kind of claim this project has been wrong about before.
+  {
+    const cash = (r) => r.salvage + r.scrap;
+    const boneyard = CFG.run.routes.find((r) => r.id === "boneyard");
+    const flats = CFG.run.routes.find((r) => r.id === "flats");
+    ok("a payout-ranked tie-break would have picked the RISKIER road, so it was rejected",
+      cash(boneyard) < cash(flats) && boneyard.threat > flats.threat && boneyard.module,
+      `boneyard pays ${cash(boneyard)} at x${boneyard.threat} threat plus a free module,`
+      + ` against the flats' ${cash(flats)} at x${flats.threat}`);
+    const quiet = CFG.run.routes.filter(
+      (r) => r.threat === 1 && r.count === 0 && r.speed === 1 && r.fog === 1);
+    ok("and only one route in six is genuinely quiet, so it is usually not even offered",
+      quiet.length === 1 && CFG.run.branches < CFG.run.routes.length,
+      `${quiet.length} quiet of ${CFG.run.routes.length}, ${CFG.run.branches} offered`);
+  }
+
+  // ---- an operative who leaves takes their vote with them.
+  //
+  // Without this a disconnect leaves a vote nobody can change while still counting toward
+  // the crew size, which holds the run one short of a majority for ever. Same discipline
+  // as the repair claim: the roster is the authority on who exists.
+  {
+    const sim = ballot(3);
+    const [a, b, c] = sim.crew.members;
+    sim.run.vote(a, 0);
+    sim.run.vote(c, 1);
+    ok("two of three have voted, one each way (test is not vacuous)",
+      sim.run.tally[0] === 1 && sim.run.tally[1] === 1 && sim.run.choosing,
+      `[${sim.run.tally.join(",")}]`);
+
+    ok("the third operative leaves", sim.crew.remove(c) && sim.crew.size === 2,
+      `${sim.crew.size} left`);
+    ok("their vote goes with them, so it cannot block a majority for ever",
+      sim.run.tally[0] === 1 && sim.run.tally[1] === 0,
+      `[${sim.run.tally.join(",")}]`);
+    ok("and the remaining pair can now carry it between them",
+      !!sim.run.vote(b, 0) && !sim.run.choosing,
+      `2 of ${sim.crew.size} needed ${sim.run.votesNeeded}`);
+  }
+
+  // ---- a fresh ballot per landmark, so last landmark's votes never carry.
+  {
+    const sim = ballot(4);
+    const [a, b, c] = sim.crew.members;
+    sim.run.vote(a, 0);
+    sim.run.vote(b, 0);
+    sim.run.vote(c, 0);
+    ok("the first road was taken by a majority (test is not vacuous)",
+      !sim.run.choosing && sim.run.leg === 2, `leg ${sim.run.leg}`);
+
+    // Straight into the next choice, without fighting the siege.
+    sim.director.phase = PHASE.HELD;
+    sim.run.update();
+    sim.economy.takePick(0);
+    sim.run.update();
+    ok("a second road is offered", sim.run.choosing, `phase ${sim.run.phase}`);
+    ok("and the ballot is empty rather than carrying the last one's votes",
+      sim.run.tally.every((n) => n === 0) && sim.run.voteOf(a) === -1,
+      `[${sim.run.tally.join(",")}]`);
+  }
+
+  // ---- and a vote outside the choice does nothing, rather than banking one.
+  {
+    const sim = makeSim();
+    ok("a run mid-siege is not asking for a road (test is not vacuous)",
+      !sim.run.choosing, `phase ${sim.run.phase}`);
+    ok("so a vote is refused rather than stored for later",
+      sim.run.vote(sim.player, 0) === null && sim.run.tally.length === 0,
+      `${sim.run.votes.size} votes recorded`);
+    ok("and an out-of-range road is refused too",
+      (() => {
+        const s = ballot(2);
+        return s.run.vote(s.player, 99) === null && s.run.votes.size === 0;
+      })(), "index 99");
+  }
+
+  // ---- a reset clears the ballot, like everything else a run touches (invariant 25).
+  {
+    const sim = ballot(4);
+    sim.run.vote(sim.crew.members[0], 0);
+    ok("a vote is on the record (test is not vacuous)", sim.run.votes.size === 1);
+    sim.run.reset();
+    ok("and a restart clears it along with the journey",
+      sim.run.votes.size === 0 && sim.run.leg === 1 && !sim.run.choosing,
+      `${sim.run.votes.size} votes, leg ${sim.run.leg}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Damage carries WHO caused it, not what kind of thing caused it.
+//
+// `source` was a string -- "player" for anything the crew aimed, "emitter" for automation
+// -- and every proc gated on `source === "player"`. That was correct with one operative
+// and is a latent bug with two: it names a KIND, so one operative's kill fires every
+// operative's procs, their splash heals somebody else, and their arc spends a stack of an
+// item they do not own. Nothing throws. It reads as "these items feel stronger in co-op".
+//
+// Section 94 owns the automation half, which is the older and louder claim. This section
+// owns the half a string could never express: WHICH person.
+//
+// One thing worth naming about the fix. The two rules collapse into a single identity
+// test, because no subsystem is ever equal to a Player -- so `causedBy` enforces
+// invariant 2b as a side effect of asking about a person. That is exactly why it is
+// exported rather than written out: the tempting hand-written version, `source !== null`,
+// satisfies invariant 2b, reads like a working gate, and has the original bug intact.
+console.log("\n110. A proc fires for its OWN operative's kill and nobody else's");
+{
+  /** Two operatives with two independent item runtimes on one shared horde. */
+  const pair = () => {
+    const sim = makeSim();
+    sim.trampler.walking = false;
+    sim.trampler.turning = false;
+
+    const cam = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 1400);
+    cam.rotation.order = "YXZ";
+    const mate = new Player(cam, sim.world, sim.trampler);
+    sim.crew.add(mate);
+
+    // A second Economy and a second Items, because the personal track is personal:
+    // stacks, purse and procs all belong to one operative. Same bus, same horde -- which
+    // is the whole point, since the bus is where a kill is announced to everybody.
+    //
+    // And a WEAPON OF THEIR OWN. The first version of this helper handed both operatives
+    // `sim.weapon`, which section 114 shows silently wipes one operative's kit with the
+    // other's recompute -- so it is now refused at construction and this would throw.
+    const mateWeapon = new Weapon(sim.scene, mate, sim.horde, sim.world, sim.trampler);
+    mateWeapon.events = sim.events;
+    const mateEconomy = new Economy({
+      player: mate, trampler: sim.trampler, weapon: mateWeapon, repair: sim.repair,
+      horde: sim.horde, director: sim.director, modules: sim.modules, events: sim.events,
+    });
+    const mateItems = new Items({
+      economy: mateEconomy, player: mate, trampler: sim.trampler, weapon: mateWeapon,
+      horde: sim.horde, repair: sim.repair, events: sim.events,
+    });
+    return { sim, mate, mateWeapon, mateEconomy, mateItems };
+  };
+
+  /** Four bodies in a line, tight enough for a splash to reach the neighbours. */
+  const cluster = (sim, n = 4) => {
+    const centre = sim.trampler.localToWorld(new THREE.Vector3(0, 0, 0));
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const e = sim.horde.spawn(CHEWER);
+      e.x = centre.x + i * 1.2;
+      e.y = 0.8;
+      e.z = centre.z;
+      out.push(e);
+    }
+    return out;
+  };
+
+  // ---- the splash. Crew 1 has the item; crew 2 makes the kill.
+  {
+    const { sim, mate, mateItems } = pair();
+    sim.economy.stacks.fragment = 1;
+    sim.economy.applyAll();
+    ok("only crew 1 has the item fitted (test is not vacuous)",
+      sim.items.procs.fragment === 0 && mateItems.procs.fragment === 0
+      && sim.economy.stacks.fragment === 1,
+      `crew 1 x${sim.economy.stacks.fragment}, crew 2 x0`);
+
+    const bodies = cluster(sim);
+    const before = bodies.slice(1).map((e) => e.hp);
+    sim.horde.damage(bodies[0], 1e6, mate);
+    const splashed = bodies.slice(1).filter((e, i) => e.hp < before[i]).length;
+
+    ok("a teammate's kill does NOT fire the other operative's splash",
+      sim.items.procs.fragment === 0 && splashed === 0,
+      sim.items.procs.fragment === 0
+        ? "0 procs, neighbours untouched"
+        : `${sim.items.procs.fragment} PROCS OFF SOMEBODY ELSE'S KILL`);
+    ok("nor the item runtime of the operative who has none",
+      mateItems.procs.fragment === 0, `${mateItems.procs.fragment} procs`);
+  }
+
+  // ---- and the same kill, made by the operative who owns the item.
+  {
+    const { sim } = pair();
+    sim.economy.stacks.fragment = 1;
+    sim.economy.applyAll();
+    const bodies = cluster(sim);
+    const before = bodies.slice(1).map((e) => e.hp);
+    sim.horde.damage(bodies[0], 1e6, sim.player);
+    const splashed = bodies.slice(1).filter((e, i) => e.hp < before[i]).length;
+
+    ok("their OWN kill fires it, so the zero above is identity and not a dead item",
+      sim.items.procs.fragment === 1 && splashed > 0,
+      `${splashed} neighbours hit, ${sim.items.procs.fragment} procs`);
+  }
+
+  // ---- the heal, which is the sharpest case: a proc that writes to a person.
+  //
+  // Ungated, a teammate's kill would top up your health from across the map. Measured
+  // both ways in one sim so there is no doubt the item is live.
+  {
+    const { sim, mate } = pair();
+    sim.economy.stacks.executioner = 1;
+    sim.economy.applyAll();
+    sim.player.hp = 50;
+    mate.hp = 50;
+
+    sim.horde.damage(sim.horde.spawn(CHEWER), 1e6, mate);
+    ok("a teammate's kill heals nobody, because the item belongs to one operative",
+      sim.player.hp === 50 && mate.hp === 50 && sim.items.procs.executioner === 0,
+      `crew 1 at ${sim.player.hp} hp, crew 2 at ${mate.hp} hp`);
+
+    sim.horde.damage(sim.horde.spawn(CHEWER), 1e6, sim.player);
+    ok("and their own kill heals THEM and only them",
+      sim.player.hp === 50 + CFG.items.executioner && mate.hp === 50
+      && sim.items.procs.executioner === 1,
+      `crew 1 50 -> ${sim.player.hp}, crew 2 still ${mate.hp}`);
+  }
+
+  // ---- THE ON-HIT CHANNEL, WHICH HAD NO GATE AT ALL.
+  //
+  // This is the hole the change actually closed rather than tightened. `emitHit` carried
+  // no source, so `#onHit` could not gate even if it wanted to -- it was safe purely
+  // because `shootFrom` is the only publisher of a hit and every weapon through it is
+  // crew-aimed. Safe by nobody else emitting, which is the same shape as the burrowed
+  // check that excluded nothing for an entire update.
+  {
+    const { sim, mate } = pair();
+    sim.economy.stacks.arc = 20; // well past the chance curve's knee, so it must fire
+    sim.economy.applyAll();
+    const bodies = cluster(sim, 2);
+    const neighbourBefore = bodies[1].hp;
+
+    for (let i = 0; i < 12; i++) sim.events.emitHit(bodies[0], 20, mate);
+    ok("a teammate's hit rolls nobody else's arc caster",
+      sim.items.procs.arc === 0 && bodies[1].hp === neighbourBefore,
+      sim.items.procs.arc === 0
+        ? "0 arcs from 12 of a teammate's hits"
+        : `${sim.items.procs.arc} ARCS OFF SOMEBODY ELSE'S HITS`);
+
+    for (let i = 0; i < 12 && sim.items.procs.arc === 0; i++) {
+      sim.events.emitHit(bodies[0], 20, sim.player);
+    }
+    ok("while their own hits do, so the zero above is the gate and not a dead item",
+      sim.items.procs.arc > 0 && bodies[1].hp < neighbourBefore,
+      `${sim.items.procs.arc} arcs, neighbour ${neighbourBefore} -> ${bodies[1].hp.toFixed(0)}`);
+  }
+
+  // ---- automation is still excluded, and now for a structural reason rather than by
+  // matching a string. The Emitters system is the causer, and no subsystem is ever equal
+  // to a Player, so the identity test refuses it without knowing what an emitter is.
+  {
+    const { sim } = pair();
+    sim.economy.stacks.fragment = 1;
+    sim.economy.applyAll();
+    const bodies = cluster(sim);
+    const before = bodies.slice(1).map((e) => e.hp);
+    sim.horde.damage(bodies[0], 1e6, sim.emitters);
+    ok("a subsystem as the causer procs nothing, without any string being compared",
+      sim.items.procs.fragment === 0
+      && bodies.slice(1).every((e, i) => e.hp === before[i]),
+      `${sim.items.procs.fragment} procs from an Emitters-sourced kill`);
+  }
+
+  // ---- and the predicate itself, including the trap in it.
+  {
+    const sim = makeSim();
+    ok("causedBy is true only for the exact operative",
+      causedBy(sim.player, sim.player) === true
+      && causedBy(sim.emitters, sim.player) === false
+      && causedBy(null, sim.player) === false,
+      "player yes, subsystem no, unattributed no");
+    // The guard that stops the collapse going the other way. With no operative to compare
+    // against, an unattributed source must not match an absent one -- without the
+    // `!!operative` term, `causedBy(null, null)` is true and every unattributed kill in
+    // the game procs for a runtime that has no player.
+    ok("and never true when there is no operative to be, which is why the guard exists",
+      causedBy(null, null) === false && causedBy(undefined, undefined) === false,
+      "null does not equal null here");
+    // The string it replaced must not still work, or both spellings would be live at once
+    // and the old one would quietly keep being written.
+    ok("the string that used to mean 'the crew' now means nothing",
+      causedBy("player", sim.player) === false, `"player" is not a person`);
+  }
+
+  // ---- INCOME SPLITS THE SAME WAY THE PROCS DO, and it did not used to.
+  //
+  // Every Economy is subscribed to the same kill bus, so before the gate each operative
+  // collected salvage for every corpse the crew produced -- four operatives earning four
+  // times over, which reads as "money is generous in co-op" rather than as a bug. The
+  // shared half had the mirror-image fault: scrap was credited once per operative, so one
+  // kill paid the single shared pot four times.
+  //
+  // Invariant 24 survives both fixes and is asserted below rather than assumed. Nothing
+  // kills for free; a kill nobody made simply cannot fill one person's pocket.
+  {
+    const { sim, mate } = pair();
+    const before = sim.economy.earned.salvage;
+    const scrapAtStart = sim.economy.earned.scrap;
+    sim.horde.damage(sim.horde.spawn(CHEWER), 1e6, mate);
+    const afterMate = sim.economy.earned.salvage;
+    sim.horde.damage(sim.horde.spawn(CHEWER), 1e6, sim.emitters);
+    const afterAuto = sim.economy.earned.salvage;
+
+    ok("a teammate's kill pays THEIR salvage, not this operative's",
+      afterMate === before, `crew 1's purse unchanged at ${before}`);
+    ok("nor does an automated kill pay anybody's personal purse",
+      afterAuto === before, `still ${afterAuto}`);
+    // Invariant 24 intact, on the purse a kill nobody made actually belongs in. Read off
+    // the shared ledger so this cannot pass by everything having stopped paying.
+    ok("but both still pay the CREW, because nothing may kill for free",
+      sim.economy.earned.scrap > scrapAtStart,
+      `${scrapAtStart} -> ${sim.economy.earned.scrap} shared scrap across both kills`);
+  }
+
+  // ---- a manned gun is attributed to its OCCUPANT, not to the weapon's own operative.
+  //
+  // Solo those are the same person, so nothing here is observable without a crew. With
+  // one, it decides whose procs a kill from that seat fires -- and invariant 2b-i counts
+  // a manned gun as the crew precisely because somebody is sitting in it, so the
+  // attribution has to be that somebody.
+  {
+    const { sim, mate, mateItems } = pair();
+    // The item on the MATE, who will be the one in the seat. The Weapon belongs to
+    // crew 1, so if the gun attributed to `weapon.player` this would proc nothing.
+    mateItems.economy.stacks.fragment = 1;
+    mateItems.economy.applyAll();
+
+    const gun = sim.guns[0];
+    mate.position.copy(gun.operatorWorld(new THREE.Vector3()));
+    mate.base = sim.trampler;
+    mate.velocity.set(0, 0, 0);
+    ok("the mate is in the seat and the weapon belongs to somebody else (not vacuous)",
+      gun.mount(mate) && gun.operator === mate && sim.weapon.player === sim.player,
+      `${gun.name} operator is crew ${sim.crew.seatOf(gun.operator)},`
+      + ` weapon belongs to crew ${sim.crew.seatOf(sim.weapon.player)}`);
+
+    // A tight cluster out in the open ahead of the bow, inside the gun's arc.
+    const ahead = sim.trampler.localToWorld(
+      new THREE.Vector3(0, -CFG.trampler.deckHeight, -70));
+    const targets = [];
+    for (let i = 0; i < 4; i++) {
+      const e = sim.horde.spawn(CHEWER);
+      e.x = ahead.x + (i - 1.5) * 1.1;
+      e.y = 0.8;
+      e.z = ahead.z;
+      targets.push(e);
+    }
+
+    const aimPoint = new THREE.Vector3(targets[0].x, targets[0].y, targets[0].z);
+    const mateInput = makeInput();
+    mateInput.mouseHeld.add(0);
+    let gunKills = 0;
+    for (let i = 0; i < 240 && mateItems.procs.fragment === 0; i++) {
+      aimAt(mate, aimPoint);
+      gun.constrain(mate);
+      aimAt(mate, aimPoint);
+      sim.trampler.group.updateMatrixWorld(true);
+      gun.heat = 0;
+      gun.overheated = false;
+      gun.cooldown = 0;
+      gun.update(DT, mateInput, mate, sim.weapon);
+      gunKills = sim.horde.killCount;
+    }
+
+    ok("the mount actually killed things from the seat (test is not vacuous)",
+      gunKills > 0 && gun.shots > 0, `${gunKills} kills over ${gun.shots} rounds`);
+    ok("and the kill fired the OCCUPANT's proc, not the weapon owner's",
+      mateItems.procs.fragment > 0 && sim.items.procs.fragment === 0,
+      `occupant ${mateItems.procs.fragment} procs, weapon owner ${sim.items.procs.fragment}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A crew gets a BIGGER wave, and that is the only thing crew size changes.
+//
+// Section 106 measured the gap this closes: before it, four operatives faced exactly the
+// solo fight -- 45 spawns either way, identical composition, identical pacing. Crew size
+// scaled nothing at all in any dimension.
+//
+// The coefficient is Risk of Rain 2's shipped one, `0.5 * playerCount + 0.5`, written
+// here as `1 + 0.5 * (size - 1)` so that one operative is x1.0 by construction rather
+// than by two numbers agreeing. Borrowed rather than invented because it is the only
+// number in this file with a decade of live-service tuning behind it, and starting from a
+// known-good value is what makes the first measurement mean something.
+//
+// COUNT ONLY, which is invariant 19e's discipline applied to a new axis: the size curve
+// was tuned against measured pacing, so moving size and composition together makes a
+// later difficulty change impossible to attribute to either. The consequence of that
+// restriction is measured below rather than reasoned about, because it is the thing that
+// names the next question.
+console.log("\n111. Crew size scales how many arrive, and nothing else");
+{
+  const w = CFG.waves;
+
+  /** A director whose crew has `n` operatives. */
+  const atCrew = (n) => {
+    const sim = makeSim();
+    for (let i = 1; i < n; i++) {
+      const cam = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 1400);
+      cam.rotation.order = "YXZ";
+      sim.crew.add(new Player(cam, sim.world, sim.trampler));
+    }
+    return sim;
+  };
+
+  const tally = (types) => {
+    const out = {};
+    for (const t of types) out[ENEMY_TYPE_KEYS[t]] = (out[ENEMY_TYPE_KEYS[t]] ?? 0) + 1;
+    return out;
+  };
+  const soloSize = (wave) => w.baseCount + w.perWave * (wave - 1);
+
+  // ---- one operative is untouched, and that is the acceptance test for the change.
+  {
+    const sim = atCrew(1);
+    ok("a solo crew scales the wave by exactly one",
+      sim.director.crewScale === 1, `x${sim.director.crewScale}`);
+    const sizes = [];
+    let allMatch = true;
+    for (let wave = 1; wave <= w.siegeLength; wave++) {
+      const n = sim.director.buildWave(wave).length;
+      sizes.push(n);
+      if (n !== soloSize(wave)) allMatch = false;
+    }
+    ok("so the solo size curve is the authored one, unchanged",
+      allMatch, `${sizes.join("/")} against ${[1, 2, 3, 4, 5].map(soloSize).join("/")}`);
+  }
+
+  // ---- and the multiplier is the configured curve, not something near it.
+  {
+    const seen = [];
+    let allMatch = true;
+    for (let n = 1; n <= 4; n++) {
+      const sim = atCrew(n);
+      const want = 1 + w.crewCountPerHead * (n - 1);
+      seen.push(`${n}:x${sim.director.crewScale}`);
+      if (Math.abs(sim.director.crewScale - want) > 1e-9) allMatch = false;
+      // And it lands on the actual wave, not merely on the getter.
+      const built = sim.director.buildWave(1).length;
+      if (built !== Math.round(soloSize(1) * want)) allMatch = false;
+    }
+    ok("each extra operative adds the configured share, and it reaches the wave",
+      allMatch, `${seen.join("  ")} at ${w.crewCountPerHead} per extra head`);
+  }
+
+  // ---- A ROAD'S STATED COST STAYS LITERAL.
+  //
+  // The crew multiplier applies to the size curve and the road's flat bonus is added
+  // afterwards, on purpose. The route panel tells the player "+4 enemies per wave" and
+  // `run.modifiers` repeats it for the rest of the biome; multiplying that by the crew
+  // would make both readouts wrong by a factor nothing on screen mentions.
+  {
+    const sim = atCrew(4);
+    const bare = sim.director.buildWave(1).length;
+    sim.run.extraCount = 4;
+    const withRoad = sim.director.buildWave(1).length;
+    ok("a road that promises four more delivers four more, whatever the crew size",
+      withRoad - bare === 4,
+      `${bare} -> ${withRoad} with a +4 road at x${sim.director.crewScale}`
+      + ` — not ${Math.round(4 * sim.director.crewScale)}`);
+  }
+
+  // ---- the pillar survives the bigger wave: both pressures still present, floor held.
+  {
+    const broken = [];
+    let lowestChewerShare = 1;
+    let lowestAt = "";
+    for (let n = 1; n <= 4; n++) {
+      const sim = atCrew(n);
+      for (let leg = 1; leg <= CFG.run.legs; leg++) {
+        sim.run.leg = leg;
+        const len = leg >= CFG.run.legs ? CFG.run.bossSiegeLength : w.siegeLength;
+        for (let wave = 1; wave <= len; wave++) {
+          const t = tally(sim.director.buildWave(wave, sim.director.tierOf(wave)));
+          const size = Object.values(t).reduce((a, b) => a + b, 0);
+          if (!t.chewer) broken.push(`no chewers at crew ${n} leg ${leg} wave ${wave}`);
+          if (!t.climber) broken.push(`no climbers at crew ${n} leg ${leg} wave ${wave}`);
+          if (t.titan) continue; // the boss wave truncates its escort on purpose
+          const share = (t.chewer ?? 0) / size;
+          if (share < lowestChewerShare) {
+            lowestChewerShare = share;
+            lowestAt = `crew ${n} leg ${leg} wave ${wave}, size ${size}`;
+          }
+        }
+      }
+    }
+    ok("every wave at every crew size still contains both pillar types",
+      broken.length === 0,
+      broken.length ? broken.join("; ") : "chewers and climbers throughout, crew 1 to 4");
+    // The floor is a SHARE, so it scales with the count for free -- but the reserve is
+    // `round(count * floor)` rather than `ceil`, so the REALISED share can sit up to half
+    // an enemy below the nominal one. Solo never showed this: the size curve is
+    // 10/15/20/25/30 and 0.4x every one of those is an integer, so round and ceil agreed
+    // at every count the game had ever built. Crew scaling produces 23, where 0.4x is 9.2,
+    // the reserve rounds to 9, and the share lands at 39%.
+    //
+    // Asserted with the rounding step named rather than tightened, and `round` is
+    // deliberately NOT changed to `ceil` here. It would make the floor true as written and
+    // it is a one-character edit, but it is a composition change riding along inside a
+    // count change -- exactly the two-variables-at-once that 19e exists to prevent -- and
+    // 39% against 40% threatens nothing the floor is for. Flagged, not tuned.
+    const c = CFG.enemies.composition;
+    const slack = 0.5 / 23; // half an enemy at the count that first exposed it
+    ok("and the chewer floor still holds to within its own rounding step",
+      lowestChewerShare >= c.chewerFloor - slack,
+      `lowest ${(lowestChewerShare * 100).toFixed(1)}% at ${lowestAt},`
+      + ` nominal floor ${(c.chewerFloor * 100).toFixed(0)}%`
+      + ` — reserve is round(count x ${c.chewerFloor}), so it can land half an enemy low`);
+  }
+
+  // ---- the same seed builds the same wave at the same crew size (invariant 21).
+  {
+    const a = atCrew(3).director.buildWave(4, 4).join(",");
+    const b = atCrew(3).director.buildWave(4, 4).join(",");
+    ok("two crews of the same size are handed the same wave from the same seed",
+      a === b, `${a.split(",").length} enemies, identical`);
+  }
+
+  // ---- AND THE MEASUREMENT THAT NAMES THE NEXT QUESTION.
+  //
+  // The specials' caps -- bulwarkMax, sapperMax -- are ABSOLUTE, and this change did not
+  // touch them, because touching composition at the same time as size is exactly what
+  // 19e forbids. So a crew of four meets a bigger wave with the SAME number of bulwarks
+  // and sappers in it, and the growth is absorbed by chewers.
+  //
+  // Reported rather than asserted against a threshold, because there is no defensible
+  // threshold yet -- that is the point of measuring it. If the specials' share collapses,
+  // roster scaling is the next variable and this is the number that says so. Asserting a
+  // hoped-for value here would be the "assert the roll rather than the thing" trap.
+  {
+    const shareAt = (n) => {
+      const sim = atCrew(n);
+      sim.run.leg = 2; // a mid-run tier, so the specials are actually due
+      let specials = 0;
+      let total = 0;
+      let bulwarks = 0;
+      let sappers = 0;
+      for (let wave = 1; wave <= w.siegeLength; wave++) {
+        const t = tally(sim.director.buildWave(wave, sim.director.tierOf(wave)));
+        const size = Object.values(t).reduce((a, b) => a + b, 0);
+        total += size;
+        bulwarks += t.bulwark ?? 0;
+        sappers += t.sapper ?? 0;
+        specials += (t.bulwark ?? 0) + (t.sapper ?? 0) + (t.burrower ?? 0);
+      }
+      return { specials, total, bulwarks, sappers, share: specials / total };
+    };
+
+    const one = shareAt(1);
+    const four = shareAt(4);
+    ok("a crew of four does face a materially bigger siege (test is not vacuous)",
+      four.total > one.total * 2,
+      `${one.total} enemies across a siege solo -> ${four.total} with four`);
+    // The claim here was originally "the specials' COUNT is unchanged", which was wrong,
+    // and the detail string printed only the solo side so the failure could not say why.
+    //
+    // What actually happens: the tier ramps decide how many specials are WANTED and that
+    // is crew-blind, but the second allocation pass can only satisfy the want if there is
+    // room. Solo, a ten-enemy wave often runs out; at four, there is room, so the specials
+    // reach their cap where they previously could not. The count therefore grows a little
+    // and then stops dead at the cap -- which is sub-proportional by a wide margin, and is
+    // the restriction working rather than failing.
+    const crewScale = 1 + w.crewCountPerHead * 3;
+    ok("and the specials' count grows only until their caps bind, never with the crew",
+      four.specials < one.specials * crewScale,
+      `${one.bulwarks}->${four.bulwarks} bulwarks, ${one.sappers}->${four.sappers} sappers,`
+      + ` ${one.specials}->${four.specials} specials against x${crewScale} on the count`);
+    // The finding, printed so the next difficulty read is attributable to it.
+    ok("so the specials' SHARE falls, and that is the next question rather than a fault",
+      Number.isFinite(four.share) && four.share < one.share,
+      `specials are ${(one.share * 100).toFixed(0)}% of a solo siege and`
+      + ` ${(four.share * 100).toFixed(0)}% of a four-crew one`
+      + ` — if that reads as a thinner fight, roster scaling is the next variable, alone`);
+  }
+
+  // ---- and what was deliberately NOT scaled, asserted so a later edit has to argue.
+  {
+    const one = atCrew(1);
+    const four = atCrew(4);
+    four.director.elapsed = one.director.elapsed;
+    ok("enemy health does not scale with crew size, because health is invisible",
+      Math.abs(one.director.hpScale() - four.director.hpScale()) < 1e-9,
+      `x${one.director.hpScale().toFixed(2)} either way — a player cannot perceive a`
+      + ` tougher chewer, only an unrewarding one`);
+    ok("nor does the siege length, so a bigger crew is not a longer grind",
+      one.director.siegeLength === four.director.siegeLength,
+      `${one.director.siegeLength} waves either way`);
+    ok("nor the resolve threshold, which is recorded as an open question not a decision",
+      w.holdUntilCleared === 8,
+      `${w.holdUntilCleared} live enemies counts as resolved at any crew size —`
+      + ` a much smaller fraction of a four-crew wave, and unmeasured`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The crew's half of the economy has ONE owner; the personal half has one each.
+//
+// Invariant 22 already drew this line -- salvage is personal and buys unbounded kit, scrap
+// is shared and buys the bounded fortress -- but the code kept both in one object, which
+// is fine with one operative and silently destructive with two.
+//
+// The failure, reproduced before it was fixed: `applyAll()` recomputes every effect
+// absolutely from its stack counts, and two of those effects write to SHARED objects
+// (`plating` -> trampler.damageScale, `rig` -> repair.rateScale). So a second operative
+// holding zero fortress stacks recomputed them to 1.0 and called it correct. Four hull
+// plates and three repair rigs, deleted by a teammate buying a rifle calibration.
+//
+// What made it vicious is that the STACKS survived. Crew 1's economy still read
+// `plating x4`, so the shop and the build readout kept reporting full plating while the
+// hull took full damage. It would have been filed as "plating feels weak".
+//
+// THE FIX IS NOT AN OWNERSHIP FLAG, and the control case below is here to show why it did
+// not need to be. The collision came from the COUNTS being duplicated, not from the effects
+// being applied twice -- so once every operative reads the same shared count, they all
+// compute `0.85 ** 4` and write the same number, and the absolute recompute is idempotent
+// across the crew. No flag to set wrongly, no "am I the one who applies this" branch.
+console.log("\n112. The fortress track is the crew's; the personal track is each operative's");
+{
+  /** Two operatives over one world, optionally sharing the crew's half. */
+  const twoPurses = (treasury) => {
+    const sim = makeSim();
+    const cam = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 1400);
+    cam.rotation.order = "YXZ";
+    const mate = new Player(cam, sim.world, sim.trampler);
+    sim.crew.add(mate);
+    const shared = {
+      trampler: sim.trampler, repair: sim.repair, horde: sim.horde,
+      director: sim.director, modules: sim.modules, events: sim.events,
+    };
+    // A WEAPON EACH. Handing both `sim.weapon` is refused now, and section 114 says why:
+    // personal upgrades recompute absolutely from stack counts, so two operatives over one
+    // weapon silently wipe each other's kit. The guard caught this helper.
+    const mateWeapon = new Weapon(sim.scene, mate, sim.horde, sim.world, sim.trampler);
+    return {
+      sim,
+      mate,
+      e1: new Economy({ player: sim.player, weapon: sim.weapon, ...shared, treasury }),
+      e2: new Economy({ player: mate, weapon: mateWeapon, ...shared, treasury }),
+    };
+  };
+
+  const fortressState = (sim) => ({
+    plating: sim.trampler.damageScale,
+    rig: sim.repair.rateScale,
+  });
+
+  // ---- THE CONTROL. Separate treasuries still collide, which is what the sharing is for.
+  //
+  // Asserting that the rejected arrangement fails is unusual in a suite, and it is here on
+  // purpose: without it, every check below would pass just as happily if the fortress
+  // effects had simply stopped being applied at all.
+  {
+    const { sim, e1, e2 } = twoPurses(null);
+    e1.stacks.plating = 4;
+    e1.stacks.rig = 3;
+    e1.applyAll();
+    const bought = fortressState(sim);
+    ok("with a purse each, crew 1's refits do land (test is not vacuous)",
+      bought.plating < 1 && bought.rig > 1,
+      `plating ${bought.plating.toFixed(4)}, repair x${bought.rig.toFixed(2)}`);
+
+    e2.stacks.rifle = 1;
+    e2.applyAll();
+    const after = fortressState(sim);
+    ok("but a teammate recomputing their own kit WIPES them — the arrangement this replaced",
+      after.plating !== bought.plating && after.rig !== bought.rig,
+      `plating ${bought.plating.toFixed(4)} -> ${after.plating.toFixed(4)},`
+      + ` repair x${bought.rig.toFixed(2)} -> x${after.rig.toFixed(2)}`);
+    ok("and crew 1 still reads the stacks it thinks it owns, which is why it was silent",
+      e1.stacks.plating === 4 && e1.stacks.rig === 3,
+      `plating x${e1.stacks.plating}, rig x${e1.stacks.rig} — counts intact, effects gone`);
+  }
+
+  // ---- SHARED. The same scenario, holding.
+  {
+    const { sim, e1, e2 } = twoPurses(new Treasury());
+    e1.stacks.plating = 4;
+    e1.stacks.rig = 3;
+    e1.applyAll();
+    const bought = fortressState(sim);
+
+    ok("a fortress refit bought by one operative is READ by the other",
+      e2.stacks.plating === 4 && e2.stacks.rig === 3,
+      `crew 2 reads plating x${e2.stacks.plating}, rig x${e2.stacks.rig}`);
+
+    e2.stacks.rifle = 1;
+    e2.applyAll();
+    const after = fortressState(sim);
+    ok("so a teammate's recompute leaves the fortress exactly where it was",
+      after.plating === bought.plating && after.rig === bought.rig,
+      `plating ${after.plating.toFixed(4)}, repair x${after.rig.toFixed(2)} — unchanged`);
+
+    // The mechanism, stated as an assertion rather than only in a comment: BOTH operatives
+    // still apply the fortress effects. Nothing was gated off.
+    let sawChange = false;
+    for (let i = 0; i < 6; i++) {
+      const before = fortressState(sim);
+      (i % 2 ? e2 : e1).applyAll();
+      const now = fortressState(sim);
+      if (now.plating !== before.plating || now.rig !== before.rig) sawChange = true;
+    }
+    ok("and either of them applying it is idempotent, which is why no owner flag exists",
+      !sawChange && fortressState(sim).plating === bought.plating,
+      `six alternating recomputes, ${sawChange ? "STATE MOVED" : "no change"}`);
+  }
+
+  // ---- the personal half stays separate, which is the other half of invariant 22.
+  {
+    const { sim, e1, e2 } = twoPurses(new Treasury());
+    e1.stacks.rifle = 3;
+    e2.stacks.vitals = 2;
+    ok("personal stacks are per-operative, not pooled",
+      e1.stacks.rifle === 3 && e2.stacks.rifle === 0
+      && e2.stacks.vitals === 2 && e1.stacks.vitals === 0,
+      `crew 1 rifle x${e1.stacks.rifle}/vitals x${e1.stacks.vitals},`
+      + ` crew 2 rifle x${e2.stacks.rifle}/vitals x${e2.stacks.vitals}`);
+
+    e1.salvage = 400;
+    e2.salvage = 25;
+    ok("and so is the personal purse — you cannot spend a teammate's salvage",
+      e1.salvage === 400 && e2.salvage === 25);
+
+    e1.scrap = 250;
+    ok("while the shared purse is one pot, seen from both sides",
+      e2.scrap === 250, `crew 2 reads ${e2.scrap} scrap`);
+    e2.scrap -= 100;
+    ok("and spending it spends the CREW's money, which is what stops one player farming it",
+      e1.scrap === 150, `crew 1 now reads ${e1.scrap} scrap`);
+
+    e1.grantModuleCredit();
+    ok("free module fits are shared too, since a hardpoint is the fortress's",
+      e2.moduleCredits === 1, `crew 2 reads ${e2.moduleCredits} credit`);
+
+    e1.grant(10, 20, "ARRIVED");
+    ok("a road payout splits the way the purses do: scrap to the crew, salvage to whoever",
+      e2.scrap === 170 && e2.salvage === 25 && e1.salvage === 410,
+      `scrap ${e2.scrap} shared, salvage ${e1.salvage} vs ${e2.salvage}`);
+    ok("and the earned ledger follows the same line",
+      e1.earned.scrap === e2.earned.scrap && e1.earned.salvage !== e2.earned.salvage,
+      `earned scrap ${e1.earned.scrap} shared,`
+      + ` salvage ${e1.earned.salvage} vs ${e2.earned.salvage}`);
+  }
+
+  // ---- the shared entries must stay ENUMERABLE, because readers walk and serialise them.
+  //
+  // They are accessors onto the treasury rather than plain values, and a non-enumerable
+  // property would vanish from `Object.keys` and from `JSON.stringify` -- which test 65
+  // uses to report every stack after a reset. That would have read as "the fortress track
+  // does not exist" rather than as a broken descriptor.
+  {
+    const { e1 } = twoPurses(new Treasury());
+    e1.stacks.plating = 2;
+    const keys = Object.keys(e1.stacks);
+    const json = JSON.parse(JSON.stringify(e1.stacks));
+    ok("a shared stack count is enumerable and serialises like a plain field",
+      keys.includes("plating") && keys.includes("rig") && json.plating === 2,
+      `${keys.length} keys, plating serialised as ${json.plating}`);
+    ok("and the shared purse appears in the earned ledger the same way",
+      Object.keys(e1.earned).includes("scrap")
+      && Object.keys(e1.earned).includes("salvage"),
+      `earned keys: ${Object.keys(e1.earned).join(", ")}`);
+  }
+
+  // ---- solo is untouched, which is the acceptance test for the whole change.
+  {
+    const a = makeSim();
+    const b = makeSim();
+    a.economy.stacks.plating = 3;
+    a.economy.scrap = 99;
+    ok("an Economy given no treasury owns a private one, so two sims never share state",
+      b.economy.stacks.plating === 0 && b.economy.scrap === 0,
+      `second sim reads plating x${b.economy.stacks.plating}, ${b.economy.scrap} scrap`);
+    ok("and a solo economy still reverts its own fortress track on reset",
+      (a.economy.reset(), a.economy.stacks.plating === 0 && a.trampler.damageScale === 1),
+      `plating x${a.economy.stacks.plating}, damageScale ${a.trampler.damageScale}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// One corpse pays once: the killer's salvage, and the crew's scrap.
+//
+// Every Economy subscribes to the same kill bus, which made income wrong in BOTH
+// directions the moment there were two operatives:
+//
+//   salvage  paid to every operative for every kill, so four operatives each earned four
+//            times over. Reads as "co-op is generous", not as a bug.
+//   scrap    credited once per operative into the single shared pot, so one kill paid the
+//            crew four times. Same for a resolved wave, which was polled per operative.
+//
+// The fix splits the subscription rather than the arithmetic: the Treasury hooks the bus
+// once for the crew, and each Economy keeps only the personal half behind `causedBy`.
+console.log("\n113. One corpse pays once — the killer's purse, and the crew's");
+{
+  /** N operatives over one world, sharing one Treasury. */
+  const crewOf = (n) => {
+    const sim = makeSim();
+    const treasury = new Treasury({ director: sim.director, events: sim.events });
+    const shared = {
+      trampler: sim.trampler, repair: sim.repair, horde: sim.horde,
+      director: sim.director, modules: sim.modules, events: sim.events, treasury,
+    };
+    // The sim's own economy is replaced, because makeSim built one with a private
+    // treasury and it is still subscribed to the bus -- leaving it in would double-count
+    // the very thing under test.
+    const purses = [new Economy({ player: sim.player, weapon: sim.weapon, ...shared })];
+    for (let i = 1; i < n; i++) {
+      const cam = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 1400);
+      cam.rotation.order = "YXZ";
+      const mate = new Player(cam, sim.world, sim.trampler);
+      sim.crew.add(mate);
+      // A weapon each — see section 114. The guard refuses anything else.
+      const weapon = new Weapon(sim.scene, mate, sim.horde, sim.world, sim.trampler);
+      purses.push(new Economy({ player: mate, weapon, ...shared }));
+    }
+    return { sim, treasury, purses };
+  };
+
+  const chewerRate = CFG.economy.chewer;
+
+  // ---- scrap is credited ONCE, however many operatives are listening.
+  {
+    const one = crewOf(1);
+    const scrapBase = one.treasury.scrap;
+    one.sim.horde.damage(one.sim.horde.spawn(CHEWER), 1e6, one.sim.player);
+    const soloScrap = one.treasury.scrap - scrapBase;
+    ok("a kill pays the crew the configured scrap (test is not vacuous)",
+      Math.abs(soloScrap - chewerRate.scrap) < 1e-9,
+      `${soloScrap} scrap for a chewer, configured ${chewerRate.scrap}`);
+
+    const four = crewOf(4);
+    const before = four.treasury.scrap;
+    four.sim.horde.damage(four.sim.horde.spawn(CHEWER), 1e6, four.sim.player);
+    const crewScrap = four.treasury.scrap - before;
+    ok("and exactly the same with four operatives listening — not four times",
+      Math.abs(crewScrap - soloScrap) < 1e-9,
+      crewScrap === soloScrap
+        ? `${crewScrap} scrap either way`
+        : `PAID ${crewScrap} TO A CREW OF FOUR vs ${soloScrap} SOLO`);
+  }
+
+  // ---- salvage goes to the killer alone.
+  {
+    const { sim, purses } = crewOf(4);
+    const [p1, p2, p3, p4] = purses;
+    sim.horde.damage(sim.horde.spawn(CHEWER), 1e6, p2.player);
+
+    ok("the operative who made the kill is paid",
+      Math.abs(p2.salvage - chewerRate.salvage) < 1e-9,
+      `crew 2 has ${p2.salvage} salvage`);
+    ok("and nobody else is, however many are on the bus",
+      p1.salvage === 0 && p3.salvage === 0 && p4.salvage === 0,
+      `others hold ${[p1, p3, p4].map((p) => p.salvage).join("/")}`);
+    ok("so the crew's total personal income is one kill's worth, not four",
+      Math.abs(purses.reduce((a, p) => a + p.salvage, 0) - chewerRate.salvage) < 1e-9,
+      `${purses.reduce((a, p) => a + p.salvage, 0)} across the crew`);
+  }
+
+  // ---- a resolved wave pays the crew once, even though every operative polls for it.
+  {
+    const { sim, treasury, purses } = crewOf(4);
+    const before = treasury.scrap;
+    sim.director.resolved += 1;
+    // Every operative's update runs, exactly as the frame loop would do it.
+    for (const p of purses) p.update(DT, null);
+    const once = treasury.scrap - before;
+    ok("a resolved wave pays the shared pot (test is not vacuous)", once > 0,
+      `+${once} scrap`);
+
+    const before2 = treasury.scrap;
+    for (const p of purses) p.update(DT, null);
+    ok("and a second pass in the same frame pays nothing, because the counter is the crew's",
+      treasury.scrap === before2, `+${treasury.scrap - before2} on the repeat`);
+
+    // The counter has to advance once per wave, not once per operative-wave, or a crew of
+    // four would burn through the growth curve four times as fast.
+    const beforeNext = treasury.scrap;
+    sim.director.resolved += 1;
+    for (const p of purses) p.update(DT, null);
+    const second = treasury.scrap - beforeNext;
+    ok("the next wave pays the next step of the curve, not the fifth",
+      second > once && second < once * 2,
+      `wave 1 paid ${once}, wave 2 paid ${second} — one step of`
+      + ` ${CFG.economy.waveClearGrowth}, not four`);
+  }
+
+  // ---- and the solo measurement this cost, recorded rather than glossed.
+  //
+  // An emitter kill used to pay personal salvage and now does not. That is a real solo
+  // change riding inside a correctness fix, so here is its size: what a full rack kills
+  // unattended over a minute, in salvage that no longer arrives.
+  {
+    const sim = makeSim();
+    sim.trampler.walking = false;
+    sim.player.dropToGround();
+    const under = sim.trampler.localToWorld(new THREE.Vector3(0, -CFG.trampler.deckHeight, 0));
+    sim.player.position.set(under.x, 1.2, under.z);
+    let placed = 0;
+    for (let i = 0; i < CFG.emitters.max; i++) {
+      if (sim.emitters.deploy(sim.player)) placed++;
+    }
+    ok("a full rack is deployed under the hull (test is not vacuous)",
+      placed === CFG.emitters.max, `${placed} emitters`);
+
+    const killsBefore = sim.horde.killCount;
+    const salvageBefore = sim.economy.salvage;
+    const scrapBefore = sim.economy.scrap;
+    sim.player.position.set(700, 1.2, 700); // out of the fight entirely
+    sim.player.base = null;
+    sim.waves = true;
+    step(sim, 60 * 60);
+    const killed = sim.horde.killCount - killsBefore;
+
+    ok("the emitters really did kill unattended (test is not vacuous)", killed > 0,
+      `${killed} kills over 60 s with nobody present`);
+    ok("and none of it paid a personal purse",
+      sim.economy.salvage === salvageBefore,
+      `salvage still ${salvageBefore}`);
+    ok("while the crew's pot did grow, which is the half invariant 24 protects",
+      sim.economy.scrap > scrapBefore,
+      `${scrapBefore} -> ${sim.economy.scrap.toFixed(0)} scrap —`
+      + ` the solo cost of this change is the salvage those ${killed} kills used to pay`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A weapon belongs to ONE operative, and personal kit is independent because of it.
+//
+// This section is the outcome of an investigation that found nothing to build. Weapon,
+// Grapple and Items were already constructible one-per-operative and hold no shared mutable
+// state, so the per-operative work turned out to be zero lines of plumbing and one guard.
+//
+// The guard is the point. Every personal item recomputes absolutely from its stack count --
+// `rifle` writes `weapon.damageScale`, `trigger` writes `fireRateScale`, `sabot` writes
+// `armourPierce` -- which is correct with one owner and destructive with two. Measured
+// before the guard existed: two operatives over one Weapon, crew 1 buys four rifle
+// calibrations for a damageScale of 2.00, crew 2 recomputes their own unrelated kit, and it
+// drops to 1.00. Four stacks gone, stack counts intact, nothing thrown. The fortress
+// collision exactly, one layer in.
+//
+// The fortress case was fixed by SHARING the counts, because a hull plate genuinely is the
+// crew's. Personal kit is the opposite: it must not be shared, so there is nothing to
+// unify and the only defence is refusing the arrangement. Hence a load failure rather than
+// a control case -- the same move as exporting `isSubmerged` and `causedBy`.
+console.log("\n114. A weapon has one operative, and personal kit is theirs alone");
+{
+  /** A second operative with a complete personal stack of their own. */
+  const mateOf = (sim) => {
+    const cam = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 1400);
+    cam.rotation.order = "YXZ";
+    const mate = new Player(cam, sim.world, sim.trampler);
+    sim.crew.add(mate);
+    const weapon = new Weapon(sim.scene, mate, sim.horde, sim.world, sim.trampler);
+    weapon.events = sim.events;
+    const grapple = new Grapple(sim.scene, mate, sim.trampler, sim.world);
+    mate.grapple = grapple;
+    const repair = new Repair(mate, sim.trampler, sim.horde, sim.crew);
+    const economy = new Economy({
+      player: mate, trampler: sim.trampler, weapon, repair, horde: sim.horde,
+      director: sim.director, modules: sim.modules, events: sim.events,
+      treasury: sim.economy.treasury,
+    });
+    const items = new Items({
+      economy, player: mate, trampler: sim.trampler, weapon, horde: sim.horde,
+      repair, events: sim.events,
+    });
+    return { mate, weapon, grapple, repair, economy, items };
+  };
+
+  // ---- THE GUARD. A weapon that belongs to somebody else is refused, not tolerated.
+  {
+    const sim = makeSim();
+    const cam = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 1400);
+    cam.rotation.order = "YXZ";
+    const mate = new Player(cam, sim.world, sim.trampler);
+
+    let economyThrew = false;
+    try {
+      new Economy({
+        player: mate, trampler: sim.trampler, weapon: sim.weapon, repair: sim.repair,
+        horde: sim.horde, director: sim.director, modules: sim.modules, events: sim.events,
+      });
+    } catch {
+      economyThrew = true;
+    }
+    ok("an Economy handed somebody else's weapon refuses to be built",
+      economyThrew, economyThrew ? "threw at construction" : "ACCEPTED SILENTLY");
+
+    let itemsThrew = false;
+    try {
+      new Items({
+        economy: sim.economy, player: mate, trampler: sim.trampler, weapon: sim.weapon,
+        horde: sim.horde, repair: sim.repair, events: sim.events,
+      });
+    } catch {
+      itemsThrew = true;
+    }
+    ok("and so does an Items runtime, which is a SECOND writer to the same field",
+      itemsThrew, itemsThrew ? "threw at construction" : "ACCEPTED SILENTLY");
+
+    // The guard must not fire on the legitimate arrangement, or every existing sim breaks.
+    ok("while the operative's own weapon is accepted, so nothing legitimate is refused",
+      (sim.weapon.assertOperative(sim.player), true)
+      && sim.weapon.player === sim.player, "own weapon passes");
+  }
+
+  // ---- INDEPENDENCE, which is what the guard buys.
+  {
+    const sim = makeSim();
+    const m = mateOf(sim);
+
+    sim.economy.stacks.rifle = 4;
+    sim.economy.stacks.sabot = 2;
+    sim.economy.applyAll();
+    m.economy.stacks.rifle = 1;
+    m.economy.applyAll();
+
+    ok("two operatives hold different weapon damage at the same instant",
+      Math.abs(sim.weapon.damageScale - 2) < 1e-9
+      && Math.abs(m.weapon.damageScale - 1.25) < 1e-9,
+      `crew 1 x${sim.weapon.damageScale.toFixed(2)}, crew 2 x${m.weapon.damageScale.toFixed(2)}`);
+    ok("and tooling does not leak either — armour pierce is bought, not shared",
+      sim.weapon.armourPierce > 0 && m.weapon.armourPierce === 0,
+      `crew 1 pierces ${sim.weapon.armourPierce}, crew 2 pierces ${m.weapon.armourPierce}`);
+    // Max health is written on the PLAYER rather than the weapon, so it was never at risk
+    // from the shared-weapon bug -- but asserting it needs the item actually bought by one
+    // of them. The first version of this compared `maxHp !== maxHp || stacks === stacks`,
+    // which is a tautology: both operatives held 100 hp and the fallback clause compared a
+    // value to itself, so it passed while measuring nothing.
+    sim.economy.stacks.vitals = 2;
+    sim.economy.applyAll();
+    ok("nor does max health, which is written on the operative rather than the weapon",
+      sim.player.maxHp > m.mate.maxHp && m.mate.maxHp === CFG.combat.playerHp,
+      `crew 1 bought x${sim.economy.stacks.vitals} vitals for ${sim.player.maxHp} hp,`
+      + ` crew 2 still on the base ${m.mate.maxHp}`);
+  }
+
+  // ---- and the CONDITIONAL half, which is the sharper case.
+  //
+  // `Items.update` clears and rebuilds `weapon.damageBonus` from current conditions every
+  // frame. Two runtimes over one weapon would fight over that field every frame, and a
+  // position bonus is exactly the kind of thing that would then apply to the wrong person.
+  {
+    const sim = makeSim();
+    sim.trampler.walking = false;
+    const m = mateOf(sim);
+
+    // Both operatives carry the under-hull item; only one of them is under the hull.
+    sim.economy.stacks.understudy = 3;
+    sim.economy.applyAll();
+    m.economy.stacks.understudy = 3;
+    m.economy.applyAll();
+
+    const under = sim.trampler.localToWorld(
+      new THREE.Vector3(0, -CFG.trampler.deckHeight, 0));
+    sim.player.position.set(under.x, 1.2, under.z);
+    sim.player.base = null;
+    m.mate.position.set(700, 1.2, 700);
+    m.mate.base = null;
+
+    sim.items.update(DT);
+    m.items.update(DT);
+
+    ok("both operatives carry the same conditional item (test is not vacuous)",
+      sim.economy.stacks.understudy === m.economy.stacks.understudy
+      && sim.economy.stacks.understudy > 0,
+      `x${sim.economy.stacks.understudy} each`);
+    ok("only the one meeting the condition is paid for it",
+      sim.weapon.damageBonus > 0 && m.weapon.damageBonus === 0,
+      `crew 1 +${(sim.weapon.damageBonus * 100).toFixed(0)}%`
+      + ` [${sim.items.reasons.join(", ")}], crew 2 +${(m.weapon.damageBonus * 100).toFixed(0)}%`
+      + ` [${m.items.reasons.join(", ") || "nothing"}]`);
+    ok("and the buff strip each of them reads names their OWN reasons",
+      sim.items.reasons.length > 0 && m.items.reasons.length === 0,
+      `crew 1 [${sim.items.reasons.join(", ")}] vs crew 2 [${m.items.reasons.join(", ")}]`);
+  }
+
+  // ---- the winch is already per-operative, and was before any of this.
+  {
+    const sim = makeSim();
+    const m = mateOf(sim);
+    ok("each operative has their own winch, and points at it",
+      m.grapple !== sim.grapple
+      && sim.player.grapple === sim.grapple && m.mate.grapple === m.grapple,
+      "distinct grapples, each owned by its operative");
+    // Anchors are stored hull-local per grapple, so two ropes cannot share an anchor.
+    ok("and its anchor is its own, so two ropes cannot converge on one point",
+      sim.grapple.anchorLocal !== m.grapple.anchorLocal,
+      "separate anchor vectors");
+  }
+
+  // ---- a shot fired by one operative uses THEIR multipliers, not the other's.
+  //
+  // The end-to-end version of everything above, through the real hitscan path: two
+  // operatives with different damage, firing at identical targets, must do different damage.
+  {
+    const sim = makeSim();
+    sim.trampler.walking = false;
+    const m = mateOf(sim);
+    sim.economy.stacks.rifle = 4;
+    sim.economy.applyAll();
+
+    const shootAt = (who, weapon) => {
+      const spot = sim.trampler.localToWorld(
+        new THREE.Vector3(0, -CFG.trampler.deckHeight, -60));
+      const e = sim.horde.spawn(CHEWER);
+      e.x = spot.x;
+      e.y = 0.8;
+      e.z = spot.z;
+      who.position.set(spot.x, 1.2, spot.z + 8);
+      who.base = null;
+      const before = e.hp;
+      const origin = new THREE.Vector3(who.position.x, 1.5, who.position.z);
+      const dir = new THREE.Vector3(e.x - origin.x, e.y - origin.y, e.z - origin.z).normalize();
+      weapon.shootFrom(origin, dir, CFG.combat.weapon, null, who);
+      return before - e.hp;
+    };
+
+    const strongHit = shootAt(sim.player, sim.weapon);
+    const plainHit = shootAt(m.mate, m.weapon);
+    ok("both shots connected (test is not vacuous)", strongHit > 0 && plainHit > 0,
+      `${strongHit.toFixed(1)} and ${plainHit.toFixed(1)} damage`);
+    ok("and the upgraded operative hits harder, through the one shared hitscan path",
+      Math.abs(strongHit / plainHit - 2) < 1e-6,
+      `x${(strongHit / plainHit).toFixed(2)} — ${strongHit.toFixed(1)} vs`
+      + ` ${plainHit.toFixed(1)} from the same weapon profile`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The netcode's founding claim, measured rather than reasoned about.
+//
+// src/net.js sends a crewmate's pose in HULL-LOCAL space when they are aboard, and its
+// header argues that this is worth an order of magnitude: a world-space pose 120 ms old
+// is stale by the HULL's speed, while a hull-local one is stale only by the walker's own
+// speed, because the receiver already knows the hull's current transform.
+//
+// That argument was written down and never checked. It was going to be checked by eye,
+// with two browser tabs, watching whether a box drifts astern — which would have answered
+// "is it obviously broken" and not "how big is the error". The load-bearing half needs no
+// renderer at all: it is entirely a question about transforms, which is exactly what this
+// harness exists to measure.
+//
+// So this is the two-tab observation, as a number, permanently. What it CANNOT cover is
+// the drawing half — three.js reparenting, visibility, materials — and that still wants
+// eyes on a screen once. But if the arithmetic here were wrong, the wire format would be
+// wrong, and no amount of looking at boxes would say by how much.
+console.log("\n115. A hull-local pose does not skate; a world-space one does");
+{
+  const sim = makeSim();
+  const t = sim.trampler;
+
+  // A crewmate standing still amidships on the deck, in the frame net.js sends.
+  const localPose = new THREE.Vector3(3.0, 1.2, 2.0);
+  const worldPoseAtSend = t.localToWorld(localPose.clone());
+
+  // One interpolation delay of hull travel. CFG.net.interpDelayMs is the real knob the
+  // client renders behind live, so the drift being measured is the drift a player sees.
+  const delayFrames = Math.round((CFG.net.interpDelayMs / 1000) * CFG.loop.stepHz);
+  ok("the delay is a real number of frames (test is not vacuous)", delayFrames >= 6,
+    `${CFG.net.interpDelayMs} ms is ${delayFrames} frames at ${CFG.loop.stepHz} Hz`);
+
+  const hullBefore = t.group.position.clone();
+  step(sim, delayFrames);
+  const hullTravel = t.group.position.distanceTo(hullBefore);
+
+  ok("the hull actually moved during the delay (test is not vacuous)", hullTravel > 0.4,
+    `hull travelled ${hullTravel.toFixed(2)} m in ${delayFrames} frames`);
+  ok("and it turned as well, so this is not a straight-line special case",
+    Math.abs(t.yawDelta) > 0 || Math.abs(t.yawRate) > 0,
+    `yaw rate ${t.yawRate.toFixed(4)} rad/s`);
+
+  // THE TWO READINGS. Both are "where would the receiver DRAW this crewmate now, given a
+  // pose that is one interpolation delay old", and they differ only in which frame the
+  // pose was authored in.
+  //
+  // Hull-local: reparented under trampler.group, so three.js applies the hull's CURRENT
+  // transform. Reproduced here as localToWorld against the transform after the step.
+  const drawnFromLocal = t.localToWorld(localPose.clone());
+  // World-space: the stale coordinates are drawn as-is, because there is nothing to
+  // reinterpret them against.
+  const drawnFromWorld = worldPoseAtSend.clone();
+
+  // Truth: the crewmate never moved relative to the deck, so they are wherever that deck
+  // point is now.
+  const truth = t.localToWorld(localPose.clone());
+
+  const localErr = drawnFromLocal.distanceTo(truth);
+  const worldErr = drawnFromWorld.distanceTo(truth);
+
+  ok("a hull-local pose lands exactly where the crewmate actually is", localErr < 0.01,
+    `${(localErr * 100).toFixed(2)} cm off after ${CFG.net.interpDelayMs} ms`);
+  ok("a world-space pose is stale by the HULL's travel, which is the skate",
+    worldErr > 0.4,
+    `${(worldErr * 100).toFixed(1)} cm off — this is what the relay would look like`);
+  ok("so choosing the frame is worth at least an order of magnitude",
+    worldErr > localErr * 10,
+    `world ${(worldErr * 100).toFixed(1)} cm vs local ${(localErr * 100).toFixed(2)} cm`);
+
+  // AND THE HONEST OTHER HALF, measured with a crewmate who is actually WALKING.
+  //
+  // The 0 cm above is a standing crewmate, where the frame choice removes the whole
+  // error. A moving one keeps a residual — their own displacement relative to the deck
+  // over the same window — and that residual is what the design accepts.
+  //
+  // Measured against the real controller rather than by arithmetic, because the first
+  // version of this block did the arithmetic and compared it against the STANDING
+  // world-space figure. Two different scenarios, so the comparison was meaningless and
+  // reported a failure against a design that is fine. Like with like: same player, same
+  // behaviour, same window, only the frame differs.
+  //
+  // AND THE CLAIM IS A PROPERTY, NOT A SINGLE COMPARISON. This is the second thing the
+  // first version got wrong, and it is the more interesting of the two.
+  //
+  // Asserting "hull-local beats world-space for a walking crewmate" FAILED, correctly:
+  // measured, the walker's own 53 cm across the deck happened to run against the hull's
+  // 52 cm, so their net world displacement was 12 cm and the stale WORLD pose was
+  // accidentally the more accurate of the two. Luck, and it would reverse if they turned
+  // round.
+  //
+  // So a single comparison is the wrong instrument. The real architectural claim is about
+  // what each error DEPENDS on:
+  //
+  //   hull-local error = the walker's own deck-relative travel. Bounded by player speed,
+  //                      and INDEPENDENT of how fast the hull is moving.
+  //   world-space error = hull travel + own travel, composed as vectors. Contains a term
+  //                      nobody controls, and it grows with hull speed.
+  //
+  // That is testable without luck: run the same walk twice, once with the hull moving and
+  // once with it stopped, and see which error changes.
+  const measureWalk = (hullMoving) => {
+    const s2 = makeSim();
+    const t2 = s2.trampler;
+    t2.walking = hullMoving;
+    t2.turning = hullMoving;
+    s2.player.respawnOnDeck();
+    step(s2, 10); // settle onto the deck before anything is captured
+
+    // Pinned, so both runs walk the same way across the deck rather than whichever way
+    // the respawn happened to leave them facing. An orientation a test depends on has to
+    // be set, not inherited.
+    s2.player.yaw = 0;
+
+    const localAtSend = t2.worldToLocal(s2.player.position.clone());
+    const worldAtSend = s2.player.position.clone();
+
+    s2.input.keys.add("KeyW");
+    step(s2, delayFrames);
+    s2.input.keys.delete("KeyW");
+
+    const truth = s2.player.position.clone();
+    const localNow = t2.worldToLocal(truth.clone());
+    return {
+      // Travel across the DECK, which is what the residual is made of. Measured in hull
+      // space on purpose: world travel confounds it with the hull's own motion, which is
+      // exactly the mistake this block is correcting.
+      deckTravel: localNow.distanceTo(localAtSend),
+      localErr: t2.localToWorld(localAtSend.clone()).distanceTo(truth),
+      worldErr: worldAtSend.distanceTo(truth),
+      hullTravel: hullMoving ? t2.linVel.length() * (delayFrames / CFG.loop.stepHz) : 0,
+    };
+  };
+
+  const moving = measureWalk(true);
+  const stopped = measureWalk(false);
+
+  ok("the crewmate actually walked across the deck (test is not vacuous)",
+    moving.deckTravel > 0.3 && stopped.deckTravel > 0.3,
+    `${(moving.deckTravel * 100).toFixed(0)} cm moving, `
+    + `${(stopped.deckTravel * 100).toFixed(0)} cm stopped`);
+  ok("and both runs walked the same distance across the deck, so they are comparable",
+    Math.abs(moving.deckTravel - stopped.deckTravel) < 0.05,
+    `${(Math.abs(moving.deckTravel - stopped.deckTravel) * 100).toFixed(1)} cm apart`);
+
+  ok("a walking crewmate leaves a residual — the frame choice is not free",
+    moving.localErr > 0.05,
+    `${(moving.localErr * 100).toFixed(0)} cm, which is their own travel across the deck`);
+
+  // THE PROPERTY. Hull-local error is the same whether the fortress is walking or parked;
+  // world-space error is not. That is the whole reason to choose the frame, and unlike a
+  // single distance comparison it cannot be flipped by which way somebody happened to face.
+  ok("HULL-LOCAL error does not care whether the fortress is moving",
+    Math.abs(moving.localErr - stopped.localErr) < 0.05,
+    `${(moving.localErr * 100).toFixed(0)} cm moving vs `
+    + `${(stopped.localErr * 100).toFixed(0)} cm parked`);
+  ok("WORLD-SPACE error does care, which is the term the frame choice removes",
+    Math.abs(moving.worldErr - stopped.worldErr) > 0.2,
+    `${(moving.worldErr * 100).toFixed(0)} cm moving vs `
+    + `${(stopped.worldErr * 100).toFixed(0)} cm parked`);
+
+  // THE NUMBER net.js GETS WRONG, pinned so it cannot drift back.
+  //
+  // Its header says the hull-local residual is "about 5 cm". At CFG.player.walkSpeed of
+  // 7.0 m/s across CFG.net.interpDelayMs it is an order of magnitude more than that, and
+  // sprinting is worse. The frame choice is still right, because it removes a term that
+  // would otherwise be ADDED to this one; what is wrong is the advertised size of what
+  // remains, and "5 cm" invites someone to treat a remote position as exact.
+  const walkResidual = CFG.player.walkSpeed * (CFG.net.interpDelayMs / 1000);
+  ok("and the residual is much larger than net.js's comment claims",
+    walkResidual > 0.5,
+    `${(walkResidual * 100).toFixed(0)} cm at walk speed, ${(CFG.player.sprintSpeed
+      * (CFG.net.interpDelayMs / 1000) * 100).toFixed(0)} cm sprinting — not "about 5 cm"`);
+  ok("and the measured residual agrees with that arithmetic",
+    Math.abs(moving.localErr - walkResidual) < 0.35,
+    `measured ${(moving.localErr * 100).toFixed(0)} cm vs predicted `
+    + `${(walkResidual * 100).toFixed(0)} cm`);
+}
+
+// ---------------------------------------------------------------------------
+// The horde's walk cycle. Presentation, and asserted here for the same reason the aim
+// readout lives in weapon.js rather than hud.js: it is decided in a simulation module,
+// so it CAN be tested, and the three things most likely to be wrong about it are all
+// invisible to inspection.
+//
+// A rig where nothing got classified animates nothing and reads as perfectly correct in
+// source -- the chewer and burrower legitimately have no limbs, so "zero limbs" is not
+// by itself a fault and cannot be used as the alarm.
+//
+// A displacement large enough to pull the drawn body off its hit box breaks invariant 8
+// quietly, because the shot still lands on the body mass and only the extremity lies
+// about where it is. The first version of the rig did exactly this: the climber's
+// forward-pointing forelimbs were classified as legs, which shoved them 18 cm further
+// forward and nearly doubled an overhang that already existed, on the one type whose job
+// is to be shot before it boards.
+//
+// And a phase drawn from a seeded stream would be an invariant 21 violation that no
+// amount of looking at the screen would ever reveal.
+//
+// `node tools/gait-extents.mjs` prints the full table. This pins what must not drift.
+console.log("\n116. The horde's walk cycle moves limbs without leaving the hit box");
+{
+  const sim = makeSim();
+  const { horde } = sim;
+  const gait = CFG.enemies.gait;
+  const pad = CFG.combat.weapon.hitPad;
+
+  let typesWithLimbs = 0;
+  let unbalanced = 0;
+  let deadPivots = 0;
+  let worstAdded = 0;
+  let worstWhere = "";
+  let missingAttrs = 0;
+
+  for (let type = 0; type < ENEMY_TYPE_KEYS.length; type++) {
+    const geo = horde.meshes[type].geometry;
+    const rig = geo.attributes.aRig;
+    const anim = geo.attributes.aAnim;
+    if (!rig || !anim) { missingAttrs++; continue; }
+
+    const pos = geo.attributes.position;
+    let nA = 0;
+    let nB = 0;
+    // The largest gap between a limb vertex and the pivot it hangs from. If this is
+    // zero the swing term is multiplied by zero and the limb is decoratively classified
+    // and completely still -- which looks exactly like a working rig.
+    let deepestHang = 0;
+
+    const stat = { x: 0, y: 0, z: 0 };
+    const anim3 = { x: 0, y: 0, z: 0 };
+
+    for (let i = 0; i < pos.count; i++) {
+      const px = pos.getX(i);
+      const py = pos.getY(i);
+      const pz = pos.getZ(i);
+      stat.x = Math.max(stat.x, Math.abs(px));
+      stat.y = Math.max(stat.y, Math.abs(py));
+      stat.z = Math.max(stat.z, Math.abs(pz));
+
+      const code = rig.getX(i);
+      const pivot = rig.getY(i);
+      if (code > 1.5) nB++; else if (code > 0.5) nA++;
+
+      const limb = code > 0.5 ? 1 : 0;
+      const dir = 1 - 2 * (code > 1.5 ? 1 : 0);
+      const hang = Math.min(py - pivot, 0);
+      if (limb) deepestHang = Math.max(deepestHang, -hang);
+
+      // The vertex shader, replicated. Swept across a whole phase cycle at FULL
+      // amplitude, which is the worst case rather than one instant -- the trap this
+      // suite has been caught by three times.
+      for (let s = 0; s < 180; s++) {
+        const ph = (s / 180) * Math.PI * 2;
+        const bob = Math.sin(ph * 2) * gait.bob;
+        const sway = Math.sin(ph) * gait.sway;
+        const c = Math.cos(sway);
+        const sn = Math.sin(sway);
+        const tx = c * px + sn * pz;
+        const ty = py + bob;
+        const tz = -sn * px + c * pz
+          + Math.sin(ph) * gait.swing * limb * dir * hang;
+        anim3.x = Math.max(anim3.x, Math.abs(tx));
+        anim3.y = Math.max(anim3.y, Math.abs(ty));
+        anim3.z = Math.max(anim3.z, Math.abs(tz));
+      }
+    }
+
+    if (nA > 0 || nB > 0) {
+      typesWithLimbs++;
+      // A left side and a right side must carry the same number of vertices. An
+      // imbalance means one side was miscoded, and the result is a limp -- which is
+      // subtle enough on one body in a crowd of four hundred to never get reported.
+      if (nA !== nB) unbalanced++;
+      if (deepestHang < 1e-6) deadPivots++;
+    }
+
+    for (const axis of ["x", "y", "z"]) {
+      const added = anim3[axis] - stat[axis];
+      if (added > worstAdded) {
+        worstAdded = added;
+        worstWhere = `${ENEMY_TYPE_KEYS[type]} ${axis}`;
+      }
+    }
+  }
+
+  ok("every type carries both the rig and the per-instance gait attribute",
+    missingAttrs === 0, `${missingAttrs} missing`);
+  // Three, and the three WITHOUT limbs are each deliberate: a chewer's only appendages
+  // are mandibles, a burrower is a segmented worm, and a climber's forelimbs point
+  // forward, so the hang-driven swing is the wrong rule for all three. There is no
+  // headroom in this bound on purpose -- if a silhouette loses its legs, that is a thing
+  // to be told about rather than absorbed.
+  ok("limbs were actually classified on the types that have them (not vacuous)",
+    typesWithLimbs >= 3,
+    `${typesWithLimbs} of ${ENEMY_TYPE_KEYS.length} types — the bulwark, sapper and`
+    + ` titan walk on legs; the chewer, burrower and climber have none to swing`);
+  ok("left and right carry the same vertex count, so nothing limps",
+    unbalanced === 0, `${unbalanced} unbalanced`);
+  ok("and every limb hangs BELOW its pivot, or the swing multiplies by zero",
+    deadPivots === 0, `${deadPivots} limbs with a dead pivot`);
+
+  // The bound is 0.15 m and it is chosen by the failure it catches, not by taste: the
+  // measured worst across all six types is 0.099 m, and the climber mistake this is
+  // guarding against measured 0.182 m. Anything between leaves room for a silhouette
+  // tweak without leaving room for classifying a forward-pointing arm as a leg.
+  ok("no type's silhouette is pulled far off its hit box by the animation",
+    worstAdded < 0.15,
+    `worst ${worstAdded.toFixed(3)} m at ${worstWhere}, against a measured 0.099 m`
+    + ` and 0.182 m for the mistake this bound exists to catch`);
+
+  // Phase must not come from the seeded stream, and the cheap proof is that clear()
+  // re-seeds everything stochastic and cannot touch this.
+  const before = horde.pool.slice(0, 8).map((e) => e.gaitPhase);
+  horde.clear();
+  const after = horde.pool.slice(0, 8).map((e) => e.gaitPhase);
+  ok("gait phase survives a clear, so it is not drawn from a seeded stream",
+    before.every((p, i) => p === after[i]),
+    `[${before.slice(0, 3).map((p) => p.toFixed(2)).join(", ")}…] unchanged`);
+
+  let closest = Infinity;
+  for (let i = 1; i < 64; i++) {
+    let d = Math.abs(horde.pool[i].gaitPhase - horde.pool[i - 1].gaitPhase);
+    if (d > Math.PI) d = Math.PI * 2 - d;
+    closest = Math.min(closest, d);
+  }
+  ok("adjacent pool slots are far apart in phase, so a batch of spawns does not march",
+    closest > 1.0,
+    `closest adjacent pair ${closest.toFixed(2)} rad apart`);
+
+  // And the behavioural half: amplitude has to follow what the body is actually doing.
+  //
+  // The latched body is produced by the real fight rather than by assigning the flag,
+  // and that is not "waiting for a coincidence" -- chewers reaching legs and holding on
+  // is the deterministic outcome of invariant 18b, not a timing accident. Assigning
+  // `latched` by hand would be worse than slow: the AI owns that flag and would clear it
+  // inside the same update, so the assertion would be measuring the assignment rather
+  // than the mechanism.
+  for (let i = 0; i < 20; i++) horde.spawn(CHEWER);
+  step(sim, 400);
+
+  const arr = horde.animArrays[CHEWER];
+  let latchedAmp = null;
+  let movingAmp = 0;
+  let slot = 0;
+  for (const e of horde.pool) {
+    if (!e.alive || e.state === ENEMY_STATE.BURROWED) continue;
+    if (e.type !== CHEWER) continue;
+    const amp = arr[slot * 2 + 1];
+    if (e.latched) latchedAmp = amp;
+    else movingAmp = Math.max(movingAmp, amp);
+    slot++;
+  }
+
+  ok("a body is genuinely latched and another is genuinely moving (not vacuous)",
+    latchedAmp !== null && movingAmp > 0,
+    `latched amp ${latchedAmp}, fastest free amp ${movingAmp.toFixed(2)}`);
+  ok("a latched body's legs stop dead, because it is riding rather than walking",
+    latchedAmp === 0,
+    `amp ${latchedAmp} — a fixed-amplitude cycle would pedal on the spot under the hull`);
+  ok("while a body crossing the sand is animated in proportion to its speed",
+    movingAmp > 0 && movingAmp <= 1,
+    `amp ${movingAmp.toFixed(2)}`);
+}
+
+// ---------------------------------------------------------------------------
+// The wire format, tested as arithmetic rather than over a socket.
+//
+// This is the reason src/snapshot.js is a module in src/ and not code inside net.js. Every
+// failure mode of a codec is SILENT: a field written as int16 and read as uint16 does not
+// throw, it reports a fortress 600 metres away; a scale of 10 where 100 was meant loses a
+// decimal place in one coordinate and nowhere else. None of that is visible by inspection
+// and none of it is reachable from a browser-only module.
+console.log("\n117. The snapshot round-trips, and says so when it cannot");
+{
+  // A state with every field set to something distinctive, so a field read from the wrong
+  // offset lands on a value that cannot be mistaken for the right one. Deliberately not
+  // round numbers: 0 and 1 survive almost any offset mistake.
+  const sent = {
+    tick: 123456,
+    elapsedMs: 754321,
+    resetId: 37,
+    hullX: 142.37,
+    hullZ: -83.91,
+    hullYaw: 2.4711,
+    gait: 918.2734,
+    reactorHp: 588,
+    driveScale: 1.184,
+    turnScale: 1.402,
+    hullBits: packHullBits({
+      walking: true, turning: false, destroyed: false, immobilised: true,
+    }),
+    wave: 4,
+    resolved: 1301,
+    phaseTimer: 12.34,
+    arcOffset: 5.9012,
+    phaseBits: packPhaseBits({
+      phase: "engaged", runPhase: "choosing", calledEarly: true, bossLeg: false,
+    }),
+    runLeg: 3,
+    threatScale: 1.237,
+    extraCount: 4,
+    fogScale: 0.813,
+    speedScale: 1.164,
+    treasuryScrap: 287.375,
+    treasuryEarnedScrap: 914.625,
+    moduleCredits: 2,
+    hordeKills: 1203,
+    hordeDeaths: 1231,
+    lastDeathX: -17.43,
+    lastDeathY: 2.19,
+    lastDeathZ: 81.27,
+    lastDeathType: 4,
+    lastDeathBits: 1,
+    legHp: [120, 0, 47, 120, 99, 3],
+  };
+
+  const { buffer, clamped } = encode(sent);
+  ok("nothing had to be clamped for a legitimate state", clamped.length === 0,
+    clamped.length ? JSON.stringify(clamped[0]) : "all fields fit their widths");
+
+  const got = decode(buffer);
+
+  // SIZE, asserted rather than printed. A snapshot goes to every client 20 times a
+  // second, so "it grew a bit" is the failure that is invisible until it is a bandwidth
+  // problem. The number is small on purpose: slice 1 carries the hull and the director,
+  // and the horde is what will actually cost something.
+  // Derived from the format rather than typed in, so adding a section moves the number
+  // instead of breaking the assertion. The earlier version hard-coded `< 64` and duly failed
+  // the moment the operative section landed — a bound that had to be edited every slice is a
+  // bound that teaches nothing.
+  const bytes = buffer.byteLength;
+  const predicted = snapshotBytes(sent);
+  ok("the fixed part of a snapshot is the size the format predicts", bytes === predicted,
+    `${bytes} bytes -> ${(bytes * CFG.net.sendHz / 1024).toFixed(2)} KiB/s per client`);
+  ok("and it is small enough that the fixed cost is irrelevant", bytes < 128,
+    `${bytes} B: hull, director, run and the leg array`);
+  ok("so four clients cost almost nothing before the horde is counted",
+    bytes * CFG.net.sendHz * 4 < 16384,
+    `${(bytes * CFG.net.sendHz * 4 / 1024).toFixed(2)} KiB/s for a full crew`);
+
+  // EVERY FIELD, checked against the format's OWN stated tolerance rather than against
+  // numbers typed in here. A test that carries its own idea of the precision is a test
+  // that agrees with whoever wrote it; this one disagrees with the codec if the codec is
+  // wrong.
+  let worstField = "";
+  let worstRatio = 0;
+  for (const [key, kind] of LAYOUT.BODY) {
+    const tol = toleranceOf(kind, sent[key]);
+    const err = Math.abs(got[key] - sent[key]);
+    // An angle may come back on the other side of the wrap, which is the same angle.
+    const wrapped = kind === "angle"
+      ? Math.min(err, Math.abs(err - Math.PI * 2))
+      : err;
+    const ratio = tol > 0 ? wrapped / tol : (wrapped > 0 ? Infinity : 0);
+    if (ratio > worstRatio) {
+      worstRatio = ratio;
+      worstField = `${key} (${kind}): off by ${wrapped.toExponential(2)}, tolerance ${tol}`;
+    }
+  }
+  ok("every body field round-trips inside its own declared tolerance", worstRatio <= 1,
+    worstField || "all exact");
+
+  ok("the leg array round-trips, length and all",
+    got.legHp.length === 6 && got.legHp.every((v, i) => v === sent.legHp[i]),
+    `[${got.legHp.join(", ")}]`);
+
+  // The bit fields, through their own helpers. Packed indices are the one part of the
+  // format where an off-by-one is silent AND plausible — "engaged" and "held" are adjacent.
+  const hb = unpackHullBits(got.hullBits);
+  ok("hull flags survive, including the ones that are false",
+    hb.walking === true && hb.turning === false
+    && hb.destroyed === false && hb.immobilised === true,
+    `walking ${hb.walking}, turning ${hb.turning}, immobilised ${hb.immobilised}`);
+  const pb = unpackPhaseBits(got.phaseBits);
+  ok("both phases and both flags share one byte without colliding",
+    pb.phase === "engaged" && pb.runPhase === "choosing"
+    && pb.calledEarly === true && pb.bossLeg === false,
+    `${pb.phase} / ${pb.runPhase}, early ${pb.calledEarly}, boss ${pb.bossLeg}`);
+
+  // EVERY phase index, not just the one above. The packing gives the director 3 bits and
+  // the run 2, and a list that outgrew its bit width would wrap onto another phase — which
+  // reads as the game deciding it is in a different part of the run.
+  let phasesOk = true;
+  for (const p of WIRE_PHASES) {
+    for (const r of WIRE_RUN_PHASES) {
+      const round = unpackPhaseBits(packPhaseBits({
+        phase: p, runPhase: r, calledEarly: false, bossLeg: true,
+      }));
+      if (round.phase !== p || round.runPhase !== r || round.bossLeg !== true) phasesOk = false;
+    }
+  }
+  ok("every phase pairing round-trips, so neither list has outgrown its bits", phasesOk,
+    `${WIRE_PHASES.length} director phases x ${WIRE_RUN_PHASES.length} run phases`);
+
+  // THE THREE REFUSALS, each named. A socket that says "bad packet" for a stale browser
+  // tab sends someone to check their network, which is the refit terminal's lesson.
+  const bad = (fn) => {
+    try {
+      fn();
+      return null;
+    } catch (err) {
+      return err;
+    }
+  };
+
+  const wrongVersion = new Uint8Array(buffer.slice(0));
+  wrongVersion[0] = PROTOCOL_VERSION + 7;
+  const vErr = bad(() => decode(wrongVersion.buffer));
+  ok("a protocol mismatch refuses, and names itself", vErr?.cause === "version",
+    vErr ? vErr.message.slice(0, 72) : "it PARSED, which is the dangerous outcome");
+
+  const wrongKind = new Uint8Array(buffer.slice(0));
+  wrongKind[1] = 99;
+  const kErr = bad(() => decode(wrongKind.buffer));
+  ok("an unknown message kind refuses separately from a version mismatch",
+    kErr?.cause === "kind", kErr ? kErr.message.slice(0, 64) : "it PARSED");
+
+  const truncated = buffer.slice(0, buffer.byteLength - 3);
+  const tErr = bad(() => decode(truncated));
+  ok("a truncated buffer refuses rather than reading past its end",
+    tErr?.cause === "truncated", tErr ? tErr.message.slice(0, 64) : "it PARSED");
+
+  const trailing = new ArrayBuffer(buffer.byteLength + 2);
+  new Uint8Array(trailing).set(new Uint8Array(buffer));
+  const lErr = bad(() => decode(trailing));
+  ok("trailing bytes refuse too, which is the guard on editing the layout",
+    lErr?.cause === "layout", lErr ? lErr.message.slice(0, 64) : "it PARSED");
+
+  // CLAMPING IS REPORTED, NOT SILENT. Invariant 31's dune reached inside the patrol ring
+  // because arithmetic was trusted instead of asserted; a coordinate that quietly saturates
+  // is the same mistake on a wire.
+  const tooFar = encode({ ...sent, hullX: 900 });
+  ok("a value that does not fit its field is reported rather than saturating quietly",
+    tooFar.clamped.length === 1 && tooFar.clamped[0].kind === "metres",
+    tooFar.clamped.length ? `${tooFar.clamped[0].kind} at ${tooFar.clamped[0].value}` : "silent");
+
+  // NaN IS NOT A COORDINATE. Invariant 16 forbids it anywhere, and a single NaN arriving
+  // from a peer would otherwise be broadcast to everyone.
+  const nan = encode({ ...sent, hullX: NaN, gait: NaN });
+  const nanBack = decode(nan.buffer);
+  ok("NaN is neutralised at the boundary, not forwarded",
+    Number.isFinite(nanBack.hullX) && Number.isFinite(nanBack.gait),
+    `hullX ${nanBack.hullX}, gait ${nanBack.gait}`);
+
+  // THE PRECISION CLAIM THE FORMAT'S OWN COMMENT MAKES, checked against the real deck.
+  //
+  // 16 bits for the hull's yaw rather than 8, because every deck position is derived by
+  // rotating a hull-local offset, so angular error is MULTIPLIED by distance from the
+  // centreline. Read off a real Trampler rather than from a CFG key: the first version
+  // reached for `CFG.trampler.length`, which does not exist, and produced `NaN mm at NaN m`
+  // — a wrong property name is not an error, it is a wrong answer, which is the same
+  // failure `isSubmerged` exists to prevent.
+  const halfL = makeSim().trampler.halfL;
+  const yawTol = toleranceOf("angle");
+  const sternError = yawTol * halfL;
+  const eightBitError = (Math.PI * 2 / 256 / 2) * halfL;
+  ok("the deck's half-length is a real number (test is not vacuous)",
+    Number.isFinite(halfL) && halfL > 5, `${halfL} m from the centreline to the stern`);
+  ok("16-bit yaw keeps a stern-standing crewmate inside a millimetre or two",
+    sternError < 0.005,
+    `${(sternError * 1000).toFixed(2)} mm at ${halfL} m out`);
+  ok("and 8 bits would not have, which is why the field is 16",
+    eightBitError > 0.1,
+    `8-bit yaw would throw them ${(eightBitError * 100).toFixed(0)} cm sideways`);
+}
+
+// ---------------------------------------------------------------------------
+// SLICE 1 END TO END, WITH NO SOCKET.
+//
+// Two complete simulations in one process: one plays the server, one plays a client. The
+// client is fed nothing but encoded snapshots, exactly as many as a real client would get,
+// and then asked whether its fortress is where the server's fortress is.
+//
+// This is the whole argument for putting the wire format and the session in src/ rather
+// than in net.js. A socket cannot be tested here. Everything that can actually go wrong in
+// this layer can: a field read at the wrong offset, a correction applied in the wrong order,
+// a transform left stale, a clock that drifts because one end integrates and the other does
+// not. All of it is arithmetic, and all of it is silent.
+console.log("\n118. A client driven by snapshots ends up on the same fortress");
+{
+  // FIRST, THE TWO LISTS THAT MUST AGREE ACROSS FILES. snapshot.js sends phases as wire
+  // INDICES, so its ordering is a second declaration of an enum that lives in waves.js and
+  // run.js. Two lists in two files with nothing checking them is how the shop and the pick
+  // came to disagree about a safe moment.
+  const simPhases = Object.values(PHASE);
+  const simRunPhases = Object.values(RUN);
+  ok("the wire's director phases are exactly the director's own, in order",
+    WIRE_PHASES.length === simPhases.length
+    && WIRE_PHASES.every((p, i) => p === simPhases[i]),
+    `wire [${WIRE_PHASES.join(",")}] vs PHASE [${simPhases.join(",")}]`);
+  ok("and the wire's run phases are exactly the run's own, in order",
+    WIRE_RUN_PHASES.length === simRunPhases.length
+    && WIRE_RUN_PHASES.every((p, i) => p === simRunPhases[i]),
+    `wire [${WIRE_RUN_PHASES.join(",")}] vs RUN [${simRunPhases.join(",")}]`);
+
+  const server = createSession();
+  const client = createSession();
+
+  // The clock divergence this slice exists to close, reproduced first so the fix is
+  // measured against something real. A client that "clicked" ten seconds late has been
+  // running ten seconds behind for ever, and enemy health scales off exactly that.
+  const lateBySeconds = 10;
+  for (let i = 0; i < lateBySeconds * CFG.loop.stepHz; i++) stepSession(server, DT);
+
+  const beforeElapsed = Math.abs(server.director.elapsed - client.director.elapsed);
+  ok("the two sims really do disagree about the clock to begin with (not vacuous)",
+    beforeElapsed > lateBySeconds - 0.5,
+    `${beforeElapsed.toFixed(2)} s apart, which scales enemy health by`
+    + ` x${(server.director.hpScale() / client.director.hpScale()).toFixed(2)}`);
+
+  // Now run them together, the client seeing only what the wire carries. One snapshot every
+  // third tick, which is the server's real SNAPSHOT_EVERY, so the client predicts through
+  // the gaps exactly as it will in the browser.
+  const SNAPSHOT_EVERY = 3;
+  let worst = { position: 0, yaw: 0, gait: 0, elapsed: 0 };
+  let snapshots = 0;
+  let totalBytes = 0;
+  let firstCorrection = null;
+
+  for (let tick = 1; tick <= 600; tick++) {
+    stepSession(server, DT);
+
+    if (tick % SNAPSHOT_EVERY === 0) {
+      const { buffer, clamped } = encode(snapshotOf(server, tick));
+      if (clamped.length) {
+        ok("a live snapshot clamped a field", false, JSON.stringify(clamped[0]));
+        break;
+      }
+      totalBytes += buffer.byteLength;
+      snapshots++;
+      // APPLIED BEFORE THE CLIENT'S OWN STEP, which is the ordering session.js argues for
+      // at length: a correction applied after a step is seen by the next step as real hull
+      // travel, and drags anybody standing on the deck along with it.
+      applySnapshot(client, decode(buffer));
+      if (!firstCorrection) firstCorrection = hullDivergence(server, client);
+    }
+
+    // The client predicts by running the REAL Trampler.update, not by extrapolating. That
+    // is legitimate because the fortress consumes no input at all — given the same pose,
+    // gait, leg health and multipliers, it lands on the same answer.
+    stepSession(client, DT);
+
+    // MEASURED ONLY ONCE A SNAPSHOT HAS ARRIVED, and the first version of this did not do
+    // that — it took the worst across all 600 ticks including the two before the first
+    // packet, so it faithfully reported the 10 second gap the test had just created on
+    // purpose. 44.9 m of "divergence", which is exactly 10 s of hull travel at 4.5 m/s.
+    //
+    // A convergence test that includes the pre-convergence state measures the setup. Same
+    // family as sampling an oscillating state at one instant, or reading a value inside the
+    // frame hook: the window has to contain the thing being claimed.
+    if (snapshots > 0) {
+      const d = hullDivergence(server, client);
+      for (const k of Object.keys(worst)) worst[k] = Math.max(worst[k], d[k]);
+    }
+  }
+
+  ok("snapshots were actually exchanged (test is not vacuous)", snapshots === 200,
+    `${snapshots} snapshots over 600 ticks, ${totalBytes} bytes total`);
+
+  // ONE PACKET CLOSES TEN SECONDS. Worth asserting separately from the steady state,
+  // because it is the property that makes a late joiner viable at all: there is no
+  // catch-up protocol, no replay, no handshake — the next snapshot simply is the truth.
+  ok("a single snapshot collapses a ten-second divergence outright",
+    firstCorrection && firstCorrection.elapsed < 0.05 && firstCorrection.position < 0.05,
+    firstCorrection
+      ? `${(firstCorrection.elapsed * 1000).toFixed(0)} ms and `
+        + `${(firstCorrection.position * 100).toFixed(2)} cm immediately after the first packet`
+      : "no snapshot was applied");
+  // Against the format's own prediction for the complete state this scenario actually has,
+  // including every protocol-v4 repeated array. Passing a hand-maintained subset here is the
+  // exact failure this assertion exists to catch: the encoder derives its size from real arrays,
+  // so the independent predictor must be handed those same arrays rather than silently treating
+  // every omitted section as empty.
+  const expectPerSnap = snapshotBytes(snapshotOf(server, 600));
+  ok("which is the bandwidth a real client pays",
+    Math.round(totalBytes / snapshots) === expectPerSnap,
+    `${(totalBytes / snapshots).toFixed(0)} B each -> `
+    + `${(totalBytes / snapshots * CFG.net.sendHz / 1024).toFixed(2)} KiB/s per client`);
+
+  // THE CLOCK. One field, and it is the largest divergence in the game.
+  ok("the client's clock is pulled onto the server's and stays there",
+    worst.elapsed < 0.1,
+    `worst disagreement ${(worst.elapsed * 1000).toFixed(0)} ms, down from`
+    + ` ${beforeElapsed.toFixed(1)} s`);
+
+  // THE HULL, AND THE BOUND IS DERIVED RATHER THAN CHOSEN.
+  //
+  // The client is deliberately ONE TICK ahead of its last correction: it applies a snapshot
+  // and then predicts forward, which is what a predicting client is for. So the steady-state
+  // divergence measured here is one tick of hull travel plus one tick of quantisation, and
+  // that is the design rather than an error.
+  //
+  // The first version asserted `< 0.05` and `< 0.01`, numbers picked because they sounded
+  // tight, and both failed at exactly one tick's worth — 8.16 cm against 4.5/60 = 7.5 cm,
+  // and 1.7e-2 against a gait step of 1/60. A threshold invented in a test is a threshold
+  // that disagrees with the system for reasons the test cannot explain; derived from the
+  // hull's own speed, it says what it is actually claiming.
+  const tickTravel = CFG.trampler.speed * DT;
+  const quantum = 0.01; // int16 metres at 1 cm, worst case on each of two axes
+  ok("the two fortresses stay within one tick of each other, which is the prediction lead",
+    worst.position < tickTravel + quantum * 2,
+    `worst ${(worst.position * 100).toFixed(2)} cm against a one-tick budget of `
+    + `${((tickTravel + quantum * 2) * 100).toFixed(2)} cm`);
+  ok("facing the same way",
+    worst.yaw < CFG.trampler.turnRate * DT + 0.001,
+    `worst ${(worst.yaw * 1000).toFixed(2)} mrad apart`);
+  // The gait accumulator advances by dt scaled between 0.25 and 1.0, so one tick is at most
+  // DT. Anything beyond that would mean the phase is genuinely drifting rather than leading.
+  ok("and walking in step, so the legs and the bob agree",
+    worst.gait <= DT + 1e-6,
+    `worst gait phase ${worst.gait.toExponential(1)} against a one-tick step of `
+    + `${DT.toExponential(1)}`);
+
+  // PREDICTION IS DOING REAL WORK, not being hidden by a snapshot every frame. If the
+  // client were simply being overwritten, the gaps between snapshots would show as jitter;
+  // if it were extrapolating badly, the same. Measured by asking how far the client's own
+  // integration carries it between corrections.
+  const beforeStep = client.trampler.group.position.clone();
+  stepSession(client, DT);
+  const predicted = client.trampler.group.position.distanceTo(beforeStep);
+  ok("the client moves the hull itself between snapshots (prediction is live)",
+    predicted > 0.01,
+    `${(predicted * 100).toFixed(1)} cm of predicted travel in one un-corrected tick`);
+
+  // AND THE CORRECTION MUST NOT SHOVE ANYBODY. session.js applies before the step for this
+  // reason; here it is asserted rather than trusted, because the failure would look like a
+  // teleporting teammate rather than like an ordering bug.
+  client.player.respawnOnDeck();
+  stepSession(client, DT);
+  const standing = client.trampler.worldToLocal(client.player.position.clone());
+  const nudged = snapshotOf(server, 601);
+  // A deliberately large correction — a metre of position error, far more than the measured
+  // half-centimetre — so that if it leaked into based movement it could not be missed.
+  nudged.hullX += 1.0;
+  applySnapshot(client, decode(encode(nudged).buffer));
+  stepSession(client, DT);
+  const after = client.trampler.worldToLocal(client.player.position.clone());
+  ok("a one-metre hull correction does not move the operative across the deck",
+    Math.hypot(after.x - standing.x, after.z - standing.z) < 0.2,
+    `${(Math.hypot(after.x - standing.x, after.z - standing.z) * 100).toFixed(1)} cm`
+    + " of deck-relative movement from a 100 cm correction");
+}
+
+// ---------------------------------------------------------------------------
+// SLICE 2: the horde on the wire, and the frame bit that keeps a latched chewer on its leg.
+//
+// The bandwidth slice. The hull/shared state is fixed once; the horde is twelve bytes times however
+// many are alive, so this is the section where "it grew a bit" becomes a real cost. And it
+// is where the frame choice matters most: the two bodies that travel in hull-local space are
+// a boarder on the deck and a chewer holding a leg, which are exactly the two readouts a
+// player uses to decide which of the two positions to be in.
+console.log("\n119. The horde crosses the wire, and carried bodies stay carried");
+{
+  const server = createSession();
+  const client = createSession();
+
+  // A real wave rather than a hand-placed one, so composition, states and the mix of
+  // carried and free bodies are whatever the director actually produces.
+  server.director.callEarly();
+  for (let i = 0; i < 60 * 30; i++) stepSession(server, DT);
+
+  const live = server.horde.liveCount;
+  let carried = 0;
+  let aboard = 0;
+  for (const e of server.horde.pool) {
+    if (!e.alive) continue;
+    if (e.onHull || e.latched) carried++;
+    if (e.onHull) aboard++;
+  }
+
+  ok("the server has a real horde to send (test is not vacuous)", live >= 8,
+    `${live} alive after 30 s of a called wave`);
+  ok("and some of them are being CARRIED by the hull, which is the case that matters",
+    carried >= 1, `${carried} carried (${aboard} on the deck, ${carried - aboard} latched)`);
+
+  const liveState = snapshotOf(server, 1800);
+  const { buffer, clamped } = encode(liveState);
+  ok("nothing clamped with a live horde", clamped.length === 0,
+    clamped.length ? JSON.stringify(clamped[0]) : "every body fit its fields");
+
+  // ---- BANDWIDTH, asserted so it cannot creep ------------------------------
+  const bytes = buffer.byteLength;
+  const perBody = ENTITY_BYTES;
+  ok("one body costs twelve bytes", perBody === 12, `${perBody} B each`);
+  ok("the snapshot is the size the format predicts", bytes === snapshotBytes(liveState),
+    `${bytes} B for ${live} bodies and ${server.operatives.length} operative(s)`);
+  // The realistic peak: wave five at a four-crew scale is 30 x 2.5 = 75 bodies, with the four
+  // operatives that made it that size.
+  const fullCrewState = snapshotOf(createSession({ seats: 4 }), 0);
+  const bytesAt = (entityCount) => snapshotBytes({
+    ...fullCrewState,
+    // Worst point in the journey: all three prior roads, a live two-road ballot and four votes.
+    roadHistory: { length: 3 },
+    roadOffers: { length: CFG.run.branches },
+    roadVotes: { length: 4 },
+    entities: { length: entityCount },
+  });
+  const peak = bytesAt(75);
+  const cap = bytesAt(CFG.enemies.max);
+  ok("a four-crew wave five stays under 30 KiB/s per client",
+    (peak * CFG.net.sendHz) / 1024 < 30,
+    `${(peak / 1024).toFixed(2)} KiB per snapshot -> `
+    + `${((peak * CFG.net.sendHz) / 1024).toFixed(1)} KiB/s`);
+  ok("and even a structurally full pool stays inside 115 KiB/s per client",
+    (cap * CFG.net.sendHz) / 1024 < 115,
+    `${CFG.enemies.max} bodies -> ${((cap * CFG.net.sendHz) / 1024).toFixed(1)} KiB/s`);
+
+  // ---- the round trip ------------------------------------------------------
+  applySnapshot(client, decode(buffer));
+
+  ok("the client ends up with the same number of bodies alive",
+    client.horde.liveCount === live, `${client.horde.liveCount} vs ${live}`);
+
+  let worstPos = 0;
+  let worstBody = "";
+  let matched = 0;
+  let typesOk = true;
+  let statesOk = true;
+  for (let i = 0; i < server.horde.pool.length; i++) {
+    const s = server.horde.pool[i];
+    const c = client.horde.pool[i];
+    if (!s.alive) {
+      // A body dead on the server must be dead on the client. The absence half of the sync is
+      // the one an "update what I was told" loop silently gets wrong: without the sweep in
+      // applyEntities, every corpse would stand on the sand for the rest of the run.
+      if (c.alive) { statesOk = false; worstBody = `slot ${i} alive on the client only`; }
+      continue;
+    }
+    matched++;
+    if (c.type !== s.type) typesOk = false;
+    if (c.state !== s.state) statesOk = false;
+    const d = Math.hypot(c.x - s.x, c.y - s.y, c.z - s.z);
+    if (d > worstPos) {
+      worstPos = d;
+      worstBody = `slot ${i} type ${s.type} state ${s.state}`
+        + `${s.onHull || s.latched ? " CARRIED" : ""}`;
+    }
+  }
+
+  ok("every live body was matched by pool index (test is not vacuous)", matched === live,
+    `${matched} of ${live}`);
+  ok("types survive the wire", typesOk, "all six types round-trip");
+  ok("states survive, and nothing is alive on one side only", statesOk, worstBody || "clean");
+
+  // ONE CENTIMETRE, which is the quantisation and nothing else. This is the assertion that
+  // the frame conversion is right in BOTH directions: a carried body is encoded into hull
+  // space and read back out of it, and any error in either transform shows up here as
+  // whole metres rather than as a rounding difference.
+  ok("every body lands within a centimetre of where the server has it",
+    worstPos < 0.02, `worst ${(worstPos * 100).toFixed(2)} cm — ${worstBody}`);
+
+  // ---- AND NOW THE POINT: THE HULL MOVES UNDER THEM ------------------------
+  //
+  // The test above sends and applies in the same instant, which is the easy case. The claim
+  // that matters is what a 120 ms old snapshot looks like once the fortress has walked on.
+  const stale = decode(encode(snapshotOf(server, 1800)).buffer);
+  const delayFrames = Math.round((CFG.net.interpDelayMs / 1000) * CFG.loop.stepHz);
+
+  // Both sims advance, but the client is applying a snapshot from BEFORE the walk.
+  const hullBefore = server.trampler.group.position.clone();
+  for (let i = 0; i < delayFrames; i++) stepSession(server, DT);
+  const hullMoved = server.trampler.group.position.distanceTo(hullBefore);
+  for (let i = 0; i < delayFrames; i++) stepSessionClient(client, DT);
+  applySnapshot(client, stale);
+
+  // Derived from the hull's ACTUAL speed, not from CFG.trampler.speed. Thirty seconds of a
+  // called wave has chewed the legs, so `speedFactor()` has throttled the fortress — the
+  // first version of this asserted 0.4 m against a full-speed 0.53 m and measured 0.39,
+  // because a damaged fortress walks slower by design. A bound that ignores the damage the
+  // scenario just inflicted is a bound that disagrees with the game for a reason the test
+  // cannot see.
+  const expectedTravel = CFG.trampler.speed * server.trampler.speedFactor()
+    * server.trampler.driveScale * (delayFrames / CFG.loop.stepHz);
+  ok("the fortress walked while the snapshot was in flight (test is not vacuous)",
+    hullMoved > expectedTravel * 0.5 && hullMoved > 0.15,
+    `hull travelled ${hullMoved.toFixed(2)} m in ${delayFrames} frames at speed factor `
+    + `${server.trampler.speedFactor().toFixed(2)} (${server.trampler.brokenLegs()} legs down)`);
+
+  // A carried body, drawn from a stale hull-local position against the CURRENT transform,
+  // should still be on its leg. Measured in hull space, because that is where "still on its
+  // leg" is a meaningful question.
+  // MEASURED IN THREE GROUPS, because "carried" is two different cases and lumping them
+  // together produced a bound that was wrong for both.
+  //
+  //   LATCHED   holds a leg and does not move in hull space at all, so its only error is the
+  //             1 cm quantisation. This is the strong claim.
+  //   ON DECK   is a boarder WALKING toward the reactor, so it is stale by its own
+  //             deck-relative travel — the same residual a free body has, just smaller
+  //             because a boarder on a 26 m deck is not crossing open sand.
+  //   FREE      is stale by its own world travel.
+  //
+  // The first version asserted one bound over both carried cases and measured 5.53 cm
+  // against a 5 cm threshold — a walking boarder, behaving exactly as designed, failing an
+  // assertion that had quietly assumed every carried body was stationary.
+  let worstLatched = 0;
+  let worstOnDeck = 0;
+  let worstFreeWorld = 0;
+  let latchedSeen = 0;
+  const probeS = new THREE.Vector3();
+  const probeC = new THREE.Vector3();
+  for (let i = 0; i < server.horde.pool.length; i++) {
+    const s = server.horde.pool[i];
+    const c = client.horde.pool[i];
+    if (!s.alive || !c.alive) continue;
+    if (s.onHull || s.latched) {
+      probeS.set(s.x, s.y, s.z);
+      probeC.set(c.x, c.y, c.z);
+      server.trampler.worldToLocal(probeS);
+      client.trampler.worldToLocal(probeC);
+      const err = probeS.distanceTo(probeC);
+      if (s.latched) { worstLatched = Math.max(worstLatched, err); latchedSeen++; }
+      else worstOnDeck = Math.max(worstOnDeck, err);
+    } else {
+      worstFreeWorld = Math.max(
+        worstFreeWorld, Math.hypot(c.x - s.x, c.y - s.y, c.z - s.z),
+      );
+    }
+  }
+
+  ok("bodies were actually latched to a leg (test is not vacuous)", latchedSeen >= 1,
+    `${latchedSeen} latched`);
+  // THE STRONG CLAIM, and the one the pillar rests on: a chewer holding a leg is exactly
+  // where the server has it, to within the wire's own precision, however far the fortress
+  // walked while the packet was in flight.
+  ok("a LATCHED chewer is on its leg to within the quantisation, after 120 ms of walking",
+    worstLatched < 0.03,
+    `worst ${(worstLatched * 100).toFixed(2)} cm in hull space across `
+    + `${hullMoved.toFixed(2)} m of hull travel`);
+  // The honest other halves. Both are the body's OWN motion and neither contains the hull's,
+  // which is the entire benefit of choosing the frame — and both are what interpolation
+  // smooths rather than removes.
+  ok("a boarder walking the deck is stale by its own deck-relative travel, not the hull's",
+    worstOnDeck < 0.25,
+    `worst ${(worstOnDeck * 100).toFixed(1)} cm — its own walk, against `
+    + `${(hullMoved * 100).toFixed(0)} cm of hull travel it does NOT carry`);
+  ok("while a FREE body is stale by its own world travel",
+    worstFreeWorld > 0.05,
+    `worst ${(worstFreeWorld * 100).toFixed(0)} cm — a chewer covers `
+    + `${(CFG.enemies.chewer.speed * CFG.net.interpDelayMs / 1000 * 100).toFixed(0)} cm in that window`);
+  ok("so the frame choice is worth an order of magnitude for the bodies that matter",
+    worstFreeWorld > worstLatched * 10,
+    `free ${(worstFreeWorld * 100).toFixed(0)} cm vs latched `
+    + `${(worstLatched * 100).toFixed(2)} cm`);
+
+  // ---- the client must not be running the AI -------------------------------
+  //
+  // stepSessionClient omits horde.update, and this is the assertion that it stays omitted.
+  // If it ever runs, a client's bodies drift away from the positions they were handed on
+  // their own initiative — and the symptom is rubber-banding rather than anything that looks
+  // like a missing guard.
+  applySnapshot(client, decode(encode(snapshotOf(server, 1900)).buffer));
+  const before = [];
+  for (const e of client.horde.pool) if (e.alive) before.push(e.x, e.y, e.z);
+  for (let i = 0; i < 30; i++) stepSessionClient(client, DT);
+  let drift = 0;
+  let k = 0;
+  for (const e of client.horde.pool) {
+    if (!e.alive) continue;
+    drift = Math.max(
+      drift,
+      Math.hypot(e.x - before[k], e.y - before[k + 1], e.z - before[k + 2]),
+    );
+    k += 3;
+  }
+  ok("a client does not move enemies on its own — it has no AI to run",
+    drift === 0,
+    drift === 0 ? "half a second of client stepping moved nothing" : `${drift.toFixed(3)} m of drift`);
+
+  // And the server, over the same half second, plainly does. Otherwise the check above
+  // would pass on a frozen simulation.
+  const sBefore = [];
+  for (const e of server.horde.pool) if (e.alive) sBefore.push(e.x, e.z);
+  for (let i = 0; i < 30; i++) stepSession(server, DT);
+  let sDrift = 0;
+  let j = 0;
+  for (const e of server.horde.pool) {
+    if (!e.alive) continue;
+    sDrift = Math.max(sDrift, Math.hypot(e.x - sBefore[j], e.z - sBefore[j + 1]));
+    j += 2;
+  }
+  ok("while the server's horde is plainly alive (so the above is not a frozen world)",
+    sDrift > 0.1, `${sDrift.toFixed(2)} m of server-side movement in the same window`);
+}
+
+// ---------------------------------------------------------------------------
+// SLICE 3: the server seats a real crew, which is what makes seven built rules reachable.
+//
+// THE ARGUMENT FOR THIS WHOLE PIECE OF WORK, stated as a measurement. Wave size scales off
+// `crew.size`, and until now nothing ever increased it — src/net.js draws remote operatives
+// as avatars and does not put them in the Crew. So with four people connected, every one of
+// them faced a solo-sized fight, and the scaling table, the shared repair claim, the road
+// vote, the split purses, the proc attribution and the stomp's crew sweep were all correct,
+// tested, and unreachable.
+console.log("\n120. Seating a crew on the server makes the co-op rules reachable");
+{
+  const solo = createSession({ seats: 1 });
+  const four = createSession({ seats: 4 });
+
+  ok("a four-seat session really seats four operatives (test is not vacuous)",
+    four.crew.size === 4 && four.operatives.length === 4,
+    `crew ${four.crew.size}, ${four.operatives.length} kits`);
+  ok("and a one-seat session is unchanged, which is the acceptance test for all of this",
+    solo.crew.size === 1 && solo.director.crewScale === 1,
+    `crew 1, scale x${solo.director.crewScale}`);
+
+  // THE SCALING, which is the headline. 1 + 0.5 * (n - 1) — Risk of Rain 2's shipped
+  // coefficient, borrowed rather than invented.
+  ok("wave size scales with the crew, and by the documented coefficient",
+    Math.abs(four.director.crewScale - 2.5) < 1e-9,
+    `x${four.director.crewScale} at four operatives against x${solo.director.crewScale} solo`);
+
+  const soloWave = solo.director.buildWave(5, solo.director.tierOf(5));
+  const fourWave = four.director.buildWave(5, four.director.tierOf(5));
+  const count = (w) => w.reduce((n, t) => n + t, 0);
+  const ratio = count(fourWave) / count(soloWave);
+
+  // MEASURED AT 2.0x AGAINST A 2.5x COEFFICIENT, and that gap is the roster's absolute caps
+  // doing their job rather than the scaling failing. `bulwarkMax` and `sapperMax` are 3
+  // whatever the crew size, so a scaled wave has room for more bodies than the composition is
+  // willing to fill with specials, and the remainder does not fully absorb it.
+  //
+  // The first version asserted `> 2x` and failed at exactly 2.00 — a bound picked to sound
+  // strict, against a system whose real behaviour is bounded by a different number entirely.
+  //
+  // This is the open question the brief already names: the specials' share falls from 29% of a
+  // siege to 21% at four operatives, and whether that reads as a thinner fight is unmeasured.
+  // Recorded here rather than fixed, because roster scaling is the next variable and moving it
+  // in the same change as seating the crew would make either one unattributable.
+  ok("so wave five is substantially bigger with four aboard",
+    ratio >= 1.8,
+    `${count(soloWave)} solo vs ${count(fourWave)} at four — x${ratio.toFixed(2)} against a `
+    + `x${four.director.crewScale} coefficient, the gap being the absolute per-type caps`);
+  ok("and the shortfall is the caps rather than the count, which is a known open question",
+    ratio < four.director.crewScale + 1e-9,
+    `x${ratio.toFixed(2)} <= x${four.director.crewScale}: bulwarkMax and sapperMax are `
+    + `${CFG.enemies.composition.bulwarkMax} and ${CFG.enemies.composition.sapperMax} `
+    + "at any crew size");
+
+  // AND NOTHING ELSE SCALED. Each of these is asserted so a later edit has to argue with a
+  // test rather than quietly widen the change.
+  ok("enemy health did not scale with the crew — it is invisible to a player",
+    Math.abs(solo.director.hpScale() - four.director.hpScale()) < 1e-9,
+    `x${solo.director.hpScale().toFixed(3)} both`);
+  ok("nor did an operative's own health",
+    solo.player.maxHp === four.player.maxHp, `${four.player.maxHp} hp each`);
+  ok("nor the siege length",
+    solo.director.siegeLength === four.director.siegeLength,
+    `${four.director.siegeLength} waves`);
+
+  // PRESSURE AGGREGATES TO THE WORST-OFF OPERATIVE, so one hurt person generates the same
+  // pacing pressure whether they are alone or beside three healthy teammates. That is Left 4
+  // Dead's director responding to whoever is in trouble rather than to an average that hides
+  // them — and it is the reason a crew of four does not get an easier ride by bringing
+  // spare health bars.
+  solo.player.hp = solo.player.maxHp * 0.5;
+  four.operatives[2].player.hp = four.operatives[2].player.maxHp * 0.5;
+  ok("one hurt operative reads as the same pressure alone or in a crowd",
+    Math.abs(solo.director.pressure - four.director.pressure) < 1e-9,
+    `${(solo.director.pressure * 100).toFixed(0)}% both, from crew 3 of 4 at half health`);
+
+  // ---- the per-operative kit, which is why each seat gets its own ----------
+  ok("every operative has their own weapon, winch, repair and purse",
+    new Set(four.operatives.map((o) => o.weapon)).size === 4
+    && new Set(four.operatives.map((o) => o.grapple)).size === 4
+    && new Set(four.operatives.map((o) => o.repair)).size === 4
+    && new Set(four.operatives.map((o) => o.economy)).size === 4,
+    "four distinct instances of each");
+  ok("but ONE treasury, so the fortress track is the crew's",
+    new Set(four.operatives.map((o) => o.economy.treasury)).size === 1,
+    "one shared pot of scrap and one set of fortress stacks");
+
+  // The wiring guard that makes the above structural rather than hopeful: a Weapon belonging
+  // to somebody else is refused at construction, because personal items recompute absolutely
+  // from stack counts and two operatives over one weapon silently wipe each other's kit.
+  let refused = false;
+  try {
+    new Economy({
+      player: four.operatives[0].player,
+      trampler: four.trampler,
+      weapon: four.operatives[1].weapon,
+      repair: four.operatives[0].repair,
+      horde: four.horde,
+      director: four.director,
+    });
+  } catch { refused = true; }
+  ok("and an Economy handed somebody else's weapon still refuses to be built", refused,
+    "threw at construction");
+
+  // ---- the input queue, which is where levels and edges diverge -----------
+  //
+  // `down()` is a level and may be repeated when a packet is late; `pressed()` is an edge the
+  // reader CONSUMES and must fire exactly once. A starved tick that replayed the edge mask
+  // would fire a second grapple or buy the same refit twice.
+  const q = netInput();
+  q.push({ seq: 1, clientTick: 1, held: HELD_BIT.forward, edges: EDGE_BIT.jump, lookDx: 0, lookDy: 0 });
+  q.advance();
+  ok("a queued command is readable as both a level and an edge",
+    q.down("KeyW") === true && q.pressed("Space") === true,
+    "W held, Space pressed");
+  ok("and the edge is CONSUMED, exactly like the real Input",
+    q.pressed("Space") === false, "a second read returns false");
+  ok("the acknowledged sequence is the one actually stepped", q.ackSeq === 1, `ack ${q.ackSeq}`);
+
+  q.advance(); // starved: nothing queued
+  ok("a starved tick keeps the HELD keys, so a hiccup does not stop you walking",
+    q.down("KeyW") === true, "W still held");
+  ok("but supplies NO edges, so nothing fires twice",
+    q.pressed("Space") === false, "Space did not repeat");
+  ok("and the starvation is counted rather than hidden", q.starved === 1, `${q.starved} starved`);
+
+  // Local presentation/debug controls must never reach the authority. Restart is different:
+  // it mutates shared run state, so K is deliberately an authority-owned edge rather than a
+  // client-side debug mutation. An all-bits packet therefore reaches K, but still cannot invent
+  // mappings for P or B.
+  const rig = netInput();
+  rig.push({ seq: 2, clientTick: 2, held: 0xffff, edges: 0xffff, lookDx: 0, lookDy: 0 });
+  rig.advance();
+  ok("only authority-owned run controls can be reached, whatever bitmask a client sends",
+    !rig.pressed("KeyP") && rig.pressed("KeyK") && !rig.down("KeyB"),
+    "P and B are unmapped; K is the authority-owned restart edge");
+
+  // ---- and the operatives cross the wire ----------------------------------
+  const client = createSession({ seats: 4 });
+  for (let i = 0; i < 120; i++) stepSession(four, DT);
+  const wire = decode(encode(snapshotOf(four, 120)).buffer);
+
+  ok("all four operatives are in the snapshot", wire.operatives.length === 4,
+    `${wire.operatives.length} seats, ${OPERATIVE_BYTES} B each`);
+  ok("each carries its own seat number, in order",
+    wire.operatives.every((o, i) => o.seat === i + 1),
+    `seats ${wire.operatives.map((o) => o.seat).join(",")}`);
+
+  applySnapshot(client, wire);
+  let worstOp = 0;
+  for (let i = 0; i < 4; i++) {
+    const s = four.operatives[i].player;
+    const c = client.operatives[i].player;
+    worstOp = Math.max(worstOp, s.position.distanceTo(c.position));
+  }
+  ok("and every operative lands within a centimetre of where the server has them",
+    worstOp < 0.02, `worst ${(worstOp * 100).toFixed(2)} cm`);
+}
+
+// ---------------------------------------------------------------------------
+// SLICE 3, THE OTHER DIRECTION: a keypress becomes an authoritative movement.
+//
+// Everything up to here has been state travelling DOWN. This is intent travelling up, and it
+// is the half that makes the server an authority rather than a broadcaster: a client says "I
+// am holding W", the server decides where that puts them, and the answer comes back in the
+// next snapshot. The relay this replaces sent positions and believed them, which is why its
+// own header called it trivially cheatable.
+console.log("\n121. A keypress crosses the wire and the server decides what it did");
+{
+  const server = createSession({ seats: 2, networked: true });
+
+  ok("an input command is small (test is not vacuous)", INPUT_BYTES <= 24,
+    `${INPUT_BYTES} B -> ${(INPUT_BYTES * CFG.loop.stepHz / 1024).toFixed(2)} KiB/s upstream`);
+
+  // ---- the codec ----------------------------------------------------------
+  const local = makeInput();
+  local.keys.add("KeyW");
+  local.keys.add("ShiftLeft");
+  local.presses.add("Space");
+  local.mouseHeld.add(0);
+  local.mouse.dx = 12.5;
+  local.mouse.dy = -3.25;
+
+  const cmd = readInput(local, { seq: 7, clientTick: 99 });
+  const wire = decodeInput(encodeInput(cmd).buffer);
+
+  ok("held keys survive the round trip",
+    (wire.held & HELD_BIT.forward) !== 0
+    && (wire.held & HELD_BIT.sprint) !== 0
+    && (wire.held & HELD_BIT.fire) !== 0,
+    `held ${wire.held.toString(2)}`);
+  ok("and so do edges, separately from the levels",
+    (wire.edges & EDGE_BIT.jump) !== 0, `edges ${wire.edges.toString(2)}`);
+  ok("the sequence number survives, which is what reconciliation is keyed on",
+    wire.seq === 7 && wire.clientTick === 99, `seq ${wire.seq}, tick ${wire.clientTick}`);
+  ok("and the look delta survives at centimetre precision",
+    Math.abs(wire.lookDx - 12.5) < 0.01 && Math.abs(wire.lookDy + 3.25) < 0.01,
+    `dx ${wire.lookDx}, dy ${wire.lookDy}`);
+
+  // READING THE LOCAL INPUT MUST NOT STEAL THE PRESS. `input.pressed()` deletes what it
+  // returns, so a `readInput` that used it would send the jump and never perform it — working
+  // in single player and vanishing in multiplayer, which is the worst possible shape for a bug.
+  ok("reading the input for the wire does not consume the local press",
+    local.pressed("Space") === true,
+    "the local simulation can still act on it");
+
+  // ---- and now the loop ---------------------------------------------------
+  //
+  // Seat 2 walks; seat 1 does nothing. Both are on the deck, so this also exercises the
+  // hull-local frame on the way back out.
+  for (const op of server.operatives) op.player.respawnOnDeck();
+  for (let i = 0; i < 10; i++) stepSession(server, DT);
+
+  const walker = server.operatives[1];
+  const idler = server.operatives[0];
+  walker.player.yaw = 0;
+  const startLocal = server.trampler.worldToLocal(walker.player.position.clone());
+  const idlerStart = server.trampler.worldToLocal(idler.player.position.clone());
+
+  // Baselined, because the ten settling steps above ran with nothing queued and the counter is
+  // cumulative for the life of the connection. Asserting the absolute figure measured the
+  // test's own setup and reported ten starved ticks as a fault.
+  const starvedBefore = walker.input.starved;
+  const frames = 30;
+  for (let i = 0; i < frames; i++) {
+    // What a client sends every step: held-only after the first, exactly as main.js does.
+    walker.input.push({
+      seq: i + 1, clientTick: i + 1, held: HELD_BIT.forward, edges: 0, lookDx: 0, lookDy: 0,
+    });
+    stepSession(server, DT);
+  }
+
+  const endLocal = server.trampler.worldToLocal(walker.player.position.clone());
+  const idlerEnd = server.trampler.worldToLocal(idler.player.position.clone());
+  const walked = endLocal.distanceTo(startLocal);
+  const expected = CFG.player.walkSpeed * (frames / CFG.loop.stepHz);
+
+  ok("the operative whose seat sent input actually walked",
+    walked > expected * 0.5,
+    `${walked.toFixed(2)} m across the deck against a nominal ${expected.toFixed(2)} m`);
+  ok("and the one who sent nothing did not move",
+    idlerEnd.distanceTo(idlerStart) < 0.02,
+    `${(idlerEnd.distanceTo(idlerStart) * 100).toFixed(1)} cm — input is per seat, not shared`);
+  ok("the server acknowledged the last command it stepped, not the last it received",
+    walker.input.ackSeq === frames, `ack ${walker.input.ackSeq} of ${frames} sent`);
+  ok("and nothing starved, because one command was supplied per tick",
+    walker.input.starved === starvedBefore,
+    `${walker.input.starved - starvedBefore} new starved ticks across ${frames}`);
+
+  // ---- the ack reaches the client, per seat -------------------------------
+  const snap = decode(encode(snapshotOf(server, 1000)).buffer);
+  const mine = snap.operatives.find((o) => o.seat === 2);
+  ok("the snapshot tells each seat which of ITS commands has been simulated",
+    mine.ackSeq === frames,
+    `seat 2 acked at ${mine.ackSeq}, seat 1 at `
+    + `${snap.operatives.find((o) => o.seat === 1).ackSeq}`);
+
+  // ---- and a client applying it leaves its OWN seat alone -----------------
+  //
+  // That exclusion IS client prediction. Overwriting the local operative from a snapshot
+  // 120 ms old would undo the responsiveness prediction exists to provide.
+  const client = createSession({ seats: 2 });
+  for (const op of client.operatives) op.player.respawnOnDeck();
+
+  // MEASURED IN HULL SPACE, not world space, and the difference is a thing I had forgotten
+  // about my own code. A hull correction CARRIES ITS PASSENGERS — session.js moves anybody
+  // based to the trampler so their deck-relative position survives, which is invariant 5 and
+  // is what stopped a one-metre correction shoving an operative 114 cm across the deck.
+  //
+  // So the local operative's WORLD position does legitimately change when a snapshot arrives.
+  // What must not change is where on the deck they are standing, and what must not happen is
+  // the wire's authoritative position overwriting the predicted one. Asserting the world
+  // position was unchanged conflated those and reported the rider fix as a fault.
+  const beforeLocal = client.trampler.worldToLocal(client.operatives[1].player.position.clone());
+  const wireMine = snap.operatives.find((o) => o.seat === 2);
+  applySnapshot(client, snap, 2); // this client is seat 2
+  const afterLocal = client.trampler.worldToLocal(client.operatives[1].player.position.clone());
+  const otherMoved = client.operatives[0].player.position.distanceTo(
+    server.operatives[0].player.position,
+  );
+
+  ok("the wire's own-seat position is genuinely different (test is not vacuous)",
+    Math.hypot(wireMine.x - beforeLocal.x, wireMine.z - beforeLocal.z) > 1.0,
+    `the server has seat 2 ${Math.hypot(wireMine.x - beforeLocal.x, wireMine.z - beforeLocal.z)
+      .toFixed(2)} m from where this client predicts it`);
+  ok("a client does not overwrite its own operative from a snapshot",
+    afterLocal.distanceTo(beforeLocal) < 0.01,
+    `seat 2 stayed put on the deck (${(afterLocal.distanceTo(beforeLocal) * 100).toFixed(2)} cm)`
+    + " — predicted locally, not corrected");
+  ok("but it does take every OTHER seat from the authority",
+    otherMoved < 0.02, `seat 1 within ${(otherMoved * 100).toFixed(2)} cm of the server`);
+  ok("and it still learns its own acknowledged sequence, which reconciliation needs",
+    client.operatives[1].ackSeq === frames, `ack ${client.operatives[1].ackSeq}`);
+}
+
+// ---------------------------------------------------------------------------
+// SMOOTHNESS: interpolating between snapshots, and pulling a prediction back into line.
+//
+// Both are the difference between "correct" and "looks right", and both are pure arithmetic
+// whose failures are silent — an interpolator that mixes two coordinate systems produces bodies
+// sliding through the hull, and a reconciler with the wrong sign walks the player away from the
+// authority rather than toward it.
+console.log("\n122. Bodies interpolate between snapshots, and a prediction is pulled back");
+{
+  const server = createSession({ seats: 2, networked: true });
+  server.director.callEarly();
+  for (let i = 0; i < 60 * 25; i++) stepSession(server, DT);
+  ok("there is a horde to interpolate (test is not vacuous)", server.horde.liveCount >= 4,
+    `${server.horde.liveCount} alive`);
+
+  const first = decode(encode(snapshotOf(server, 1500)).buffer);
+  for (let i = 0; i < 3; i++) stepSession(server, DT);
+  const second = decode(encode(snapshotOf(server, 1503)).buffer);
+
+  // ---- the midpoint is genuinely between --------------------------------------
+  const mid = lerpSnapshot(first, second, 0.5);
+  let moved = 0;
+  let worstOffLine = 0;
+  for (const m of mid.entities) {
+    const a = first.entities.find((e) => e.id === m.id);
+    const b = second.entities.find((e) => e.id === m.id);
+    if (!a || !b) continue;
+    const travel = Math.hypot(b.x - a.x, b.z - a.z);
+    if (travel < 0.02) continue;
+    moved++;
+    // A true midpoint is equidistant from both ends. Measured rather than assumed, because the
+    // plausible bug here is returning `b` unchanged — which would pass any test that only
+    // checked the result was "between" a pair that barely moved.
+    const da = Math.hypot(m.x - a.x, m.z - a.z);
+    const db = Math.hypot(m.x - b.x, m.z - b.z);
+    worstOffLine = Math.max(worstOffLine, Math.abs(da - db));
+  }
+  ok("bodies actually moved between the two snapshots (test is not vacuous)", moved >= 2,
+    `${moved} of ${mid.entities.length} bodies moved more than 2 cm`);
+  ok("and the midpoint really is halfway, not just the newer snapshot",
+    worstOffLine < 0.02,
+    `worst asymmetry ${(worstOffLine * 100).toFixed(2)} cm`);
+
+  const zero = lerpSnapshot(first, second, 0);
+  const one = lerpSnapshot(first, second, 1);
+  const at = (s, id) => s.entities.find((e) => e.id === id);
+  const someMover = mid.entities.find((m) => {
+    const a = at(first, m.id); const b = at(second, m.id);
+    return a && b && Math.hypot(b.x - a.x, b.z - a.z) > 0.02;
+  });
+  ok("t=0 gives the older position and t=1 the newer",
+    Math.abs(at(zero, someMover.id).x - at(first, someMover.id).x) < 1e-9
+    && Math.abs(at(one, someMover.id).x - at(second, someMover.id).x) < 1e-9,
+    "the ends are exact, so nothing is being nudged at the boundaries");
+
+  // Discrete fields must NOT be blended. Half way between two enemy types is a third type, and
+  // a tint band between two integers is a band that does not exist.
+  ok("discrete state comes from the newer snapshot rather than being averaged",
+    mid.entities.every((m) => {
+      const b = at(second, m.id);
+      return !b || (m.bitsA === b.bitsA && m.bitsB === b.bitsB);
+    }),
+    "type, state, flags and health band all taken whole");
+
+  // A CHANGE OF FRAME IS NOT INTERPOLABLE. Forged, because catching a body in the act of
+  // leaving the deck inside a three-tick window is a coincidence to wait for rather than a
+  // scenario to drive — the trap this project calls "waiting for a coincidence".
+  {
+    const a2 = { ...first, entities: [{ ...first.entities[0], bitsA: first.entities[0].bitsA | 64, x: 3, z: 2 }] };
+    const b2 = { ...second, entities: [{ ...second.entities[0], bitsA: second.entities[0].bitsA & ~64, x: 140, z: -80 }] };
+    const snapped = lerpSnapshot(a2, b2, 0.5);
+    ok("a body that changed coordinate frame snaps instead of mixing the numbers",
+      snapped.entities[0].x === 140 && snapped.entities[0].z === -80,
+      "hull-local to world is not a line between two points");
+  }
+
+  // A body that appears in the newer snapshot only has no history, so it must not slide in from
+  // wherever the previous occupant of its pool slot died.
+  {
+    const spawned = { ...second, entities: [...second.entities, { ...second.entities[0], id: 411, x: 99, z: 99 }] };
+    const blended = lerpSnapshot(first, spawned, 0.5);
+    const fresh = blended.entities.find((e) => e.id === 411);
+    ok("a newly spawned body appears where it is, not partway from a stranger",
+      fresh.x === 99 && fresh.z === 99, "no history means no blend");
+  }
+
+  // ---- reconciliation, band by band -------------------------------------------
+  const base = { x: 10, y: 1.2, z: -4 };
+  const tiny = reconcile(base, { x: 10.01, y: 1.2, z: -4 },
+    { deadZone: CFG.net.correctionDeadZone, snapAt: CFG.net.correctionSnapAt });
+  const small = reconcile(base, { x: 10.4, y: 1.2, z: -4 },
+    { deadZone: CFG.net.correctionDeadZone, snapAt: CFG.net.correctionSnapAt });
+  const huge = reconcile(base, { x: 25, y: 1.2, z: -4 },
+    { deadZone: CFG.net.correctionDeadZone, snapAt: CFG.net.correctionSnapAt });
+
+  ok("an error inside the quantisation is ignored outright", tiny.action === "none",
+    `${(tiny.error * 100).toFixed(1)} cm against a ${(CFG.net.correctionDeadZone * 100)
+      .toFixed(0)} cm dead zone`);
+  ok("a real but modest error is smoothed", small.action === "smooth",
+    `${(small.error * 100).toFixed(0)} cm`);
+  ok("and it points TOWARD the authority, which is the sign a reconciler gets wrong",
+    small.dx > 0, `dx +${small.dx.toFixed(2)} for a server ahead of the prediction`);
+  ok("a large error snaps, because the prediction was wrong about what happened",
+    huge.action === "snap",
+    `${huge.error.toFixed(1)} m against a ${CFG.net.correctionSnapAt} m threshold`);
+  ok("and a non-finite position snaps rather than propagating a NaN",
+    reconcile(base, { x: NaN, y: 1.2, z: -4 }).action === "snap",
+    "invariant 16 holds at the reconciliation boundary too");
+
+  // THE EXPONENTIAL PAY-OFF, checked for both ends of the band it has to sit in: fast enough
+  // that the operative is not visibly lagging its own controls, slow enough that it is not a
+  // snap wearing a different hat.
+  let remaining = 1.0;
+  const k = (dt) => 1 - Math.exp(-CFG.net.correctionRate * dt);
+  let framesToSettle = 0;
+  while (remaining > 0.05 && framesToSettle < 600) {
+    remaining -= remaining * k(DT);
+    framesToSettle++;
+  }
+  const settleMs = (framesToSettle / CFG.loop.stepHz) * 1000;
+  ok("a correction settles fast enough not to feel like lag",
+    settleMs < 400, `95% paid off in ${settleMs.toFixed(0)} ms`);
+  ok("but not so fast that it is a teleport in all but name",
+    1 - k(DT) > 0.5,
+    `${((1 - k(DT)) * 100).toFixed(0)}% of the error survives the first frame, so it eases`);
+}
+
+// ---------------------------------------------------------------------------
+// SLICE 4: the client fires for feedback, the server decides what it hit.
+//
+// The last thing that looked obviously wrong. Until now a client's trigger damaged its own copy
+// of a body the server still had alive, the next snapshot resurrected it 50 ms later, and the
+// shooter was paid salvage for a kill nobody made. Two claims to establish: a client deals
+// nothing, and both ends scatter the round the same way so the tracer points where the shot went.
+console.log("\n123. An arbitrated shot draws a tracer and deals no damage");
+{
+  const sim = makeSim();
+  const { horde, weapon, player } = sim;
+
+  /** A body straight ahead of the operative, out in the open. */
+  const target = () => {
+    horde.clear();
+    player.dropToGround();
+    step(sim, 4);
+    const e = horde.spawn(CHEWER);
+    e.x = player.position.x;
+    e.y = 0.8;
+    e.z = player.position.z - 12;
+    e.latched = false;
+    e.onHull = false;
+    player.yaw = 0;
+    player.pitch = 0;
+    return e;
+  };
+
+  const shootAt = (e) => {
+    const origin = new THREE.Vector3(player.position.x, 1.5, player.position.z);
+    const dir = new THREE.Vector3(e.x - origin.x, e.y - origin.y, e.z - origin.z).normalize();
+    return weapon.shootFrom(origin, dir, CFG.combat.weapon, null, player);
+  };
+
+  // ---- the ordinary path still works, or the comparison below means nothing ----
+  weapon.arbitrated = false;
+  let e = target();
+  const beforeHp = e.hp;
+  const beforeScrap = sim.economy.scrap;
+  let hitsBefore = weapon.hits;
+  ok("an unarbitrated shot connects (test is not vacuous)", shootAt(e) !== null,
+    "the ray reaches the body");
+  ok("and it deals damage, as it always has", e.hp < beforeHp,
+    `${beforeHp} -> ${e.hp.toFixed(1)} hp`);
+
+  // ---- and now the arbitrated one ---------------------------------------------
+  weapon.arbitrated = true;
+  e = target();
+  const hp0 = e.hp;
+  const scrap0 = sim.economy.scrap;
+  const salvage0 = sim.economy.salvage;
+  const kills0 = horde.killCount;
+  hitsBefore = weapon.hits;
+  const tracers0 = sim.weapon.tracers?.length ?? -1;
+
+  const hit = shootAt(e);
+
+  ok("an arbitrated shot still finds the body (test is not vacuous)", hit !== null,
+    "the ray, the geometry clip and the horde walk all still run");
+  ok("but it deals NO damage", e.hp === hp0, `${e.hp.toFixed(1)} hp, unchanged`);
+  ok("and pays nothing into either purse",
+    sim.economy.scrap === scrap0 && sim.economy.salvage === salvage0,
+    `scrap ${sim.economy.scrap}, salvage ${sim.economy.salvage}`);
+  ok("and kills nothing", horde.killCount === kills0, `${horde.killCount} kills`);
+
+  // THE FEEDBACK IS DELIBERATELY KEPT. It is the only "that connected" signal in the game, and
+  // withholding it for a round trip would make every shot feel 120 ms late.
+  ok("but the hit STILL registers as feedback, so shooting does not feel dead",
+    weapon.hits > hitsBefore && weapon.hitFlash > 0,
+    `hits ${hitsBefore} -> ${weapon.hits}, flash ${weapon.hitFlash.toFixed(2)}`);
+
+  // Emptying a magazine must not creep the health bar. A single shot passing is weaker than it
+  // looks: a bug that dealt a fraction of the damage would pass it and fail here.
+  const hpBeforeBurst = e.hp;
+  for (let i = 0; i < 20; i++) shootAt(e);
+  ok("twenty arbitrated rounds leave it untouched, so nothing leaks a fraction",
+    e.hp === hpBeforeBurst && e.alive,
+    `${e.hp.toFixed(1)} hp after 20 shots`);
+
+  // PROCS ARE THE HALF THAT MATTERS MORE THAN THE DAMAGE. Items subscribes to onHit as well as
+  // onKill, so an unarbitrated local shot would fire splash and arc chains for hits the server
+  // never registered — which is invariant 2b-i's whole concern, arriving through the network
+  // rather than through automation.
+  let heard = 0;
+  sim.events.onHit(() => { heard++; });
+  shootAt(e);
+  ok("and nothing is published on the hit bus, so no proc can fire",
+    heard === 0, `${heard} hit events from an arbitrated shot`);
+
+  weapon.arbitrated = false;
+  shootAt(e);
+  ok("while an unarbitrated shot does publish, so the bus itself is alive",
+    heard === 1, `${heard} hit event once arbitration is off`);
+}
+
+console.log("\n124. Cone spread is a function of an index both ends agree on");
+{
+  // TWO INDEPENDENT WEAPONS, which is the situation that matters: one is the client's and one is
+  // the server's, and they have never exchanged a stream position. Under the old scheme they
+  // agreed only while they made identical draws in identical order, and diverged permanently the
+  // first time a client mispredicted a shot the server refused.
+  const a = makeSim();
+  const b = makeSim();
+
+  const spreadOf = (sim, seq, shotIndex) => {
+    const w = sim.weapon;
+    w.spreadKey = seq;
+    w.shotsThisKey = shotIndex;
+    const origin = new THREE.Vector3(0, 1.5, 0);
+    const dir = new THREE.Vector3(0, 0, -1);
+    // A profile with real spread, so there is something to compare. The rifle's own is small
+    // enough that a bug could hide inside the tolerance.
+    const profile = { ...CFG.combat.weapon, spread: 0.05, pellets: 1, range: 200, damage: 1 };
+    w.arbitrated = true;
+    w.shootFrom(origin, dir, profile, null, sim.player, 0);
+    // shootFrom mutates the direction it is handed, which is how the cone is applied.
+    return dir.clone();
+  };
+
+  const d1 = spreadOf(a, 4242, 0);
+  const d2 = spreadOf(b, 4242, 0);
+  ok("two weapons that never shared a stream scatter one round identically",
+    d1.distanceTo(d2) < 1e-12,
+    `directions match to ${d1.distanceTo(d2).toExponential(1)}`);
+
+  // AND THE STREAMS ARE NOW GENUINELY OUT OF STEP, which is the scenario the hash exists for.
+  // `a` fires three extra rounds; under the old scheme its stream would be six draws ahead and
+  // every subsequent shot would disagree.
+  for (let i = 0; i < 3; i++) spreadOf(a, 999, i);
+  const d3 = spreadOf(a, 5555, 0);
+  const d4 = spreadOf(b, 5555, 0);
+  ok("and still agree after one of them has fired extra rounds the other never saw",
+    d3.distanceTo(d4) < 1e-12,
+    `still matching to ${d3.distanceTo(d4).toExponential(1)} — order-independent`);
+
+  // Different keys must give different cones, or the hash is a constant and the test above is
+  // vacuous. This is the "confirm it actually varies" half.
+  const spreads = new Set();
+  for (let seq = 1; seq <= 40; seq++) spreads.add(spreadOf(a, seq, 0).x.toFixed(9));
+  ok("different sequences give different cones (the hash is not a constant)",
+    spreads.size >= 38, `${spreads.size} distinct directions from 40 sequences`);
+
+  // Two shots on the SAME sequence must differ too. At a high enough fire rate two rounds land in
+  // one tick, and keying only on the sequence would make that burst pinpoint accurate.
+  const s0 = spreadOf(a, 7000, 0);
+  const s1 = spreadOf(a, 7000, 1);
+  ok("and two shots within one tick scatter differently",
+    s0.distanceTo(s1) > 1e-6,
+    `${s0.distanceTo(s1).toExponential(1)} apart — shotsThisKey separates them`);
+
+  // Pellets within one blast, for the same reason: they would otherwise all take the same key.
+  const pelletDirs = new Set();
+  {
+    const w = a.weapon;
+    w.spreadKey = 8000;
+    w.shotsThisKey = 0;
+    const profile = { ...CFG.combat.weapon, spread: 0.05, pellets: 6, range: 200, damage: 1 };
+    for (let p = 0; p < 6; p++) {
+      const dir = new THREE.Vector3(0, 0, -1);
+      w.shootFrom(new THREE.Vector3(0, 1.5, 0), dir, profile, null, a.player, p);
+      pelletDirs.add(dir.x.toFixed(9));
+    }
+  }
+  ok("and every pellet of one blast goes somewhere different",
+    pelletDirs.size === 6, `${pelletDirs.size} distinct of 6 pellets`);
+
+  // SOLO IS UNTOUCHED. Key 0 means "no agreed index", and the seeded stream runs as it always
+  // has — which is what keeps every spread-dependent measurement in these files valid.
+  const c = makeSim();
+  c.weapon.spreadKey = 0;
+  const solo1 = spreadOf(c, 0, 0);
+  const d = makeSim();
+  d.weapon.spreadKey = 0;
+  const solo2 = spreadOf(d, 0, 0);
+  ok("with no agreed index the seeded stream is used, so solo replays identically",
+    solo1.distanceTo(solo2) < 1e-12,
+    "two fresh sims agree, because both draw from the same seed in the same order");
 }
 
 ok("no boarder ever floated off the deck footprint", !sawFloatingBoarder);

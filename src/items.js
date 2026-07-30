@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { CFG, hyperGain } from "./config.js";
 import { makeRandom } from "./util.js";
-import { isSubmerged } from "./enemies.js";
+import { isSubmerged, causedBy } from "./enemies.js";
 
 // The salvage table: what a purchase actually does.
 //
@@ -29,8 +29,9 @@ import { isSubmerged } from "./enemies.js";
 // 3. PROCS ONLY FIRE FOR KILLS THE CREW CAUSED. An on-kill splash triggered by a
 //    shock emitter is automation compounding itself with nobody present -- exactly
 //    what invariant 2b forbids, and exactly why the emitters were made weak and
-//    finite. Every proc gates on `source === "player"`, and a manned deck gun counts
-//    as the player because somebody is sitting in it.
+//    finite. Every proc gates on `causedBy(source, this.player)`, and a manned deck gun
+//    counts as the crew because somebody is sitting in it -- attributed to whoever that
+//    is, since with four operatives "the crew did it" no longer says whose build pays.
 //
 // THE RULE FOR ADDING ANY ITEM HERE: does it let one position do the other's job?
 // An auto-repair drone, a deployable turret, anything that reaches under the hull
@@ -109,6 +110,11 @@ export const ITEM_EFFECTS = {
  */
 export class Items {
   constructor({ economy, player, trampler, weapon, horde, repair, events, seed }) {
+    // Same guard the economy applies, and for a sharper reason: `update` CLEARS and rebuilds
+    // `weapon.damageBonus` every frame, so two runtimes over one weapon are two authors of
+    // one field and one operative's position would buff the other.
+    weapon?.assertOperative?.(player);
+
     this.economy = economy;
     this.player = player;
     this.trampler = trampler;
@@ -125,8 +131,14 @@ export class Items {
     // Subscribed once, never unsubscribed -- same rule as the economy's income. A
     // reset zeroes the stacks, and an item with no stacks does nothing, so there is
     // nothing to detach.
+    // Both arrows forward EVERY argument the bus emits. An arrow that quietly drops one
+    // is how this change first broke: `(e, damage) => this.#onHit(e, damage)` left the
+    // new source `undefined`, so `causedBy` refused every legitimate hit and the arc
+    // caster went completely inert. Seven checks across four sections failed and all of
+    // them pointed here, which is the harness earning its keep -- by inspection the line
+    // looked untouched, because it was.
     events?.onKill((e, source) => this.#onKill(e, source));
-    events?.onHit((e, damage) => this.#onHit(e, damage));
+    events?.onHit((e, damage, source) => this.#onHit(e, damage, source));
 
     this.reset();
   }
@@ -164,8 +176,12 @@ export class Items {
   // ------------------------------------------------------------------- procs
 
   #onKill(e, source) {
-    // The invariant-2b gate. An emitter kill must not chain.
-    if (source !== "player") return;
+    // The invariant-2b gate AND the identity gate, which are one test. An emitter kill
+    // must not chain, and neither must a TEAMMATE'S -- their trigger must not spend the
+    // build hanging off this operative. Through `causedBy` rather than by hand: the two
+    // hand-written spellings, `=== "player"` and `!== null`, both read as working gates
+    // and both fire for every operative's kill.
+    if (!causedBy(source, this.player)) return;
 
     const frag = this.#n("fragment");
     if (frag > 0) this.#splash(e, CFG.items.fragment.damage * frag, CFG.items.fragment.radius);
@@ -181,7 +197,13 @@ export class Items {
     }
   }
 
-  #onHit(e, damage) {
+  #onHit(e, damage, source) {
+    // The gate this channel never had. It was safe only because `shootFrom` is the sole
+    // publisher of a hit and every weapon through it is crew-aimed -- safe by nobody else
+    // emitting rather than safe by a rule, which is the same shape as the burrowed check
+    // that excluded nothing. With a crew it also has to be the RIGHT operative.
+    if (!causedBy(source, this.player)) return;
+
     const arc = this.#n("arc");
     if (arc === 0) return;
     // One roll per hit, not per stack, so stacking raises the chance rather than
@@ -192,9 +214,10 @@ export class Items {
     const nearest = this.#nearestOther(e, CFG.items.arc.range);
     if (!nearest) return;
     this.procs.arc++;
-    // Damage from a proc is still "player" damage: the crew pulled the trigger that
-    // started it. The event bus's depth cap is what stops a chain going forever.
-    this.horde.damage(nearest, damage * CFG.items.arc.share, "player");
+    // Attributed to the operative whose item it is: they pulled the trigger that started
+    // it, so a chain kill pays their purse and can fire their other procs. The event
+    // bus's depth cap is what stops that going forever.
+    this.horde.damage(nearest, damage * CFG.items.arc.share, this.player);
   }
 
   /** Damage everything within `radius` of a corpse, except the corpse. */
@@ -213,7 +236,7 @@ export class Items {
       const dx = o.x - dead.x;
       const dz = o.z - dead.z;
       if (dx * dx + dz * dz > r2) continue;
-      this.horde.damage(o, amount, "player");
+      this.horde.damage(o, amount, this.player);
       struck++;
       if (struck >= CFG.items.fragment.maxTargets) break;
     }

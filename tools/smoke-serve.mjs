@@ -19,6 +19,9 @@ const paths = [
   "/src/fx.js",
   "/src/audio.js",
   "/src/viewmodel.js",
+  // The multiplayer client. Browser-only like the four above it, so the harness
+  // never loads it and this is the only check that asks the server for it at all.
+  "/src/net.js",
   // vendor/, not node_modules/ -- see the comment on the importmap in index.html.
   "/vendor/three/build/three.module.js",
   "/vendor/three/examples/jsm/postprocessing/EffectComposer.js",

@@ -161,6 +161,23 @@ export class Modules {
     return { ...item, socket, fitted: this.count(item.id) };
   }
 
+  /** Restore a socket layout received from authority, without charging or re-fitting. */
+  restore(socketIds) {
+    const next = this.sockets.map((_, i) => {
+      const id = socketIds?.[i] ?? null;
+      return this.catalogue.some((item) => item.id === id) ? id : null;
+    });
+    if (next.every((id, i) => id === this.sockets[i])) return false;
+
+    this.sockets.splice(0, this.sockets.length, ...next);
+    this.ctx.trampler.clearSocketMeshes?.();
+    for (let i = 0; i < this.sockets.length; i++) {
+      if (this.sockets[i]) this.ctx.trampler.fitSocketMesh?.(i, this.sockets[i]);
+    }
+    this.apply();
+    return true;
+  }
+
   /** Strip every socket and restore every baseline. Part of a run reset. */
   reset() {
     this.sockets.fill(null);

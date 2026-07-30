@@ -504,23 +504,45 @@ export class Hud {
     cls(this.route, open ? "panel show" : "panel");
     if (!open) return;
 
-    const signature = run.offers.map((r) => r.id).join(",");
+    // The signature carries the VOTES as well as the offers. Without them this panel
+    // would draw once and then never redraw, because the offers do not change while the
+    // crew is deciding -- so every vote after the first would be invisible, which is the
+    // one thing a live tally must not be.
+    const seats = run.voteSeats;
+    const signature = `${run.offers.map((r) => r.id).join(",")}`
+      + `|${seats.map((s) => s.join("")).join("/")}|${run.deadlocked ? "x" : ""}`;
     if (signature === this.routeSignature) return;
     this.routeSignature = signature;
 
     const nextLeg = run.leg + 1;
     const bossNext = nextLeg >= CFG.run.legs;
-    this.routeHead.textContent = bossNext
+    const crewSize = run.crewSize;
+    const where = bossNext
       ? "CHOOSE THE ROAD — THE LAST ONE"
       : `CHOOSE THE ROAD — LANDMARK ${nextLeg} OF ${CFG.run.legs}`;
+    // A split names itself, because the alternative is a run that has visibly stopped
+    // with no explanation -- and the fix is a thing a player does, not a thing they wait
+    // for. Only ever reachable at an even crew size: with three operatives and two roads
+    // a majority is arithmetically unavoidable.
+    this.routeHead.textContent = run.deadlocked
+      ? `SPLIT ${run.tally.join("–")} — SOMEONE MUST CHANGE THEIR MIND`
+      : crewSize > 1
+        ? `${where}  ·  ${run.votesNeeded} OF ${crewSize} AGREE`
+        : where;
 
     this.routeItems.innerHTML = run.offers.map((r, i) => {
       const { costs, pays } = describeRoad(r);
+      // Named seats rather than a bare count, so an operative can see whether the vote
+      // they just cast is the one on screen. A count alone cannot tell you that.
+      const backing = crewSize > 1 && seats[i].length
+        ? `CREW ${seats[i].join(", ")}`
+        : "";
       return `<div class="road">`
         + `<div class="rn"><span class="key">${i + 1}</span> ${r.name}</div>`
         + `<div class="rd">${r.detail}</div>`
         + `<div class="rc">${costs.join(" · ")}</div>`
         + `<div class="rp">pays ${pays.join(" · ")}</div>`
+        + `<div class="rv">${backing}</div>`
         + `</div>`;
     }).join("");
 
@@ -564,16 +586,25 @@ export class Hud {
     this.help.classList.toggle("hidden");
   }
 
-  /** Returns the new state, so the caller knows who owns the number keys. */
-  toggleBay() {
-    this.bayOpen = !this.bayOpen;
+  /** Set the refit bay from either local input or an authoritative operative snapshot. */
+  setBayOpen(open) {
+    const next = !!open;
+    if (next === this.bayOpen) return this.bayOpen;
+    this.bayOpen = next;
+    // Both panels change ownership with the bay. Invalidate only on an actual transition;
+    // authoritative snapshots repeat the same state at 20 Hz and must not force DOM rebuilds.
     this.baySignature = "";
     this.shopSignature = "";
     return this.bayOpen;
   }
 
+  /** Returns the new state, so the caller knows who owns the number keys. */
+  toggleBay() {
+    return this.setBayOpen(!this.bayOpen);
+  }
+
   closeBay() {
-    this.bayOpen = false;
+    this.setBayOpen(false);
   }
 
   // Guarded against rewriting identical markup: this is called every frame
@@ -758,17 +789,30 @@ export class Hud {
     } else if (gun?.canMount) {
       this.#prompt("F", `MAN THE ${gun.name}`, 1);
     } else if (repair?.target) {
-      // Contested work still happens, just slowly. Saying so matters: the player
-      // needs to know the trade they are making, not be told no. Amber, not red --
-      // red would contradict the bar, which is still filling.
+      // Three readings, and they are genuinely three.
+      //
+      // Contested work still happens, just slowly. Saying so matters: the player needs
+      // to know the trade they are making, not be told no. Amber, not red -- red would
+      // contradict the bar, which is still filling.
+      //
+      // A point somebody else is already welding is the opposite: no work at all, and
+      // nothing the player can trade for it. So it reads in the blocked style and NAMES
+      // THE TEAMMATE, because "hold E and nothing happens" is the same illegibility the
+      // shop's three separate refusal reasons exist to prevent -- and the answer here is
+      // to go and cover them, or take another leg, neither of which a generic refusal
+      // would suggest. `takenBy` is a 1-based seat, so 0 is nobody and the test is a
+      // comparison rather than a truthiness read.
       const pct = Math.round(repair.progress * 100);
+      const taken = repair.takenBy > 0;
       this.#prompt(
         "HOLD E",
-        repair.threatened
-          ? `CONTESTED  ·  ${repair.target.label}  ${pct}%`
-          : `REPAIR ${repair.target.label}  ${pct}%`,
+        taken
+          ? `${repair.target.label}  ·  CREW ${repair.takenBy} IS ON IT`
+          : repair.threatened
+            ? `CONTESTED  ·  ${repair.target.label}  ${pct}%`
+            : `REPAIR ${repair.target.label}  ${pct}%`,
         repair.progress,
-        repair.threatened ? "contested" : repair.active ? "working" : "",
+        taken ? "blocked" : repair.threatened ? "contested" : repair.active ? "working" : "",
       );
     } else if (horde.fusesLit > 0) {
       // A sapper is a timer, and a timer nobody can see is just a leg that

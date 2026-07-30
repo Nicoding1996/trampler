@@ -358,6 +358,14 @@
   #route .road .rd { font-size: 10px; color: var(--ink-dim); margin: 4px 0 6px; }
   #route .road .rc { font-size: 10px; color: var(--bad); }
   #route .road .rp { font-size: 10px; color: var(--accent); }
+  /* Who is backing this road. Empty for a solo crew, and `:empty` collapses it so a
+     lone operative never reads a row about a vote they cannot lose. Same contract the
+     hostiles markers use — a marker that says nothing must occupy nothing. */
+  #route .road .rv {
+    font-size: 10px; color: var(--warn); letter-spacing: 0.06em;
+  }
+  #route .road .rv:empty { display: none; }
+  #route .road .rv:not(:empty) { margin-top: 6px; }
 
   /* ---- salvage pick: the reward for holding a siege. Same geometry as the route
      panel because it occupies the same moment in the run, one step earlier, and
@@ -584,6 +592,19 @@
     cursor: pointer; z-index: 20; gap: 4px;
   }
   #gate.hidden { display: none; }
+  /* Once play has begun, losing pointer lock pauses control ownership but does not reopen
+     session setup. Keep a dim click target so the browser can grant pointer lock again, and
+     hide every title/join child except the action and any real error. */
+  #gate.resume {
+    background: rgba(6,6,10,0.20);
+    backdrop-filter: blur(1px);
+  }
+  #gate.resume > :not(.cta):not(.err) { display: none; }
+  #gate.resume .cta {
+    margin: 0; padding: 12px 18px;
+    background: rgba(12,12,14,0.86); border: 1px solid var(--brass);
+    box-shadow: 0 8px 26px rgba(0,0,0,0.55);
+  }
   #gate h1 {
     margin: 0; font-size: 54px; letter-spacing: 0.36em; font-weight: 700;
     color: var(--ink); text-shadow: 0 0 40px rgba(255,170,80,0.32);
@@ -593,6 +614,42 @@
     background: linear-gradient(90deg, transparent, var(--brass), transparent);
   }
   #gate p { margin: 0; color: var(--ink-dim); font-size: 13px; line-height: 1.7; }
+
+  /* ---- multiplayer, on the gate ----
+     No `position: fixed` anywhere in here on purpose. #gate is a grid and these are
+     flow children of it, which keeps them out of test 67's derived box set -- that
+     set is panels plus anything fixed the HUD writes into, and a join menu is
+     neither. Styled to match the gate rather than the HUD, because it belongs to the
+     moment before the run. */
+  #mp { margin-top: 18px; display: grid; gap: 7px; justify-items: center; }
+  .mp-row { display: flex; gap: 8px; align-items: center; }
+  #mp button {
+    font: inherit; font-size: 11px; letter-spacing: 0.18em;
+    padding: 7px 14px; cursor: pointer;
+    color: var(--ink); background: rgba(20,16,12,0.72);
+    border: 1px solid var(--brass);
+  }
+  #mp button:hover { background: rgba(255,170,80,0.16); }
+  #mp input {
+    font: inherit; font-size: 11px; letter-spacing: 0.30em; text-align: center;
+    text-transform: uppercase; width: 108px; padding: 7px 8px;
+    color: var(--ink); background: rgba(0,0,0,0.5);
+    border: 1px solid rgba(255,170,80,0.34);
+  }
+  #mp input::placeholder { color: var(--ink-dim); letter-spacing: 0.18em; }
+  #mp-status { color: var(--ink-dim); font-size: 10px; letter-spacing: 0.16em; min-height: 12px; }
+  #mp-crew { color: var(--brass); font-size: 10px; letter-spacing: 0.16em; min-height: 12px; }
+  /* Smaller than HOST and JOIN: it is a convenience next to the code, not a third
+     thing to choose between. */
+  #mp-copy { font-size: 9px; padding: 4px 9px; letter-spacing: 0.14em; }
+  #mp-copy[hidden] { display: none; }
+  /* Deliberately in the warning colour and deliberately NOT dimmed. This is the one
+     line on the gate that corrects an expectation the rest of it creates. */
+  #mp-scope {
+    color: var(--warn); font-size: 10px; letter-spacing: 0.12em;
+    max-width: 340px; line-height: 1.5; text-align: center;
+  }
+  #mp-scope:empty { display: none; }
   /* The hint is tucked under the call to action deliberately, so "how to start" and
      "the one thing to know when you do" read as a single block rather than as two
      competing lines. The controls key is pushed clear of both. */
@@ -903,6 +960,37 @@
     <div class="cta">CLICK TO PLAY</div>
     <p class="one"><b>RIGHT MOUSE</b> grapples you aboard &mdash; it is the only way up.</p>
     <p class="keys"><b>H</b> controls</p>
+
+    <!-- Multiplayer lives on the gate rather than behind a key, because choosing to
+         play together is a decision you make BEFORE the run, not during it. It also
+         keeps it out of test 67's way on purpose: it is not a .panel, and #gate is
+         `inset: 0` so the zone check skips it as a full-bleed layer. A join menu is
+         not a readout and should not be competing with the health bars for a corner.
+
+         Clicks and keystrokes inside here are stopped from bubbling by net.js -- the
+         gate's own click starts the game, and keydown is bound to window, so without
+         that, typing a code would fire game keys. -->
+    <div id="mp">
+      <div class="mp-row">
+        <button id="mp-host" type="button">HOST</button>
+        <input id="mp-code" type="text" maxlength="7" placeholder="CODE"
+               autocomplete="off" spellcheck="false" aria-label="Join code">
+        <button id="mp-join" type="button">JOIN</button>
+      </div>
+      <div id="mp-status"></div>
+      <!-- The crew line and a copy button, in one row: the code is the invite, so
+           selecting six characters by hand was the friction between hosting and
+           actually getting somebody in. Hidden until there is a code to copy. -->
+      <div class="mp-row">
+        <div id="mp-crew"></div>
+        <button id="mp-copy" type="button" hidden>COPY LINK</button>
+      </div>
+      <!-- State the authority boundary instead of making players infer it from two
+           screens. net.js updates this when the Worker is ready and again when this
+           browser applies its first authoritative snapshot. -->
+      <div id="mp-scope"></div>
+    </div>
+
     <div class="err" id="gate-err"></div>
   </div>
 

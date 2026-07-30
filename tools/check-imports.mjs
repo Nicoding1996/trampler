@@ -51,9 +51,34 @@ function resolveSpec(spec, fromFile) {
   return { ok: false, target: `unmapped bare specifier "${spec}"` };
 }
 
+// WHAT IS SCANNED, AND WHY IT IS MORE THAN src/.
+//
+// This used to be src/ plus verify.mjs, and that gap cost something twice. worker/ and
+// tools/ both import from src/ across a relative path, and nothing validated those at
+// all: when the crew refactor landed, worker/sim-check.js went on importing fine and
+// calling wrongly, and an earlier round trip was spent on a `CFG.ENEMY_TYPE` that does
+// not exist. Neither is caught here, but the class is -- a renamed or moved module in
+// src/ silently breaks every consumer outside src/, and those consumers are the two
+// places nobody runs by habit.
+//
+// A HONEST NOTE ON WHAT THE BARE-SPECIFIER CHECK MEANS OUTSIDE src/. For src/ this
+// resolves the way the BROWSER will, through index.html's importmap, which is the real
+// resolver for those files. worker/ is resolved by wrangler's bundler and tools/ by
+// Node, both through node_modules -- different resolvers. Since the importmap points
+// into node_modules anyway, checking them here amounts to "the package is on disk",
+// which is weaker than it looks for a bare specifier and exactly right for the relative
+// paths that actually break. Said plainly rather than left to be assumed.
+const jsIn = (dir, ext) =>
+  readdirSync(join(ROOT, dir))
+    .filter((f) => f.endsWith(ext))
+    .map((f) => join(ROOT, dir, f));
+
 const files = [
   ...readdirSync(join(ROOT, "src")).map((f) => join(ROOT, "src", f)),
   join(ROOT, "verify.mjs"),
+  join(ROOT, "server.mjs"),
+  ...jsIn("worker", ".js"),
+  ...jsIn("tools", ".mjs"),
 ];
 
 let bad = 0;

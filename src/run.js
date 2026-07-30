@@ -79,16 +79,64 @@ export const RUN = {
 };
 
 export class Run {
-  /** @param economy pays arrival bonuses and owns the salvage pick offered on a hold. */
-  constructor(director, horde, economy = null, seed = CFG.run.seed) {
+  /**
+   * @param economy pays arrival bonuses and owns the salvage pick offered on a hold.
+   * @param crew    the roster the road is put to. At one member a vote is a keypress.
+   */
+  constructor(director, horde, economy = null, crew = null, seed = CFG.run.seed) {
     this.director = director;
     this.horde = horde;
+    // One personal Economy per active operative, with their Treasury shared underneath.
+    // `economy` remains the primary alias for old solo readers; progression always walks
+    // `economies` so a reward cannot silently stop at seat 1.
+    this.economies = economy ? [economy] : [];
     this.economy = economy;
+    // Set only on snapshot-driven clients, whose local Crew intentionally contains just the
+    // camera operative. The authority itself derives both values from the real roster.
+    this.authorityCrewSize = null;
+    this.authorityVoteSeats = null;
+    // Needed for one question: how many operatives have to agree. Reached through the
+    // crew rather than counted separately, because membership is the crew's business and
+    // a second tally of who exists is a second thing to keep in step.
+    this.crew = crew;
     this.seed = seed;
     this.reset();
   }
 
+  addEconomy(economy) {
+    if (economy && !this.economies.includes(economy)) this.economies.push(economy);
+    this.economy = this.economies[0] ?? null;
+    return economy;
+  }
+
+  removeEconomy(economy) {
+    const i = this.economies.indexOf(economy);
+    if (i >= 0) this.economies.splice(i, 1);
+    this.economy = this.economies[0] ?? null;
+    return i >= 0;
+  }
+
+  /** Snapshot-only vote view for a client that does not construct remote Players. */
+  setAuthorityVotes(crewSize, packedVotes = []) {
+    this.authorityCrewSize = Math.max(0, crewSize ?? 0);
+    this.authorityVoteSeats = this.offers.map(() => []);
+    for (const packed of packedVotes) {
+      const seat = packed >> 2;
+      const index = (packed & 0x03) - 1;
+      if (seat > 0 && this.authorityVoteSeats[index]) {
+        this.authorityVoteSeats[index].push(seat);
+      }
+    }
+    for (const seats of this.authorityVoteSeats) seats.sort((a, b) => a - b);
+  }
+
+  clearAuthorityVotes() {
+    this.authorityCrewSize = null;
+    this.authorityVoteSeats = null;
+  }
+
   reset() {
+    this.clearAuthorityVotes();
     // Re-seeded on reset for the same reason the horde and the director are: the
     // point of the seeds is that two attempts at the same run are comparable, and
     // a stream that carried across a restart would hand the player a different
@@ -101,6 +149,13 @@ export class Run {
     this.offers = [];
     this.history = [];
     this.lastArrival = null;   // payout banner for the frame we arrived
+
+    // Who has voted for which offered road. Keyed by the operative rather than by an
+    // array position: membership order may close up after a disconnect, while the
+    // operative object remains the identity that cast the vote. The stable seat map is
+    // used only when the panel needs a label.
+    /** @type {Map<object, number>} */
+    this.votes = new Map();
 
     // Instance modifiers, never CFG edits. `threatScale` multiplies enemy health,
     // `extraCount` adds to every wave, and the horde's own speedScale is written
@@ -177,29 +232,21 @@ export class Run {
         // on -- but an offer left untaken when the biome ends would sit on screen
         // asking for a keypress that can no longer matter.
         this.phase = RUN.DONE;
-        if (this.economy) this.economy.pendingPick = [];
+        for (const economy of this.economies) economy.pendingPick = [];
       } else {
-        // Seeing off a siege earns a pick. This is the reward beat the shop cannot
-        // provide -- buying something is not the same feeling as being handed it --
-        // and it widens how much of the pool a run actually sees, since four shop
-        // slots a landmark only ever exposes a fraction of it.
-        //
-        // Not offered over the top of one already in hand. Invariant 22f says an offer
-        // must never be overwritten, because an item you were looking at vanishing
-        // reads as a bug rather than as luck -- and the cadence's own payer already
-        // honours that. This branch did not, and the gap only mattered once the pick
-        // started WAITING for a safe window: before that a mid-siege offer was almost
-        // always resolved within a frame or two of being earned, so the hold rarely
-        // found one still open. The window made the rare case ordinary.
+        // The reward is personal: every active operative gets a choice from their own seeded
+        // pool. Existing cadence picks stay banked rather than being overwritten.
         this.phase = RUN.PICKING;
-        if (!this.economy?.pendingPick?.length) this.economy?.offerPick();
+        for (const economy of this.economies) {
+          if (!economy.pendingPick.length) economy.offerPick();
+        }
       }
     }
 
-    // The pick resolves into the road choice. Held here rather than inside
-    // `takePick` so the run owns its own phase order, and so a pick that somehow
-    // fails to resolve cannot strand the run in a state with no way out.
-    if (this.phase === RUN.PICKING && !this.economy?.pendingPick?.length) {
+    // Every active operative resolves their personal pick before the shared road ballot.
+    // A disconnect removes its Economy, so a vanished player cannot strand this phase.
+    if (this.phase === RUN.PICKING
+        && this.economies.every((economy) => economy.pendingPick.length === 0)) {
       this.phase = RUN.CHOOSING;
       this.#offerRoads();
     }
@@ -241,6 +288,142 @@ export class Run {
     return this.history.map((id) => CFG.run.routes.find((r) => r.id === id)?.name ?? id);
   }
 
+  // -------------------------------------------------------------------- the vote
+  //
+  // THE ROAD IS THE ONLY DECISION THE WHOLE CREW LIVES WITH, so it is the only one put
+  // to a vote.
+  //
+  // A road's modifiers are cumulative for the rest of the biome, and there are exactly
+  // THREE road choices in a run -- legs 1->2, 2->3, 3->4, with the fourth being the boss.
+  // That low frequency is what makes a vote affordable here: Ghost Ship's experiment with
+  // negotiated upgrades was divisive because it was every negotiation, and this is three.
+  //
+  // It also costs no tempo, and that is structural rather than lucky. A held siege
+  // already sits in CHOOSING until a human presses a key -- nothing here advances on a
+  // timer, by design -- so putting the choice to the crew spends time the run was already
+  // spending. Pausing for a menu, which co-op cannot afford, is not what this is.
+  //
+  // NO TIMER, deliberately. Three separate versions of a timing rule have failed in this
+  // project for being "on a clock you cannot see", and a road is the last place to
+  // introduce a fourth.
+
+  /** Active roster size, authoritative on a snapshot client and local on the server/solo. */
+  get crewSize() {
+    return this.authorityCrewSize ?? this.crew?.size ?? 1;
+  }
+
+  /**
+   * How many operatives have to agree: a simple majority.
+   *
+   * 1 of 1, 2 of 2, 2 of 3, 3 of 4. Note what falls out at one member -- a majority of
+   * one is one keypress, so solo behaviour is completely unchanged and the whole vote is
+   * invisible until there is somebody to disagree with.
+   */
+  get votesNeeded() {
+    const size = this.crewSize;
+    return Math.floor(size / 2) + 1;
+  }
+
+  /** Votes per offered road, in offer order. */
+  get tally() {
+    if (this.authorityVoteSeats) {
+      return this.authorityVoteSeats.map((seats) => seats.length);
+    }
+
+    const counts = this.offers.map(() => 0);
+    for (const [voter, index] of this.votes) {
+      // Ignore anyone no longer aboard. Same discipline as the repair claim: the roster
+      // is the authority on who exists, so a disconnect cannot leave a vote behind that
+      // nobody can change and that keeps the crew one short of a majority for ever.
+      if (!this.crew?.members.includes(voter)) continue;
+      if (counts[index] !== undefined) counts[index]++;
+    }
+    return counts;
+  }
+
+  /** Seat numbers backing each offered road, for the panel to draw. */
+  get voteSeats() {
+    if (this.authorityVoteSeats) {
+      return this.authorityVoteSeats.map((seats) => seats.slice());
+    }
+
+    const out = this.offers.map(() => []);
+    for (const [voter, index] of this.votes) {
+      const seat = this.crew?.seatOf(voter) ?? 0;
+      if (seat > 0 && out[index]) out[index].push(seat);
+    }
+    for (const seats of out) seats.sort((a, b) => a - b);
+    return out;
+  }
+
+  /** How this operative voted, or -1. */
+  voteOf(voter) {
+    if (this.authorityVoteSeats) {
+      const seat = this.crew?.seatOf(voter) ?? 0;
+      return this.authorityVoteSeats.findIndex((seats) => seats.includes(seat));
+    }
+    return this.votes.has(voter) ? this.votes.get(voter) : -1;
+  }
+
+  /**
+   * Everyone has voted and nobody has a majority.
+   *
+   * THIS IS NOT RESOLVED AUTOMATICALLY, and that is a correction to my own earlier
+   * proposal, which was "ties break to the quiet road". The data does not support it:
+   * `#offerRoads` draws two of six routes, and exactly one route -- the foundry -- has no
+   * cost at all, so most ties would have had no quiet road on the menu to break toward.
+   *
+   * The alternatives were worse. Ranking the offers by payout gets the order wrong,
+   * because the boneyard pays the least in cash and carries the highest threat plus a
+   * free module. Scoring the modifiers means inventing weights across four incommensurable
+   * units -- health, count, speed, visibility -- which is a number defended by nothing.
+   * And "key 1 wins" is deterministic and completely illegible.
+   *
+   * So a tie stays a tie, and the panel says so. Votes are changeable, the run already
+   * waits indefinitely, and any single operative can end it by switching -- which makes
+   * the resolution social rather than arbitrary, and never overrides half the crew.
+   * Ties are only possible at even crew sizes: with three operatives and two roads, a
+   * majority is arithmetically unavoidable.
+   */
+  get deadlocked() {
+    if (!this.choosing) return false;
+    const size = this.crewSize;
+    let cast = 0;
+    if (this.authorityVoteSeats) {
+      for (const seats of this.authorityVoteSeats) cast += seats.length;
+    } else {
+      for (const voter of this.votes.keys()) {
+        if (this.crew?.members.includes(voter)) cast++;
+      }
+    }
+    return cast >= size && Math.max(0, ...this.tally) < this.votesNeeded;
+  }
+
+  /**
+   * Cast or change a vote. Resolves the moment a majority exists.
+   *
+   * Returns the arrival if this vote decided it, otherwise null -- so a caller can tell
+   * "the crew has moved on" from "your vote was recorded and we are still waiting", which
+   * are different things to draw.
+   */
+  vote(voter, index) {
+    if (this.phase !== RUN.CHOOSING) return null;
+    if (!this.offers[index]) return null;
+    if (!voter) return null;
+
+    this.votes.set(voter, index);
+
+    // Resolved as soon as the outcome cannot be overturned, rather than when the last
+    // operative has voted. With three of four agreed there is nothing left to wait for,
+    // and waiting anyway would make the fourth player's silence hold up the run.
+    const counts = this.tally;
+    const needed = this.votesNeeded;
+    for (let i = 0; i < counts.length; i++) {
+      if (counts[i] >= needed) return this.choose(i);
+    }
+    return null;
+  }
+
   /**
    * A free pick every few waves the crew sees off, not only at the end of a siege.
    *
@@ -267,7 +450,7 @@ export class Run {
    */
   #payWavePick() {
     const d = this.director;
-    if (!d || !this.economy) return;
+    if (!d) return;
     if (d.resolved === this.seenResolved) return;
     this.seenResolved = d.resolved;
 
@@ -277,14 +460,18 @@ export class Run {
     // its own a moment later. Two offers a frame apart would replace the first.
     if (d.wave >= d.siegeLength) return;
     if (d.wave % every !== 0) return;
-    if (this.economy.pendingPick.length > 0) return;
 
-    this.economy.offerPick();
+    for (const economy of this.economies) {
+      if (economy.pendingPick.length === 0) economy.offerPick();
+    }
   }
 
   #offerRoads() {
     const pool = CFG.run.routes.slice();
     this.offers = [];
+    // A fresh ballot per landmark. Cleared here rather than in `choose`, so the votes
+    // survive long enough for the arrival frame to still be able to report the split.
+    this.votes.clear();
 
     for (let i = 0; i < CFG.run.branches && pool.length > 0; i++) {
       const pick = (this.random() * pool.length) | 0;
@@ -305,6 +492,11 @@ export class Run {
   /**
    * Take one of the offered roads. Advances the leg, applies the modifiers, pays
    * the arrival bonus, and restarts the director for the next siege.
+   *
+   * Still public, and still the thing that actually commits: `vote` calls it once a
+   * majority exists. Kept separate because they answer different questions -- this one is
+   * "the crew is taking this road", which a test setting up a later landmark wants to say
+   * directly without staging a ballot to say it.
    *
    * Payouts land on ARRIVAL, before the fight, on purpose: you are paid for
    * choosing the hard road while you can still spend it on surviving the hard
@@ -330,14 +522,19 @@ export class Run {
     this.fogScale *= road.fog;
     this.horde.speedScale *= road.speed;
 
-    if (this.economy) {
-      this.economy.grant(road.salvage, road.scrap, `ARRIVED: ${road.name}`);
-      if (road.module) this.economy.grantModuleCredit();
-      // A new landmark restocks the shop. This is the other half of what makes a
-      // build vary: the pool is larger than the keyboard, so what is on sale changes
-      // as you travel, and a plan made at the first landmark cannot simply be
-      // repeated at the third.
-      this.economy.rollOffers();
+    const label = `ARRIVED: ${road.name}`;
+    const [firstEconomy, ...otherEconomies] = this.economies;
+    if (firstEconomy) {
+      // Salvage is personal, so every operative receives it. Scrap and module credit
+      // are Treasury accessors shared by all Economies and must be credited once.
+      firstEconomy.grant(road.salvage, road.scrap, label);
+      if (road.module) firstEconomy.grantModuleCredit();
+      for (const economy of otherEconomies) economy.grant(road.salvage, 0, label);
+
+      // Each personal shop owns its own seeded stream and is re-rolled at the new
+      // landmark. Walking every active Economy preserves the solo draw while ensuring
+      // no operative is left with the previous landmark's stock.
+      for (const economy of this.economies) economy.rollOffers();
     }
 
     this.lastArrival = {

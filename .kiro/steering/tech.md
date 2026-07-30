@@ -38,6 +38,14 @@ node --check <file> # syntax only
 node tools/summarise.mjs run.txt          # failures + totals from a run
 node tools/summarise.mjs run.txt 87 88    # ...plus those sections in full
 node tools/scene-cost.mjs                 # draw calls, triangles, shadows, lights
+node tools/sim-cost-window.mjs            # per-frame cost ACROSS a run, by density
+
+# multiplayer
+npm run dev:mp        # the lobby on 8787; the game stays on 5173
+npm run smoke:lobby   # tick rate and named refusals, against a running lobby
+npm run sim           # can the real sim load and step? plain node, no server
+npm run sim:worker    # the same question inside workerd, and it times it itself
+BASE=https://... npm run sim:worker       # ...and against the deployed edge
 
 # invariant 21, after a change to a simulation module or a seed
 node verify.mjs > d1.txt && node verify.mjs > d2.txt && npm run diff
@@ -49,11 +57,16 @@ node verify.mjs > d1.txt && node verify.mjs > d2.txt && npm run diff
 
 - `npm run verify` green. It prints `N/N checks passed` with nothing above it
   marked FAIL.
-- `npm run audit` clean, if the change touched `src/`, `index.html` or the frame
-  loop.
+- `npm run audit` clean, if the change touched `src/`, `worker/`, `index.html`, a
+  wrangler config or the frame loop.
 - `npm run imports` clean, if the change touched an import.
 - `npm run smoke` clean, if the change touched `server.mjs`, `index.html` or
   `assets/`. Needs the server running.
+- `npm run sim` clean, if the change touched the **signature** of anything the
+  spike constructs — `World`, `Trampler`, `Player`, `Crew`, `Horde`, `Director`,
+  `Weapon`, `Events` — or their per-frame arguments. No static check covers this
+  and the harness does not either, because the spike is a separate call site.
+  It is the one that rotted, and it takes a second.
 - Two runs diffed, if the change touched a simulation module or a seed. That is
   the only thing that confirms invariant 21, and it is the only reason to run the
   suite twice.
@@ -102,7 +115,7 @@ the verification.
 ## Verification
 
 `verify.mjs` runs the real simulation modules in Node with no DOM and no
-renderer: 107 sections, 803 assertions. The failure modes here — drift, being
+renderer: 114 sections, 1015 assertions. The failure modes here — drift, being
 yanked off a turning deck, an anchor that does not track the hull, an enemy
 shielded by geometry, an automated defence that quietly holds a position — are
 invisible to inspection and tedious to confirm by hand.
@@ -121,11 +134,29 @@ path referenced in code resolves, that every element id and CSS class the code
 writes exists in the markup, that the headless boundary holds, that no simulation
 module has reintroduced `Math.random`, that nothing is exported and forgotten,
 that no config knob is unread, that `main.js`'s frame context provides every field
-its readers destructure, and that the harness's frame order matches the game's.
+its readers destructure, that the harness's frame order matches the game's, and
+that the wrangler configs name a Durable Object class the Worker really exports.
 
-That last one earned its keep immediately: it found the only piece of wiring in
+That penultimate one earned its keep immediately: it found the only piece of wiring in
 the project with no test behind it. The lesson generalises, and it lives in
 `structure.md` under "The number keys have exactly one owner per frame".
+
+**BOTH OF THOSE SCOPED TO `src/` AND THAT COST SOMETHING TWICE.** `worker/` and
+`tools/` had no import resolution, no CFG-path validation and no export checking at all.
+The first bill was small: a `CFG.ENEMY_TYPE` that does not exist, found by hand. The
+second was not — the Crew refactor changed three signatures, `worker/sim-check.js` went
+on passing a `Player` to all three, and the spike that decides whether a Durable Object
+can host the authoritative simulation sat broken and silent.
+
+Both now cover `worker/`, `tools/` and `server.mjs`: imports went 128 → 198 specifiers,
+and the audit's server-side scope holds the headless boundary and the no-`Math.random`
+rule there too, where both matter *more* than in `src/` — workerd has no DOM to degrade
+against, and an unseeded draw on the authority desyncs every client at once.
+
+Note the limit honestly, because it is what made the expensive failure expensive: **no
+static check catches a `Player` passed where a `Crew` was wanted.** Both are objects and
+the call is arity-legal, since `seed` defaults. The only thing that catches it is running
+the file, which is why `npm run sim` exists and needs no server.
 
 `npm run smoke` is the only check that touches the HTTP layer, and it needs the
 server running. The harness loads modules straight off disk, so a wrong MIME type,
@@ -178,6 +209,21 @@ correctly. Only paths that genuinely resolve outside the root are worth assertin
 - Inline `node -e` returned empty three times in a row in the same session for a script
   that worked verbatim from a file. The existing rule about putting non-trivial scripts
   under `tools/` applies to *trivial* ones too once the wrapper starts misbehaving.
+- **The wrapper MULTIPLEXES every command onto one shell**, which is the root of several
+  quirks above and has its own consequences:
+  - If a call returns your command echoed back, it **started**. If it returns genuinely
+    empty output, it silently did **not** run — reissue it.
+  - Once a long run is in flight, poll it **only with file reads**. Any other shell
+    command clobbers it: one cleanup command killed a `verify.mjs` run and showed up as
+    a `^C` in the middle of the output file.
+  - Reading a file at an offset past its current end returns "empty", so bisecting
+    offsets is a reliable way to see how far a run has got.
+  - Do not accumulate background terminals. When the shell goes dead, stopping them
+    revives it — but never while a run is in flight.
+- A long-lived server (`npm run dev:mp`, `npm start`) wants a background process rather
+  than a shell command, and stopping it when finished is part of the task. `wrangler dev`
+  takes tens of seconds to become ready and prints `Ready on http://127.0.0.1:8787`; the
+  spinner frames before that are not a hang.
 
 ## Tests that lie — check for these before trusting a pass
 
@@ -340,6 +386,63 @@ Every one of these produced a green or red result that was wrong:
   matching over source text has to have its *matching* verified, not just its verdict
   read.
 
+  That rule was applied to the audit's own extension to `worker/` and `tools/`, and it
+  paid immediately. Check 1's CFG-path count stayed at **266** after being pointed at 30
+  more files, which reads exactly like a broken scan. A throwaway probe file with a
+  deliberately bad path moved it to 267 and was reported correctly — so 266 was a real
+  fact (every CFG path used outside `src/` is also used inside it), not a silent failure.
+  Check 10 was verified the same way, with a throwaway `wrangler.probe.jsonc`. Neither
+  verdict was believed until its matching had been made to fail on purpose.
+
+- **A CLOCK THAT DOES NOT TICK, REPORTED AS A FAST RESULT.** The worst false green in the
+  project so far, because of what it would have greenlit.
+
+  `worker/sim-check.js` timed a synchronous 400-body loop with `Date.now()` and divided.
+  Cloudflare freezes `Date.now()` **and** `performance.now()` during synchronous
+  execution as a Spectre mitigation — they advance only after I/O — so on the deployed
+  Worker the elapsed time is exactly **0**, `msPerFrame` is 0, and the reader printed
+  `COMFORTABLE — a DO can host this at 60 Hz  (0.0 ms of CPU per second)`. The number
+  that decides whether the whole netcode architecture is possible, affirmed by a
+  measurement of nothing.
+
+  It survived because **local workerd advances timers normally.** So it read plausibly
+  under `npm run dev:mp` and would only have fabricated the deployed run, which is the
+  run that was supposed to be authoritative — edge hardware not being a dev machine was
+  the entire reason for taking it.
+
+  Three things to carry forward. A timing figure needs a name that cannot be read as a
+  fact when the clock failed: `selfTimedMsPerFrame` is `null` now, with a `clockAdvanced`
+  flag beside it, and a null cannot be mistaken for fast. **A measurement whose sign
+  cannot be checked is not a measurement** — a delta of zero and a delta that ran
+  backwards are both failures, and the reader exits on either rather than reporting a
+  verdict. And the pattern for measuring an untrustworthy server was already in the
+  adjacent file: `worker/index.js` measures its tick rate on the *client's* clock and
+  says why, in a comment, which nobody read before writing the same bug ten metres away.
+
+- **A BENCHMARK MEASURING THE CHEAPEST MOMENT IN THE RUN.** Fixing the clock produced a
+  workerd figure of 0.362 ms/frame against 0.938 measured in plain node — workerd
+  apparently 2.6x faster than Node at running the same V8 on the same box. Not credible,
+  so the measurement was wrong rather than the runtime fast.
+
+  It was neither the clock nor the runtime: `performance.now()` and `Date.now()` agree to
+  three decimals here. It was **crowd density**. Cost per frame swings six-fold as 400
+  bodies converge from a 63 m spawn ring to under an 8 m hull, so differencing a short
+  run against a long one prices whichever phase happens to dominate the difference.
+  `structure.md` has the table under "Crowds".
+
+  And a coda that applies to every figure above: **one run is not a measurement.** Four
+  runs of the identical spike gave 0.62, 0.83, 0.88 and 0.94 ms/frame, so the "2.6x
+  discrepancy" that started this was itself partly noise — the density effect is real and
+  reproducible, the absolute number is ±35%, and both of those needed saying. Quote the
+  range, and treat any single ms/frame reading in this project as one sample.
+
+  Two lessons, and the second is the general one. **A profiler is a test and can be
+  vacuous the same way** — this is "sampling at the wrong moment in a sequence", the trap
+  that caught the boss escort and the chewer floor, except it caught a performance figure
+  and that figure then sat in two steering files for months. And **an implausible result
+  is data**: "2.6x faster than Node" was the finding, not an inconvenience, and chasing
+  why is what produced the density curve.
+
 ## Performance
 
 "The game is laggy" has four possible causes with four different fixes, and picking
@@ -349,9 +452,16 @@ symptoms, the fix for each, and what this project actually turned out to have ar
 in `structure.md` under "Render cost, and where it comes from".
 
 The instinct worth correcting: it is rarely the GPU and rarely a browser limit.
-WebGL draws on the GPU, the whole simulation costs 0.40 ms a frame with 400
-enemies, and browsers hold 60 fps comfortably at a few hundred draw calls. Reach
-for the measurement before reaching for that explanation.
+WebGL draws on the GPU, the whole simulation costs roughly 0.6 – 0.95 ms a frame with
+400 enemies — about 40 – 55 ms of CPU per wall-clock second — and browsers hold 60 fps
+comfortably at a few hundred draw calls. Reach for the measurement before reaching for
+that explanation.
+
+That figure used to read 0.40 ms, which is test 17's number, and test 17 samples the
+one moment 400 bodies are maximally spread out. Simulation cost here scales with crowd
+DENSITY, not head count, and swings six-fold across a single wave.
+`node tools/sim-cost-window.mjs` prints the curve; `structure.md` has the table under
+"Crowds".
 
 ## Coordinate traps
 

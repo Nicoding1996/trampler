@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { CFG, ENEMY_TYPE_KEYS, enemyCfg, afterArmour } from "./config.js";
 import { makeRandom, clamp, lerp, smoothstep } from "./util.js";
-import { Look, enemyGeometry } from "./look.js";
+import { Look, enemyGeometry, animateHorde } from "./look.js";
 
 // Pooled horde on InstancedMesh with a spatial hash for separation.
 //
@@ -78,6 +78,26 @@ export { S as ENEMY_STATE };
  * `TypeError`. A typo'd import is a load error; a typo'd property is a wrong answer.
  */
 export const isSubmerged = (e) => e.state === S.BURROWED;
+
+/**
+ * Did `operative` cause this damage? The ONLY question anything may ask of a source.
+ *
+ * Exported for the same reason `isSubmerged` is: the obvious hand-written spellings are
+ * both wrong, and both wrong silently.
+ *
+ *   `source === "player"`   was right with one operative and names a KIND, not a person,
+ *                           so with a crew it fires every operative's procs off every
+ *                           other operative's kills.
+ *   `source !== null`       satisfies invariant 2b -- automation is excluded -- and has
+ *                           exactly the same bug, which is why it is the tempting one.
+ *
+ * Both questions collapse into one identity test, and that is not a coincidence to be
+ * relied on quietly: "this operative caused it" excludes automation as a side effect,
+ * because no subsystem is ever equal to a Player. The `!!operative` guard is what stops
+ * that collapsing the other way -- with no operative to compare against, an unattributed
+ * source must not match an absent one.
+ */
+export const causedBy = (source, operative) => !!operative && source === operative;
 
 const _v = new THREE.Vector3();
 const _local = new THREE.Vector3();
@@ -209,8 +229,10 @@ export class Horde {
     this.deckFlow = this.#buildDeckFlow();
 
     // Counters, for audio and the HUD. Polling a counter keeps the simulation
-    // unaware that a mixer or a particle system exists.
+    // unaware that a mixer or a particle system exists. `deathCount` includes unpaid
+    // removals such as a detonating sapper; `killCount` remains paid kills only.
     this.killCount = 0;
+    this.deathCount = 0;
 
     // The event bus, for the one thing a counter cannot carry: which enemy died.
     // Assigned by the owner rather than required, so a Horde can be built purely
@@ -238,6 +260,26 @@ export class Horde {
         // written yet", which forces one upload on the frame it appears rather than
         // inheriting whatever the previous occupant of this pool slot looked like.
         tintBand: -1,
+        // Where this body is in its walk cycle, so forty of them do not march in
+        // step. Presentation only.
+        //
+        // FROM THE POOL INDEX, and that is the whole point rather than laziness.
+        // Drawing it from CFG.enemies.seed would advance that stream, and invariant
+        // 21 is that two runs of the same seed are the same fight -- a phase offset
+        // nobody can perceive is not worth spending a draw on. It is the same rule
+        // that put cone spread on a hashed index instead of a stream.
+        //
+        // The GOLDEN ANGLE rather than a plain fraction, because adjacent pool slots
+        // are handed out together: spawning ten in a row off `i * 0.1` would give ten
+        // bodies almost the same phase, which is the marching this exists to avoid.
+        // A low-discrepancy step scatters neighbours by construction.
+        //
+        // Note it is stable per SLOT, not per body, so a recycled slot inherits the
+        // phase. That is correct -- the value is arbitrary and only has to be steady
+        // for one life and varied across the crowd. It could not come from the
+        // instance index, which is compacted every frame as bodies die and would make
+        // the cycle jump.
+        gaitPhase: (i * 2.39996323) % (Math.PI * 2),
         x: 0, y: 0, z: 0, vx: 0, vz: 0,
         state: S.HUNT_LEG, legIndex: 0, routeIndex: 0, climbT: 0, atkCd: 0,
         onHull: false, yaw: 0, flash: 0,
@@ -283,15 +325,28 @@ export class Horde {
     this.meshes = ENEMY_TYPE_KEYS.map((key) => {
       const cfg = CFG.enemies[key];
       const skin = skins[key];
+      const gait = CFG.enemies.gait;
       const mesh = new THREE.InstancedMesh(
         enemyGeometry(key, cfg),
-        Look.std(`enemy_${key}`, {
-          color: skin.color,
-          emissive: skin.emissive,
-          emissiveIntensity: 0.35 * cfg.glow,
-          roughness: skin.roughness ?? 0.72,
-          metalness: skin.metalness ?? 0.08,
-        }),
+        // The walk cycle is patched onto the material rather than the mesh, because
+        // it lives in the vertex shader and there is one material per type. Cadence
+        // is divided by bulk so mass sets stride rate -- a titan does not pedal like
+        // a chewer.
+        animateHorde(
+          Look.std(`enemy_${key}`, {
+            color: skin.color,
+            emissive: skin.emissive,
+            emissiveIntensity: 0.35 * cfg.glow,
+            roughness: skin.roughness ?? 0.72,
+            metalness: skin.metalness ?? 0.08,
+          }),
+          {
+            rate: gait.rate / Math.pow(cfg.bulk, gait.bulkDrag),
+            swing: gait.swing,
+            bob: gait.bob,
+            sway: gait.sway,
+          },
+        ),
         CFG.enemies.max,
       );
       mesh.name = `horde_${key}`;
@@ -309,9 +364,23 @@ export class Horde {
       for (let i = 0; i < CFG.enemies.max; i++) m.setColorAt(i, _white);
       m.instanceColor.setUsage(THREE.DynamicDrawUsage);
 
+      // Per-instance gait: (phase, amplitude). Allocated up front for the same
+      // reason as the colour buffer, and uploaded on the same terms as the matrix --
+      // amplitude tracks speed, so it genuinely does change every frame and there is
+      // no dirty-tracking to be had. Two floats against the matrix's sixteen.
+      const anim = new THREE.InstancedBufferAttribute(
+        new Float32Array(CFG.enemies.max * 2), 2,
+      );
+      anim.setUsage(THREE.DynamicDrawUsage);
+      m.geometry.setAttribute("aAnim", anim);
+
       scene.add(m);
     }
+    // The raw Float32Arrays, indexed by type, so the write loop does not walk
+    // mesh.geometry.attributes.aAnim.array for every one of 400 bodies a frame.
+    this.animArrays = this.meshes.map((m) => m.geometry.attributes.aAnim.array);
     this.wasFlashing = false;
+    this.gaitT = 0;
 
     // Spoil heaps over burrowing enemies.
     //
@@ -440,6 +509,8 @@ export class Horde {
     this.underHull = 0;
     this.aboard = 0;
     this.burrowed = 0;
+    this.fuseWarning = 0;
+    this.fusesLit = 0;
 
     // Re-seed, so a restarted encounter is the SAME fight. Seeding exists to make
     // two attempts comparable; carrying the stream across a reset would hand the
@@ -454,9 +525,45 @@ export class Horde {
 
   // ------------------------------------------------------------------ update
 
-  update(dt, player) {
+  /**
+   * Refresh snapshot-driven bodies without running enemy simulation.
+   *
+   * Authoritative clients deliberately skip update(): running AI, collision, contact damage
+   * or the spatial hash locally would immediately disagree with the server. They still need
+   * the visual clock, hit-flash decay and instance buffers once per rendered frame, otherwise
+   * every received transform remains invisible until some unrelated local update occurs.
+   */
+  updateSnapshotVisuals(dt = 0) {
+    this.gaitT = (this.gaitT + dt) % 3600;
+    for (const m of this.meshes) {
+      if (m.material.userData.gait) m.material.userData.gait.uGaitTime.value = this.gaitT;
+    }
+    for (const e of this.pool) {
+      if (e.alive && e.flash > 0) e.flash = Math.max(0, e.flash - dt);
+    }
+    this.#writeInstances();
+  }
+
+  /**
+   * @param crew a Crew, not a Player. Contact damage is one of exactly three places
+   *        the simulation asks about the crew as a group: anything adjacent hurts
+   *        whoever is adjacent, and with a single operative the other three would have
+   *        been untouchable by anything they walked into.
+   */
+  update(dt, crew) {
     const t = this.trampler;
     const en = CFG.enemies;
+
+    // The gait clock. Write-only presentation state: nothing in the simulation reads
+    // it, nothing branches on it, and it is never printed, so it cannot show up in a
+    // determinism diff. Wrapped at a large multiple of a full turn so a long session
+    // does not push it into the range where float precision coarsens sin().
+    this.gaitT = (this.gaitT + dt) % 3600;
+    for (const m of this.meshes) {
+      // Present whether or not a shader was ever compiled -- animateHorde installs it
+      // on the material, and the harness compiles nothing.
+      if (m.material.userData.gait) m.material.userData.gait.uGaitTime.value = this.gaitT;
+    }
     const pool = this.pool;
     const grid = this.grid;
 
@@ -840,16 +947,31 @@ export class Horde {
         }
       }
 
-      // Anything adjacent hurts the player, on deck or on the sand -- except
+      // Anything adjacent hurts whoever is adjacent, on deck or on the sand -- except
       // something that is currently underground, which cannot touch anybody.
-      if (e.state !== S.BURROWED && cfg.damage > 0) {
-        const dx = player.position.x - e.x;
-        const dy = player.position.y - e.y;
-        const dz = player.position.z - e.z;
+      //
+      // ONE OPERATIVE PER ATTACK COOLDOWN, and that is a deliberate choice rather than
+      // a detail of the loop. `atkCd` gates the swing, not the victim, so breaking
+      // after the first hit keeps a chewer's damage output exactly what it has always
+      // been -- 9.9 hp/s, the number every measurement in the invariants was taken
+      // against. Letting one swing hit everybody in reach would silently multiply
+      // enemy damage by crew size, which is the wave-size curve being changed by
+      // accident (invariant 19e) and would make every recorded survival time wrong.
+      //
+      // Whether an attack SHOULD splash across a bunched-up crew is a real design
+      // question and belongs to the crew-scaling work, where it can be measured. It is
+      // not a question this change is allowed to answer.
+      if (e.state !== S.BURROWED && cfg.damage > 0 && e.atkCd <= 0) {
         const reach = en.playerReach + cfg.radius - 0.5;
-        if (dx * dx + dy * dy + dz * dz < reach * reach && e.atkCd <= 0) {
-          player.hurt(cfg.damage);
+        const reach2 = reach * reach;
+        for (const p of crew) {
+          const dx = p.position.x - e.x;
+          const dy = p.position.y - e.y;
+          const dz = p.position.z - e.z;
+          if (dx * dx + dy * dy + dz * dz >= reach2) continue;
+          p.hurt(cfg.damage);
           e.atkCd = 1 / cfg.attackRate;
+          break;
         }
       }
     }
@@ -1232,6 +1354,32 @@ export class Horde {
       _m.compose(_v.set(e.x, e.y, e.z), _q, _scl);
       mesh.setMatrixAt(i, _m);
 
+      // Per-instance gait: phase, then amplitude from how fast this body is actually
+      // travelling.
+      //
+      // AMPLITUDE FROM SPEED is what keeps this out of the trap the net.js walk cycle
+      // was written around and that the test suite has been caught by three times:
+      // sampling an oscillating state at one instant. A fixed-amplitude cycle would
+      // have every parked body pedalling on the spot, and "parked" is not an edge case
+      // here -- it is a chewer latched to a leg, which is the whole under-hull fight.
+      //
+      // Latched is zeroed OUTRIGHT rather than left to the speed term, because a
+      // latched body is carried by the hull and its velocity is the hull's, not its
+      // own. It would read as sprinting while standing still on a moving leg.
+      //
+      // Normalised against speedOf() rather than cfg.speed so a road that makes the
+      // horde faster does not peg every amplitude at full and flatten the cue.
+      // sqrt of the sum rather than Math.hypot, and the attribute array cached at
+      // build time rather than walked per body. Both match what the rest of this file
+      // already does in its hot loops -- hypot pays for overflow handling that a
+      // velocity in metres per second does not need.
+      const anim = this.animArrays[e.type];
+      const ref = this.speedOf(enemyCfg(e.type));
+      anim[i * 2] = e.gaitPhase;
+      anim[i * 2 + 1] = e.latched
+        ? 0
+        : clamp(Math.sqrt(e.vx * e.vx + e.vz * e.vz) / Math.max(ref, 1e-6), 0, 1);
+
       // Per-instance tint, so a hit is unmistakable. Without it there is no way
       // to tell a shot that connected from one that was swallowed by geometry.
       if (e.flash > 0) {
@@ -1289,6 +1437,10 @@ export class Horde {
       const mesh = this.meshes[i];
       mesh.count = counts[i];
       mesh.instanceMatrix.needsUpdate = true;
+      // Unconditional, unlike the colour buffer. Amplitude follows speed, so it
+      // really does change on almost every frame for almost every body, and a
+      // dirty check would cost a comparison per instance to save nothing.
+      mesh.geometry.attributes.aAnim.needsUpdate = true;
       if (mesh.instanceColor && (anyFlash || this.wasFlashing)) {
         mesh.instanceColor.needsUpdate = true;
       }
@@ -1342,18 +1494,26 @@ export class Horde {
    * ignore armour and quietly make the bulwark pointless.
    */
   /**
-   * `source` says WHO killed it, and it exists to protect invariant 2b.
+   * `source` is WHOEVER caused it, and it exists to protect invariant 2b.
    *
-   * Item procs -- on-kill chains, on-hit arcs -- may only fire for kills the player
-   * caused. Without this, a shock emitter killing something under the hull would
-   * trigger a fragmentation proc that kills two more, which is automation holding
-   * a position unattended: exactly the failure the emitters were deliberately made
-   * weak and finite to avoid. Income is paid for every kill regardless; only procs
-   * are gated.
+   * It used to be a STRING -- "player" for anything the crew aimed, "emitter" for
+   * automation -- and every proc gated on `source === "player"`. That was the same
+   * question while there was one operative and a different one the moment there were
+   * two: it says what KIND of thing caused the kill and not WHICH person, so with a
+   * crew, one operative's kills would fire another operative's procs and their splash
+   * would heal somebody else. A string cannot name a person.
    *
-   * Optional, so the ~200 existing `damage(e, amount)` calls in the harness are
-   * unaffected and simply proc nothing, which is the correct behaviour for a test
-   * that is measuring something else.
+   * So a source is now the causer itself: an operative for anything the crew aimed, or
+   * the subsystem for automation -- the Emitters instance for a shock emitter. Ask the
+   * question through `causedBy`, never by hand, because the two rules collapse into one
+   * identity test and writing it out invites writing it wrong. `by !== null` would
+   * satisfy invariant 2b and silently let a teammate's kill proc yours.
+   *
+   * Income is paid for every kill regardless of source; only procs are gated.
+   *
+   * Still optional, so the ~200 bare `damage(e, amount)` calls in the harness are
+   * unaffected and simply proc nothing, which is the correct behaviour for a test that
+   * is measuring something else.
    */
   damage(e, amount, source = null, pierce = 0) {
     if (!e.alive) return false;
@@ -1379,6 +1539,7 @@ export class Horde {
     // for an unpaid removal, because a sapper's charge going off is exactly the
     // moment that most wants a bang.
     this.lastKill = { x: e.x, y: e.y, z: e.z, type: e.type, paid };
+    this.deathCount++;
     if (!paid) return;
     this.killCount++;
     // Single choke point for every kill in the game, whatever fired the shot --

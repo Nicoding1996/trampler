@@ -3,7 +3,7 @@ import { CFG, ENEMY_TYPE_KEYS } from "./config.js";
 import { makeRandom } from "./util.js";
 import { ITEM_EFFECTS } from "./items.js";
 import { PHASE } from "./waves.js";
-import { isSubmerged } from "./enemies.js";
+import { isSubmerged, causedBy } from "./enemies.js";
 
 // Module-level scratch for the terminal range check, which runs several times a frame.
 // Deliberately NOT shared with anything the harness uses: `_probe` in verify.mjs was
@@ -49,12 +49,149 @@ const _term = new THREE.Vector3();
 // alone. One home for "what an upgrade does", rather than the static half here and
 // the interesting half somewhere else.
 
-export class Economy {
-  // How many resolved waves have already been paid for. Polled against the
-  // director rather than driven by a callback, so the director stays unaware that
-  // an economy exists at all.
+/**
+ * The crew's half of the economy: the shared purse, the fortress stack counts, and the
+ * free module fits. ONE of these per crew, however many operatives there are.
+ *
+ * WHY THIS EXISTS, MEASURED RATHER THAN REASONED
+ *
+ * `applyAll()` recomputes every effect absolutely from its stack counts, which is the
+ * discipline that makes `reset()` trivially correct -- it is the same code path with every
+ * count at zero, so there is no separate revert path to forget. That is exactly right with
+ * one owner and destructive with two, because two of those effects write to SHARED objects:
+ * `plating` sets `trampler.damageScale` and `rig` sets `repair.rateScale`.
+ *
+ * Reproduced before it was fixed (`tools/economy-collision.mjs`): crew 1 buys four hull
+ * plates and three repair rigs, crew 2 buys something purely personal, and the fortress
+ * silently returns to `plating=1.0000 repairRate=x1.00`. Four plates and three rigs
+ * deleted. The nastiest part is that the STACKS survived -- crew 1's economy still read
+ * `plating x4` -- so the shop and the build readout kept telling the crew they owned full
+ * plating while the hull took full damage. It would have been filed as "plating feels
+ * useless".
+ *
+ * THE FIX IS NOT AN OWNERSHIP FLAG, and that is worth stating because a flag was the
+ * obvious answer and it is the wrong one. The collision is caused by the COUNTS being
+ * duplicated, not by the effects being applied twice: once every operative reads the same
+ * shared count, every one of them computes `0.85 ** 4` and writes the same number, and the
+ * absolute recompute becomes idempotent across the crew. Nothing needs to decide who is
+ * allowed to apply the fortress track, which means there is no flag to set wrongly and no
+ * "am I the special one" branch for a later reader to misread.
+ *
+ * It is also just the honest model. Fortress refits are bought with shared scrap because
+ * invariant 22 says the bounded track is paid for together; crew state belongs to the crew.
+ */
+export class Treasury {
+  // How many resolved waves have already been paid for. Lives HERE rather than on each
+  // Economy, and that is the second half of the double-pay bug: the wave-clear payout was
+  // polled per operative, so four operatives each advanced their own counter and each paid
+  // the crew, and a resolved wave paid four times into one pot.
   #resolvedSeen = 0;
 
+  /**
+   * @param director polled for resolved waves and for the early-call multiplier.
+   * @param events   the kill bus. Subscribed ONCE for the whole crew, which is what stops
+   *                 a single corpse paying scrap once per operative.
+   */
+  constructor({ director = null, events = null } = {}) {
+    this.director = director;
+    this.events = events;
+
+    // The shared half of income, hooked exactly once. Each Economy keeps only the
+    // personal half, so nothing is paid twice and nothing is paid to the wrong person.
+    //
+    // AND ON A PREDICTING CLIENT, NOTHING MAY BE HOOKED AT ALL. Recorded here because
+    // this line is where the mistake gets made, and it is silent.
+    //
+    // Under the netcode plan the server owns income: scrap, per-operative salvage and
+    // every stack count arrive in the snapshot. A client still needs an Economy, because
+    // `applyAll()` is what writes `weapon.damageScale`, `player.maxHp` and the rest, and
+    // predicting your own movement and damage requires those to be right locally. But a
+    // client Economy that ALSO subscribes here is a second writer to a purse the snapshot
+    // overwrites twenty times a second, and the symptom is an income tick that flickers
+    // or double-counts rather than anything that looks like a bug.
+    //
+    // Two things keep that from happening, deliberately both, because the failure is
+    // invisible:
+    //
+    //   1. A CLIENT DEALS NO DAMAGE. Its shot is presentation only -- muzzle, tracer,
+    //      recoil, audio -- and never routes through `Horde.damage`, so `emitKill` and
+    //      `emitHit` never fire locally and there is nothing for a listener to hear.
+    //      That also keeps `Items`' proc stream from advancing on the client, which
+    //      matters because it subscribes to onHit as well as onKill.
+    //   2. A CLIENT PASSES NO BUS. `events` is optional and is read for nothing else,
+    //      so constructing with `events: null` yields a fully working Economy that
+    //      cannot pay anybody. The `?.` here is what makes that free.
+    //
+    // The first is the rule; the second is the guard for when somebody has a good reason
+    // to emit locally later. Relying on rule 1 alone would be relying on an absence.
+    events?.onKill((e) => this.#onKill(e));
+
+    this.reset();
+  }
+
+  /** Multiplier on everything this wave pays, from having called it early. */
+  get bonus() {
+    return this.director?.calledEarly ? 1 + CFG.economy.earlyCallBonus : 1;
+  }
+
+  /**
+   * Scrap for a kill, paid whatever killed it.
+   *
+   * DELIBERATELY UNGATED on who caused it, which is the opposite of the salvage half two
+   * classes down, and invariant 24 is why: the hook is on the one choke point all damage
+   * routes through, so a newly added weapon cannot silently pay nothing. An emitter's kill
+   * still pays the crew, because the emitter is the crew's.
+   */
+  #onKill(e) {
+    const rate = CFG.economy[ENEMY_TYPE_KEYS[e.type]] ?? CFG.economy.chewer;
+    this.#credit(rate.scrap * this.bonus);
+  }
+
+  /** Paid to the shared pot when a wave is resolved, not per kill. */
+  #payWaveClear(wave) {
+    const cfg = CFG.economy;
+    this.#credit((cfg.waveClearScrap + cfg.waveClearGrowth * (wave - 1)) * this.bonus);
+  }
+
+  #credit(amount) {
+    this.scrap += amount;
+    this.earnedScrap += amount;
+  }
+
+  /**
+   * Pay out any waves resolved since the last call.
+   *
+   * Safe to call once per operative per frame, because the counter it advances is the
+   * crew's: the second call finds nothing left to pay. That is what makes it correct to
+   * drive from every Economy's own update without any of them having to know whether
+   * somebody else already did it this frame.
+   */
+  update() {
+    if (!this.director) return;
+    while (this.#resolvedSeen < this.director.resolved) {
+      this.#resolvedSeen++;
+      this.#payWaveClear(this.#resolvedSeen);
+    }
+  }
+
+  reset() {
+    this.scrap = 0;
+    this.earnedScrap = 0;
+    this.#resolvedSeen = this.director ? this.director.resolved : 0;
+    // Free module fits, granted by the Boneyard road. Shared, because a module occupies
+    // one of three hardpoints on the crew's fortress -- a credit that belonged to one
+    // operative would be a personal purse buying a bounded shared thing, which is
+    // invariant 22 broken from the reward side.
+    this.moduleCredits = 0;
+
+    this.stacks = {};
+    for (const item of CFG.economy.catalogue) {
+      if (item.pool === "scrap") this.stacks[item.id] = 0;
+    }
+  }
+}
+
+export class Economy {
   // Whether a wave has been out since the last time the buy window was announced.
   // Starts false so the opening rest says nothing: the crew spawns on the deck with
   // nothing having happened yet, and a shop announcing itself at spawn is the push
@@ -69,7 +206,18 @@ export class Economy {
 
   constructor({
     player, trampler, weapon, repair, horde, director, modules = null, events = null,
+    treasury = null,
   }) {
+    // BEFORE reset(), which reaches through it. Defaults to a private one, so a solo
+    // Economy is exactly what it always was and every existing construction site is
+    // unchanged -- the sharing only happens when a caller deliberately hands the same
+    // Treasury to two operatives.
+    // Refused at construction rather than discovered as a wiped upgrade. `applyAll` writes
+    // this operative's personal effects onto that weapon, so a weapon belonging to somebody
+    // else means each purchase silently reverts the other's.
+    weapon?.assertOperative?.(player);
+
+    this.treasury = treasury ?? new Treasury({ director, events });
     this.player = player;
     this.trampler = trampler;
     this.weapon = weapon;
@@ -88,22 +236,50 @@ export class Economy {
     // same moment and two mechanisms for one event is how they drift apart.
     // Listeners are never removed on reset: the economy has to keep earning across
     // a restart, and a reset that unhooked it would stop all income silently.
-    events?.onKill((e) => this.#onKill(e));
+    //
+    // Forwards the SOURCE as well as the corpse. An arrow that dropped it would leave the
+    // gate reading `undefined` and refuse every legitimate kill, which is exactly how the
+    // item runtime's version of this line broke.
+    events?.onKill((e, source) => this.#onKill(e, source));
 
     this.reset();
   }
 
   reset() {
-    this.scrap = 0;
     this.salvage = 0;
-    this.earned = { scrap: 0, salvage: 0 };
+    // Through the accessors defined below on first construction; on a re-reset they
+    // already exist, so this writes the treasury either way.
+    this.#shareField(this, "scrap", "scrap");
+    this.#shareField(this, "moduleCredits", "moduleCredits");
+    this.scrap = 0;
+
+    // `earned.scrap` is the crew's, `earned.salvage` is this operative's, and they live on
+    // one object because every reader wants both at once -- the income tick draws
+    // "+2 SALVAGE  +1 SCRAP" from a single kill.
+    this.earned = { salvage: 0 };
+    this.#shareField(this.earned, "scrap", "earnedScrap");
+
+    // THE FORTRESS ENTRIES ARE ACCESSORS ONTO THE TREASURY, not copies of it.
+    //
+    // This is the whole fix, and putting it here rather than at every reader is
+    // deliberate: `stacks[id]` is read in eight places in this file, in `items.js`, in
+    // `hud.js` and in a great many tests, and a split that made each of those ask "which
+    // side is this id on" would be a rule enforced at every call site -- which is a rule
+    // the next call site does not have. `economy.stacks.plating` now simply MEANS the
+    // crew's plating count, from any operative, and nothing that reads it had to change.
     this.stacks = {};
-    for (const item of CFG.economy.catalogue) this.stacks[item.id] = 0;
+    for (const item of CFG.economy.catalogue) {
+      if (item.pool === "scrap") this.#shareStack(item.id);
+      else this.stacks[item.id] = 0;
+    }
+    // Zeroed through the accessors above, so a restart clears the crew's fortress track
+    // as well as this operative's kit. Idempotent when several operatives reset, which
+    // they all will -- invariant 25 wants everything reverted, not reverted once.
+    for (const id of Object.keys(this.treasury.stacks)) this.stacks[id] = 0;
 
     this.purchases = 0;
     this.lastBought = null;
     this.blockedReason = "";
-    // Free module fits, granted by the Boneyard road. Spent before scrap.
     this.moduleCredits = 0;
 
     // What happened this frame, for the on-screen banner. Cleared every update, so
@@ -135,7 +311,38 @@ export class Economy {
     this.player.hp = Math.min(this.player.hp, this.player.maxHp);
     this.modules?.reset();
 
-    this.#resolvedSeen = this.director ? this.director.resolved : 0;
+    // The shared half rewinds too, including its own resolved-wave counter. Called from
+    // every operative's reset, which is idempotent and is what invariant 25 wants:
+    // everything reverted, not everything reverted exactly once.
+    this.treasury.reset();
+  }
+
+  /**
+   * Make `obj[name]` read and write `treasury[key]`, so the crew's half of a
+   * mixed-ownership object is shared rather than copied.
+   *
+   * Enumerable on purpose: `earned` and `stacks` are both walked and spread by readers,
+   * and a non-enumerable scrap count would vanish from every one of them.
+   */
+  #shareField(obj, name, key) {
+    const t = this.treasury;
+    Object.defineProperty(obj, name, {
+      get: () => t[key],
+      set: (v) => { t[key] = v; },
+      enumerable: true,
+      configurable: true,
+    });
+  }
+
+  /** The same, for one fortress stack count. */
+  #shareStack(id) {
+    const t = this.treasury;
+    Object.defineProperty(this.stacks, id, {
+      get: () => t.stacks[id],
+      set: (v) => { t.stacks[id] = v; },
+      enumerable: true,
+      configurable: true,
+    });
   }
 
   /**
@@ -143,6 +350,12 @@ export class Economy {
    *
    * Every effect runs on every call, including at zero, which is what restores the
    * baselines. There is deliberately no separate revert path to forget to write.
+   *
+   * Unchanged by the crew split, and that is the point rather than an oversight. The two
+   * fortress effects write to shared objects, so with duplicated counts a second operative
+   * recomputing its own kit wiped them; with the counts shared, every operative computes
+   * the same number from the same count and the write is idempotent. The fix was upstream
+   * of here, which is why this method needed no guard, no flag and no branch.
    */
   applyAll() {
     for (const item of CFG.economy.catalogue) {
@@ -161,7 +374,27 @@ export class Economy {
     return this.director?.calledEarly ? 1 + CFG.economy.earlyCallBonus : 1;
   }
 
-  #onKill(e) {
+  /**
+   * Salvage for a kill THIS operative made. The scrap half lives on the Treasury.
+   *
+   * GATED ON WHO CAUSED IT, and that gate does two separate jobs.
+   *
+   * It stops a teammate's kill paying this purse. Every Economy is subscribed to the same
+   * bus, so before the gate existed each operative collected salvage for every corpse the
+   * crew produced -- four operatives each earning four times over, which reads as "money
+   * is generous in co-op" rather than as a bug.
+   *
+   * And it stops AUTOMATION paying a personal purse, which is invariant 2b-i rather than
+   * arithmetic. Salvage is what you earn for what YOU kill; an emitter's kill is nobody's.
+   * Paying for it would mean deploying a rack and walking away funds a personal build,
+   * which is automation doing a job the player has to be present for -- the same argument
+   * that keeps a proc from firing off an emitter kill, applied to income.
+   *
+   * Note that invariant 24 is NOT weakened by this: an emitter kill still pays, it pays
+   * the CREW. Nothing kills for free, it just cannot fill one person's pocket.
+   */
+  #onKill(e, source) {
+    if (!causedBy(source, this.player)) return;
     // Looked up by type NAME rather than by a ternary on the type id. A ternary is
     // how a newly added enemy silently pays a chewer's rate, or nothing at all.
     const rate = CFG.economy[ENEMY_TYPE_KEYS[e.type]] ?? CFG.economy.chewer;
@@ -171,21 +404,10 @@ export class Economy {
     // inflate the crew's budget, which is the exact coupling the split exists to
     // prevent.
     const salvage = rate.salvage * mult * this.salvageScale;
-    const scrap = rate.scrap * mult;
 
     this.salvage += salvage;
-    this.scrap += scrap;
     this.earned.salvage += salvage;
-    this.earned.scrap += scrap;
-    if (mult > 1) this.bonusPaid += (salvage + scrap) - (rate.salvage + rate.scrap);
-  }
-
-  /** Paid to the shared pot when a wave is resolved, not per kill. */
-  #payWaveClear(wave) {
-    const cfg = CFG.economy;
-    const amount = (cfg.waveClearScrap + cfg.waveClearGrowth * (wave - 1)) * this.bonus;
-    this.scrap += amount;
-    this.earned.scrap += amount;
+    if (mult > 1) this.bonusPaid += salvage - rate.salvage;
   }
 
   /**
@@ -797,12 +1019,11 @@ export class Economy {
 
     // Pay out any waves resolved since the last frame. Polling a counter rather
     // than taking a callback keeps the director unaware the economy exists.
-    if (this.director) {
-      while (this.#resolvedSeen < this.director.resolved) {
-        this.#resolvedSeen++;
-        this.#payWaveClear(this.#resolvedSeen);
-      }
-    }
+    //
+    // Delegated to the Treasury, because a wave clear pays the CREW once. The counter it
+    // advances lives there, so calling this from every operative's update is safe: the
+    // second caller in a frame finds nothing left to pay.
+    this.treasury.update();
 
     // ---- the buy window opening, for a crew that cannot see the console.
     //
@@ -926,9 +1147,17 @@ export function routePurchaseInput({ economy, run, bayOpen, input, dt }) {
     economy.update(dt, null);
     for (let i = 0; i < CFG.run.branches; i++) {
       if (!input.pressed(CFG.economy.keys[i])) continue;
-      const arrival = run.choose(i);
+      // A VOTE, not a choice. `economy.player` is the operative whose keys and purse
+      // these are, which is exactly who is voting -- so this needs no new parameter and
+      // cannot be handed the wrong person. At one member a majority is one, so the press
+      // still takes the road on the frame it is pressed and solo is unchanged.
+      const arrival = run.vote(economy.player, i);
       if (arrival) return { owner: "route", arrival };
     }
+    // Deliberately still "route" with no arrival when a vote merely lands. The keys stay
+    // owned by the choice while the crew is deciding, because the crew IS deciding --
+    // this is the opposite of the pending-pick case, where the owner could not act on the
+    // keys and therefore must not claim them.
     return { owner: "route", arrival: null };
   }
 

@@ -1,0 +1,41 @@
+{
+  // LOCAL MULTIPLAYER DEVELOPMENT ONLY. Never deployed -- `wrangler deploy` reads
+  // wrangler.jsonc, and this file is only reached through `--config`.
+  //
+  // WHY IT EXISTS
+  //
+  // The production config sets `assets.directory` to the repo root, because
+  // index.html lives there and the importmap resolves "/vendor/..." and
+  // "/assets/..." against the site root with no build step to assemble anything
+  // else. That is right for deployment and unusable for `wrangler dev`, which
+  // watches the assets directory: wrangler writes its own state and temp bundles
+  // into `.wrangler/`, which is inside the root it is watching, so it reloads
+  // several times a second, forever, and answers no requests. Nothing in the log
+  // points at wrangler as the cause -- it just says "Reloading local server" until
+  // you work out that it is reacting to itself.
+  //
+  // So local development drops the assets block entirely. Nothing is lost: the
+  // page is already served by `npm start` on :5173, and the only thing wrangler
+  // needs to provide is /lobby/*.
+  //
+  //   npm start        -> the game, on 5173, unchanged and zero-dependency
+  //   npm run dev:mp   -> the lobby, on 8787
+  //
+  // The Worker handles a missing ASSETS binding by returning 404 for anything
+  // outside /lobby, so a stray request here is a clean miss rather than a crash.
+  "name": "trampler-dev",
+  "compatibility_date": "2026-07-27",
+  "main": "worker/index.js",
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "LOBBY", "class_name": "Lobby" }
+    ]
+  },
+
+  // Must match wrangler.jsonc's migration, or the local DO is a different class
+  // from the deployed one and a bug reproduces in exactly one of the two places.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Lobby"] }
+  ]
+}

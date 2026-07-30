@@ -181,10 +181,33 @@ export class Grapple {
     this.cooldown = 0;
   }
 
-  /** Visuals + aim feedback. Runs after the player, so the camera is current. */
-  updateVisuals(dt) {
+  /**
+   * Simulation state. Just the cooldown, but it has to live on the fixed step.
+   *
+   * This decrement used to sit inside updateVisuals(), which runs once per RENDERED
+   * frame. That made the winch the only weapon in the game whose recovery was
+   * measured in display frames rather than in simulation ticks -- the rifle and both
+   * deck guns tick theirs inside their own update(). It was invisible because the
+   * wall-clock duration comes out the same either way.
+   *
+   * It stops being invisible the moment a server is involved: a server counts ticks,
+   * so a client-side cooldown counted in render frames disagrees with it, and on a
+   * frame that runs two simulation steps the harness and the game disagreed with each
+   * other. Splitting it is the last piece of putting the simulation on a fixed step.
+   */
+  update(dt) {
     this.cooldown = Math.max(0, this.cooldown - dt);
+  }
 
+  /**
+   * Visuals + aim feedback, once per rendered frame. Runs after the player, so the
+   * camera is current -- it raycasts from the eye, and doing that per simulation step
+   * would cast several times against a camera that only moves once.
+   *
+   * Takes no dt on purpose: nothing in here may accumulate. Anything that needs to
+   * belongs in update() above.
+   */
+  updateVisuals() {
     if (this.active) {
       const anchor = this.anchorPosition(_anchor);
       this.player.handPosition(_hand);

@@ -31,20 +31,30 @@ const wrapPi = (a) => {
 };
 
 /**
- * Route the station key to whichever mount makes sense: dismount if manned,
- * otherwise man the nearest one in reach. Shared by the game loop and the test
- * harness so the dispatch rule exists once.
+ * Route the station key for ONE operative: step off their own mount if they are in
+ * one, otherwise man the nearest free one in reach. Shared by the game loop and the
+ * test harness so the dispatch rule exists once.
+ *
+ * The dismount branch reads THIS operative's station rather than searching for an
+ * occupied gun. Those were the same expression while there was one operative and
+ * different ones the moment there were two: `guns.find((g) => g.mounted)` found the
+ * bow gun crew 1 was sitting in, and crew 2 pressing F anywhere on the deck released
+ * it out from under them -- leaving crew 1 still pinned by `player.station` to a mount
+ * now reporting itself empty, and a third operative free to take it. Two operatives
+ * constrained to one seat, from a keypress made 7.1 m away -- measured, in test 107,
+ * against a mount whose reach is 2.8 m.
  */
 export function handleStationInput(guns, input, player) {
   for (const g of guns) g.updateCanMount(player);
   if (!input.pressed(CFG.deckGun.key)) return;
 
-  const manned = guns.find((g) => g.mounted);
-  if (manned) {
-    manned.dismount(player);
+  if (player.station) {
+    player.station.dismount(player);
     return;
   }
 
+  // `canMount` already excludes an occupied mount, so this cannot take a seat
+  // somebody else is in -- it falls through to the other gun, or to nothing.
   const nearest = guns
     .filter((g) => g.canMount)
     .sort((a, b) => a.distanceTo(player) - b.distanceTo(player))[0];
@@ -61,7 +71,15 @@ export class DeckGun {
     this.mountLocal = new THREE.Vector3(...mount.mountLocal);
     this.operatorLocal = new THREE.Vector3(...mount.operatorLocal);
 
-    this.mounted = false;
+    // THE operative in this mount, or null. `mounted` is derived from it rather than
+    // tracked beside it, because a bare boolean answers "is somebody in here" without
+    // saying who -- and that missing half was the bug, in three separate places: the
+    // station key, the trigger, and the release. A field that names its occupant makes
+    // all three unspellable.
+    // A remote snapshot can reserve the mount without constructing another Player in this
+    // client's simulation. The real authority never sets this: it always has the operator.
+    this.remoteOperatorSeat = 0;
+    this.operator = null;
     this.canMount = false;
     this.yawLocal = mount.facing;
     this.pitch = 0;
@@ -144,25 +162,54 @@ export class DeckGun {
     return player.position.distanceTo(this.mountWorld(_p));
   }
 
+  /**
+   * True when somebody is in this mount. Derived, never assigned -- assigning to it
+   * throws, which is deliberate: two of the three sites that used to write it were
+   * releasing a seat without saying whose.
+   */
+  get mounted() {
+    return this.operator !== null || this.remoteOperatorSeat > 0;
+  }
+
   updateCanMount(player) {
     this.canMount = !this.mounted && this.distanceTo(player) <= CFG.deckGun.mountRange;
     return this.canMount;
   }
 
+  /** Take the seat. Refuses, rather than displacing, if somebody is already in it. */
   mount(player) {
-    this.mounted = true;
+    if (this.mounted) return false;
+    this.operator = player;
     player.station = this;
     player.grapple?.cancel();
     player.cancelMantle();
     player.base = this.trampler;
     player.velocity.set(0, 0, 0);
+    return true;
   }
 
+  /**
+   * Leave the seat. Only its occupant can, so a stray call cannot desync the mount
+   * from the operative it is holding in place.
+   */
   dismount(player) {
-    this.mounted = false;
-    if (player.station === this) player.station = null;
+    if (this.operator !== player) return false;
+    this.operator = null;
+    player.station = null;
     player.base = this.trampler;
     player.velocity.set(0, 0, 0);
+    return true;
+  }
+
+  /**
+   * Clear the seat whoever is in it, and release them.
+   *
+   * For a restart, which must not have to know who was sitting where -- invariant 25
+   * says a restart reverts everything, and a mount still holding a stale operator is
+   * exactly the sort of state that survives a reset unnoticed.
+   */
+  evict() {
+    return this.operator ? this.dismount(this.operator) : false;
   }
 
   /**
@@ -199,16 +246,24 @@ export class DeckGun {
 
   // -------------------------------------------------------------------- update
 
-  update(dt, input, player, weapon) {
+  update(dt, input, player, weapon, advanceShared = true) {
     const g = CFG.deckGun;
 
-    this.heat = Math.max(0, this.heat - g.coolRate * this.coolScale * dt);
-    if (this.overheated && this.heat <= g.resumeHeat) this.overheated = false;
-    this.cooldown = Math.max(0, this.cooldown - dt);
+    // A DeckGun is shared by the crew. The ordinary browser path calls update once and uses
+    // the default; the authoritative session calls it once per operative and advances this
+    // shared clock only for the first. Otherwise four players cool one gun four times per tick.
+    if (advanceShared) {
+      this.heat = Math.max(0, this.heat - g.coolRate * this.coolScale * dt);
+      if (this.overheated && this.heat <= g.resumeHeat) this.overheated = false;
+      this.cooldown = Math.max(0, this.cooldown - dt);
+      this.pad.visible = !this.mounted;
+    }
 
-    this.pad.visible = !this.mounted;
-
-    if (!this.mounted) return;
+    // Only the operative actually in the seat can pull its trigger. Gating on
+    // `mounted` alone is the station key's bug wearing a different hat: it would let
+    // any operative's mouse fire an occupied gun from anywhere on the ship, and the
+    // heat it built would land on somebody else's weapon.
+    if (this.operator !== player) return;
 
     if (input.locked && input.mouseDown(0) && !this.overheated && this.cooldown <= 0) {
       this.#fire(player, weapon);
@@ -245,6 +300,11 @@ export class DeckGun {
 
     // Routed through the rifle's hitscan so the geometry-occlusion rule -- the
     // thing keeping chewers safe beneath the hull -- lives in exactly one place.
-    return weapon.shootFrom(_muzzle, _dir, CFG.deckGun, _muzzle);
+    //
+    // Attributed to the OPERATOR rather than to the weapon's own operative. Those are
+    // the same person solo and different people with a crew, and the difference decides
+    // whose procs fire and whose purse is paid for a kill made from this seat. `update`
+    // guarantees only the occupant can reach here.
+    return weapon.shootFrom(_muzzle, _dir, CFG.deckGun, _muzzle, player);
   }
 }

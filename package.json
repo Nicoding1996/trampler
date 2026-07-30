@@ -7,12 +7,16 @@
   "description": "First-person prototype: a crew, a walking fortress, and a roguelike siege you can ride or fight beneath.",
   "scripts": {
     "start": "node server.mjs",
+    "dev:mp": "npx --yes wrangler dev --config wrangler.dev.jsonc --port 8787",
     "check": "node --check src/main.js",
     "verify": "node verify.mjs",
     "audit": "node tools/audit.mjs",
     "cost": "node tools/scene-cost.mjs",
     "imports": "node tools/check-imports.mjs",
     "smoke": "node tools/smoke-serve.mjs",
+    "smoke:lobby": "node tools/smoke-lobby.mjs",
+    "sim": "node tools/sim-check-node.mjs",
+    "sim:worker": "node tools/sim-check.mjs",
     "diff": "node tools/diff-runs.mjs",
     "assets": "node tools/fetch-assets.mjs"
   },
