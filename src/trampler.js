@@ -764,63 +764,143 @@ export class Trampler {
   }
 
   // Cosmetic legs on an alternating tripod gait. They carry no collision and
-  // are not grappleable: they move independently of the local transform that
-  // grapple anchors are stored in, so anchoring to them would drift.
+  // are not grappleable: the visible mechanism moves around the fixed gameplay
+  // foot point, so anchoring a grapple to any part of it would drift.
+  //
+  // Every repeated part is instanced. The previous four independent meshes per
+  // leg made a simple silhouette expensive; this version can afford a hip yoke,
+  // paired load arms, two joints, a foot sole and a working hydraulic ram in
+  // fewer calls than the old straight thigh/shin assembly.
   #buildLegs(mat) {
     this.legs = [];
-    const reach = CFG.trampler.deckHeight - HULL_DEPTH; // hull bottom to ground
-    let i = 0;
 
+    const jointMat = Look.std("mast", {
+      color: 0x777d86, roughness: 0.52, metalness: 0.55,
+    });
+    const mechanismMat = Look.std("hull", {
+      color: 0x30343a, roughness: 0.82, metalness: 0.35,
+    });
+    const rodMat = Look.std("mast", {
+      color: 0xaeb4bc, roughness: 0.36, metalness: 0.55,
+    });
+
+    const instanced = (name, geometry, material, count, castShadow) => {
+      const mesh = new THREE.InstancedMesh(geometry, material, count);
+      mesh.name = `trampler_leg_${name}`;
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      mesh.castShadow = castShadow;
+      mesh.receiveShadow = true;
+      // The instances move outside the source geometry's local bounds. Eight
+      // always-visible banks are cheaper and safer than rebuilding all eight
+      // bounding spheres on every gait frame.
+      mesh.frustumCulled = false;
+      this.group.add(mesh);
+      return mesh;
+    };
+
+    const hipGeo = new THREE.BoxGeometry(1.7, 1.35, 2.2);
+    tileBoxUVs(hipGeo, 1.7, 1.35, 2.2, 1.1);
+    const upperGeo = new THREE.BoxGeometry(0.62, 3.4, 0.48);
+    tileBoxUVs(upperGeo, 0.62, 3.4, 0.48, 1.1);
+    const lowerGeo = new THREE.BoxGeometry(0.72, 2.5, 0.62);
+    tileBoxUVs(lowerGeo, 0.72, 2.5, 0.62, 1.1);
+    const footGeo = new THREE.BoxGeometry(2.2, 0.55, 2.9);
+    tileBoxUVs(footGeo, 2.2, 0.55, 2.9, 1.1);
+    const soleGeo = new THREE.BoxGeometry(2.32, 0.16, 3.02);
+    tileBoxUVs(soleGeo, 2.32, 0.16, 3.02, 1.1);
+
+    this.legVisuals = {
+      hip: instanced("hips", hipGeo, mat, CFG.trampler.legCount, true),
+      // Two parallel arms per leg make the load path read as a yoke rather than
+      // as one thin stick passing through a knee.
+      upper: instanced("upper_arms", upperGeo, mat, CFG.trampler.legCount * 2, true),
+      lower: instanced("lower_arms", lowerGeo, mat, CFG.trampler.legCount * 2, true),
+      // Hip, knee and ankle pins share one bank.
+      joint: instanced(
+        "joint_pins",
+        new THREE.CylinderGeometry(0.5, 0.5, 1.25, 10),
+        jointMat,
+        CFG.trampler.legCount * 3,
+        false,
+      ),
+      foot: instanced("feet", footGeo, mat, CFG.trampler.legCount, true),
+      sole: instanced("soles", soleGeo, mechanismMat, CFG.trampler.legCount, false),
+      ram: instanced(
+        "ram_barrels",
+        new THREE.CylinderGeometry(0.19, 0.19, 2, 8),
+        mechanismMat,
+        CFG.trampler.legCount,
+        false,
+      ),
+      rod: instanced(
+        "ram_rods",
+        new THREE.CylinderGeometry(0.10, 0.10, 2, 8),
+        rodMat,
+        CFG.trampler.legCount,
+        false,
+      ),
+    };
+
+    this.legVisualList = Object.values(this.legVisuals);
+
+    // How many consecutive instances in each bank belong to one leg. This is
+    // what lets one broken leg darken without giving up instancing.
+    this.legColorBanks = [
+      [this.legVisuals.hip, 1],
+      [this.legVisuals.upper, 2],
+      [this.legVisuals.lower, 2],
+      [this.legVisuals.joint, 3],
+      [this.legVisuals.foot, 1],
+      [this.legVisuals.sole, 1],
+      [this.legVisuals.ram, 1],
+      [this.legVisuals.rod, 1],
+    ];
+
+    // Reused by the six-leg update. No vectors, matrices or quaternions are
+    // allocated in the frame loop.
+    this.legScratch = {
+      hip: new THREE.Vector3(),
+      knee: new THREE.Vector3(),
+      ankle: new THREE.Vector3(),
+      foot: new THREE.Vector3(),
+      a: new THREE.Vector3(),
+      b: new THREE.Vector3(),
+      ramTop: new THREE.Vector3(),
+      ramBottom: new THREE.Vector3(),
+      ramSplit: new THREE.Vector3(),
+      mid: new THREE.Vector3(),
+      direction: new THREE.Vector3(),
+      up: new THREE.Vector3(0, 1, 0),
+      scale: new THREE.Vector3(1, 1, 1),
+      matrix: new THREE.Matrix4(),
+      quaternion: new THREE.Quaternion(),
+      partQuaternion: new THREE.Quaternion(),
+      jointQuaternion: new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(1, 0, 0), Math.PI / 2,
+      ),
+      euler: new THREE.Euler(),
+      color: new THREE.Color(),
+    };
+
+    let i = 0;
     for (const side of [-1, 1]) {
       for (const z of [-8.5, 0, 8.5]) {
+        // Kept as the public leg record even though the visible pieces are in
+        // shared instance banks. Tests and repair labels read side, z and the
+        // fixed stomp point from this object; none of those contracts move.
         const pivot = new THREE.Group();
         pivot.position.set(side * (HALF_W - 0.6), -HULL_DEPTH + 0.4, z);
         this.group.add(pivot);
-
-        const thighGeo = new THREE.BoxGeometry(2.6, 0.9, 0.9);
-        tileBoxUVs(thighGeo, 2.6, 0.9, 0.9, 1.1);
-        const thigh = new THREE.Mesh(thighGeo, mat);
-        thigh.position.set(side * 1.3, -0.5, 0);
-        thigh.rotation.z = side * -0.45;
-        thigh.castShadow = true;
-        pivot.add(thigh);
-
-        const shinGeo = new THREE.BoxGeometry(0.7, reach, 0.7);
-        tileBoxUVs(shinGeo, 0.7, reach, 0.7, 1.1);
-        const shin = new THREE.Mesh(shinGeo, mat);
-        shin.position.set(side * 2.5, -0.9 - reach / 2, 0);
-        shin.castShadow = true;
-        pivot.add(shin);
-
-        const footGeo = new THREE.BoxGeometry(1.8, 0.5, 2.4);
-        tileBoxUVs(footGeo, 1.8, 0.5, 2.4, 1.1);
-        const foot = new THREE.Mesh(footGeo, mat);
-        foot.position.set(side * 2.5, -0.9 - reach, 0);
-        foot.castShadow = true;
-        pivot.add(foot);
-
-        // Hydraulic ram across the knee. Reads as "this thing is driven", and it
-        // gives the gait something to visibly work against.
-        const ram = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.14, 0.14, 1.5, 8),
-          Look.std("mast", { color: 0x9aa0aa, roughness: 0.4, metalness: 0.8 }),
-        );
-        ram.position.set(side * 1.9, -0.75, 0.55);
-        ram.rotation.x = 0.35;
-        ram.castShadow = false;
-        pivot.add(ram);
 
         // Alternating tripod: every other leg swings in phase.
         pivot.userData.phase = (i % 2 === 0) ? 0 : Math.PI;
         pivot.userData.baseY = pivot.position.y;
         pivot.userData.side = side;
         pivot.userData.z = z;
-        pivot.userData.parts = [thigh, shin, foot];
-        pivot.userData.ram = ram;
-        // Foot centre in hull-local space, which is what the stomp is measured
-        // from. x is +/-9.9 -- OUTBOARD of the 8 m hull half width, and that is
-        // what makes stomping safe to add: it cannot reach the chewers latched at
-        // +/-7.0, so the fortress can never clear its own attackers.
+        // Foot centre in hull-local space, which is what the STOMP is measured
+        // from. The cosmetic foot moves through a stride but lands exactly here.
+        // x remains +/-9.9 -- outboard of the hull and unreachable from a chewer
+        // latched at +/-7.0, preserving invariant 2c.
         pivot.userData.footLocal = new THREE.Vector3(
           side * (HALF_W - 0.6 + 2.5),
           -CFG.trampler.deckHeight + 0.3,
@@ -832,6 +912,8 @@ export class Trampler {
       }
     }
 
+    for (let leg = 0; leg < this.legs.length; leg++) this.#legMaterial(leg);
+    this.#animateLegs();
     this.#buildClimbPoints();
   }
 
@@ -916,39 +998,162 @@ export class Trampler {
     this.yawDelta = this.yaw - prevYaw;
   }
 
+  #setLegPart(mesh, index, position, quaternion, scale) {
+    this.legScratch.matrix.compose(position, quaternion, scale);
+    mesh.setMatrixAt(index, this.legScratch.matrix);
+  }
+
+  /** Place a Y-axis-aligned part between two hull-local points. */
+  #setLegSegment(mesh, index, from, to, baseLength) {
+    const s = this.legScratch;
+    s.direction.subVectors(to, from);
+    const length = Math.max(0.001, s.direction.length());
+    s.direction.multiplyScalar(1 / length);
+    s.mid.addVectors(from, to).multiplyScalar(0.5);
+    s.quaternion.setFromUnitVectors(s.up, s.direction);
+    s.scale.set(1, length / baseLength, 1);
+    this.#setLegPart(mesh, index, s.mid, s.quaternion, s.scale);
+  }
+
   #animateLegs() {
     const cycle = this.time * CFG.trampler.gaitSpeed * Math.PI * 2;
+    const factor = this.speedFactor();
+    const speed = this.walking ? CFG.trampler.speed * this.driveScale * factor : 0;
+    // Match update()'s gait clock exactly. During stance the foot travels aft in
+    // hull space by the distance the hull travels forward, making it look planted
+    // without moving the gameplay transform or the fixed stomp point.
+    const timeScale = factor <= 0
+      ? 0
+      : 0.25 + (speed / Math.max(CFG.trampler.speed, 0.001)) * 0.75;
+    const gaitHz = CFG.trampler.gaitSpeed * timeScale;
+    const stanceTravel = speed > 0 && gaitHz > 0 ? speed / (2 * gaitHz) : 0;
+    const s = this.legScratch;
+    const v = this.legVisuals;
+
     for (let i = 0; i < this.legs.length; i++) {
       const leg = this.legs[i];
+      const u = leg.userData;
+      const side = u.side;
+      const broken = this.legHp[i] <= 0;
+      let lifted = false;
+      let footPitch = 0;
+      let strideZ = 0;
+      let lift = 0;
+      let loadFlex = 0;
 
-      if (this.legHp[i] <= 0) {
-        // Dead leg: stops striding and sags outward. The limp is the damage
-        // readout -- you should be able to see which leg went without a HUD.
-        leg.rotation.x = -0.42;
-        leg.rotation.z = leg.userData.side * 0.30;
-        leg.position.y = leg.userData.baseY - 0.55;
-        leg.userData.lifted = false;
-        continue;
+      if (broken) {
+        // A dead mechanism folds outward and drags behind the chassis. Its fixed
+        // gameplay foot remains where invariant 2c measures it; this is the
+        // cosmetic limp that identifies the failed leg from across the arena.
+        strideZ = 0.85;
+        footPitch = -0.14;
+        u.lifted = false;
+      } else {
+        const p = cycle + u.phase;
+        const wrapped = ((p - Math.PI / 2) % (Math.PI * 2) + Math.PI * 2)
+          % (Math.PI * 2);
+        const stance = wrapped < Math.PI;
+
+        if (stance) {
+          const t = wrapped / Math.PI;
+          // Linear in stance is deliberate: constant local travel cancels the
+          // hull's nearly constant forward travel and keeps the sole planted.
+          strideZ = stanceTravel * t;
+          loadFlex = Math.sin(t * Math.PI) * 0.10;
+        } else {
+          const t = (wrapped - Math.PI) / Math.PI;
+          const eased = t * t * (3 - 2 * t);
+          strideZ = stanceTravel * (1 - eased);
+          lift = Math.sin(t * Math.PI) * 0.58;
+          footPitch = Math.sin(t * Math.PI) * 0.12;
+          lifted = true;
+        }
       }
 
-      const p = cycle + leg.userData.phase;
-      const raise = Math.max(0, Math.cos(p));
-      leg.rotation.x = Math.sin(p) * 0.26;
-      leg.rotation.z = 0;
-      leg.position.y = leg.userData.baseY + raise * 0.30;
-      leg.userData.ram.scale.y = 1 - raise * 0.22;
+      s.hip.set(
+        side * (HALF_W - 0.35),
+        -HULL_DEPTH + 0.35,
+        u.z,
+      );
+      s.foot.set(
+        broken ? side * (HALF_W + 2.75) : u.footLocal.x,
+        u.footLocal.y + 0.13 + lift,
+        u.z + strideZ,
+      );
+      s.knee.set(
+        side * (broken ? HALF_W + 2.9 : HALF_W + 2.35 + lift * 0.10),
+        broken ? -5.05 : -4.35 - loadFlex + lift * 0.18,
+        u.z + strideZ * (broken ? 0.5 : 0.46),
+      );
+      s.ankle.set(
+        s.foot.x,
+        s.foot.y + 0.44,
+        s.foot.z - 0.05,
+      );
 
-      // A footfall is the transition from lifted to planted. Detected as an edge
-      // rather than sampled as a state, because a state test fires every frame the
-      // foot is down -- which would make the "stomp" a permanent damage aura and
-      // hand the fortress an automated defence it must not have.
-      const lifted = raise > 0.12;
-      if (leg.userData.lifted && !lifted) {
-        this.footfalls.push({ leg: i, local: leg.userData.footLocal });
+      // A broad hip casting visually carries the hull into the paired upper arms.
+      s.a.set(side * (HALF_W - 0.05), -HULL_DEPTH + 0.42, u.z);
+      s.partQuaternion.identity();
+      s.scale.set(1, 1, 1);
+      this.#setLegPart(v.hip, i, s.a, s.partQuaternion, s.scale);
+
+      for (let beam = 0; beam < 2; beam++) {
+        const offset = beam === 0 ? -0.34 : 0.34;
+        s.a.copy(s.hip);
+        s.b.copy(s.knee);
+        s.a.z += offset;
+        s.b.z += offset;
+        this.#setLegSegment(v.upper, i * 2 + beam, s.a, s.b, 3.4);
+
+        const lowerOffset = beam === 0 ? -0.25 : 0.25;
+        s.a.copy(s.knee);
+        s.b.copy(s.ankle);
+        s.a.z += lowerOffset;
+        s.b.z += lowerOffset;
+        this.#setLegSegment(v.lower, i * 2 + beam, s.a, s.b, 2.5);
+      }
+
+      // Three transverse pins make the articulation readable even in silhouette.
+      s.scale.set(1.15, 1.42, 1.15);
+      this.#setLegPart(v.joint, i * 3, s.hip, s.jointQuaternion, s.scale);
+      s.scale.set(1.05, 1.35, 1.05);
+      this.#setLegPart(v.joint, i * 3 + 1, s.knee, s.jointQuaternion, s.scale);
+      s.scale.set(0.72, 1.08, 0.72);
+      this.#setLegPart(v.joint, i * 3 + 2, s.ankle, s.jointQuaternion, s.scale);
+
+      // The foot and dark contact sole remain separate value masses. On a live
+      // leg they pitch only during swing; a broken one also rolls outward.
+      s.euler.set(footPitch, 0, broken ? side * 0.18 : 0);
+      s.partQuaternion.setFromEuler(s.euler);
+      s.scale.set(1, 1, 1);
+      this.#setLegPart(v.foot, i, s.foot, s.partQuaternion, s.scale);
+      s.a.copy(s.foot);
+      s.a.y -= 0.355;
+      this.#setLegPart(v.sole, i, s.a, s.partQuaternion, s.scale);
+
+      // A telescoping ram crosses the knee. Barrel and polished rod overlap a
+      // little so flexing the joint changes their visible extension rather than
+      // stretching one decorative cylinder.
+      s.ramTop.lerpVectors(s.hip, s.knee, 0.20);
+      s.ramTop.z += 0.62;
+      s.ramBottom.lerpVectors(s.knee, s.ankle, 0.62);
+      s.ramBottom.z += 0.62;
+      s.ramSplit.lerpVectors(s.ramTop, s.ramBottom, 0.62);
+      this.#setLegSegment(v.ram, i, s.ramTop, s.ramSplit, 2);
+      s.a.lerpVectors(s.ramTop, s.ramBottom, 0.52);
+      this.#setLegSegment(v.rod, i, s.a, s.ramBottom, 2);
+
+      // A footfall is the transition from swing to stance. The visual sole lands
+      // exactly at u.footLocal on this edge, so dust, stomp gameplay and the model
+      // agree without moving any simulation coordinate.
+      if (!broken && u.lifted && !lifted) {
+        this.footfalls.push({ leg: i, local: u.footLocal });
         this.stepCount++;
       }
-      leg.userData.lifted = lifted;
+      u.lifted = lifted;
     }
+
+    for (const mesh of this.legVisualList) mesh.instanceMatrix.needsUpdate = true;
   }
 
   #animateMachinery(dt) {
@@ -1080,13 +1285,16 @@ export class Trampler {
   }
 
   #legMaterial(index) {
+    // Instance colour multiplies each bank's own material, so the failed leg can
+    // go cold and dark without splitting eight shared banks back into one mesh
+    // per part. Geometry and roughness stay coherent; the sag carries the state.
     const broken = this.legHp[index] <= 0;
-    const mat = broken
-      ? (this.brokenLegMat ??= new THREE.MeshStandardMaterial({
-          color: 0x24262a, roughness: 0.9, metalness: 0.1,
-        }))
-      : this.legMat;
-    for (const part of this.legs[index].userData.parts) part.material = mat;
+    const tint = this.legScratch.color.setHex(broken ? 0x34373a : 0xffffff);
+    for (const [mesh, perLeg] of this.legColorBanks) {
+      const first = index * perLeg;
+      for (let slot = 0; slot < perLeg; slot++) mesh.setColorAt(first + slot, tint);
+      mesh.instanceColor.needsUpdate = true;
+    }
   }
 
   damageLeg(index, amount) {
