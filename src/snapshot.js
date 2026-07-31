@@ -41,7 +41,7 @@
 // refused it, because "could not connect" sends someone to check their network when the
 // actual problem is a stale browser tab holding last week's JavaScript. That specific
 // case is not hypothetical for a project with no build step and no cache busting.
-export const PROTOCOL_VERSION = 8;
+export const PROTOCOL_VERSION = 9;
 
 // Message kinds. One byte, so there is room to add the horde and the operatives in later
 // slices without touching anything here.
@@ -1004,8 +1004,13 @@ const INPUT = [
   // resulting yaw, because the server owns where the operative is looking for the same reason
   // it owns where they are standing — and because `CFG.player.lookSensitivity` should be
   // applied once, on the authority, not twice.
-  ["lookDx", "metres"],
-  ["lookDy", "metres"],
+  //
+  // These are floats rather than the centimetre-coordinate kind. A delta can accumulate over
+  // zero-step render frames or a browser stall and has no useful coordinate-style bound; i16
+  // at scale 100 silently clipped fast pans above 327.67 counts, leaving prediction several
+  // degrees ahead of authority and making reconciliation stutter left/right and up/down.
+  ["lookDx", "float"],
+  ["lookDy", "float"],
 ];
 
 export const INPUT_BYTES = (() => {
