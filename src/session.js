@@ -134,12 +134,32 @@ export function netInput({
     networked: true,
 
     push(cmd) {
-      // A backlog means the client is sending faster than the server steps, or a burst
-      // arrived after a stall. Oldest goes, because the newest input is the one that
-      // describes what the player is doing NOW — the same "latest wins" argument the pose
-      // relay makes, applied to a queue that must not grow without bound.
-      if (queue.length >= maxQueue) {
-        queue.shift();
+      // A backlog means the client is sending faster than the server steps, or TCP released a
+      // burst after head-of-line blocking. The queue still has to stay bounded, but its three
+      // kinds of input cannot all be discarded the same way:
+      //
+      //   held levels   describe an old duration, so one stale sample may go;
+      //   edges         are moments, and dropping one loses a grapple or purchase outright;
+      //   look deltas   are additive, and dropping one makes authority snap the camera back.
+      //
+      // Prefer the oldest edge-free command, preserving an older edge even when it sits at the
+      // head of the burst. Carry the removed mouse delta into its chronological successor so
+      // the next acknowledged orientation still includes every count the client predicted.
+      // If every queued command contains an edge, the bounded queue must still sacrifice the
+      // oldest one; sixteen consecutive edge-bearing ticks is the overload case rather than a
+      // normal network burst.
+      if (queue.length >= maxQueue && queue.length > 0) {
+        let dropAt = queue.findIndex((queued) => (queued.edges ?? 0) === 0);
+        if (dropAt < 0) dropAt = 0;
+        const [dropped] = queue.splice(dropAt, 1);
+        const successor = queue[dropAt] ?? cmd;
+        const carried = {
+          ...successor,
+          lookDx: (successor.lookDx ?? 0) + (dropped.lookDx ?? 0),
+          lookDy: (successor.lookDy ?? 0) + (dropped.lookDy ?? 0),
+        };
+        if (dropAt < queue.length) queue[dropAt] = carried;
+        else cmd = carried;
         this.dropped++;
       }
       queue.push(cmd);

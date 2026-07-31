@@ -172,8 +172,15 @@ export class Net {
     // whole vector once would rotate the deck underneath a world-space correction.
     this.correction = new THREE.Vector3();
     this.correctionBased = false;
+    // Orientation residuals use the same measured frame and exponential pay-off as position.
+    // Applying them all at once made one dropped mouse packet a visible camera snap even while
+    // the positional half of the same reconciliation eased correctly.
+    this.yawCorrection = 0;
+    this.pitchCorrection = 0;
     this.lastError = 0;
     this.worstError = 0;
+    this.lastLookError = 0;
+    this.worstLookError = 0;
     this.snaps = 0;
     this.smoothings = 0;
 
@@ -359,6 +366,8 @@ export class Net {
     this.history.length = 0;
     this.correction.set(0, 0, 0);
     this.correctionBased = false;
+    this.yawCorrection = 0;
+    this.pitchCorrection = 0;
     if (!this.connected || !this.seat) return;
 
     // Ordered with binary input by the WebSocket, but OUTSIDE that input queue. A neutral
@@ -375,6 +384,8 @@ export class Net {
     this.history.length = 0;
     this.correction.set(0, 0, 0);
     this.correctionBased = false;
+    this.yawCorrection = 0;
+    this.pitchCorrection = 0;
     this.renderEntities = null;
     this.sim?.horde?.clearRenderCombatFrame?.();
     if (this.buffer.length === 0) {
@@ -430,6 +441,8 @@ export class Net {
     this.history.length = 0;
     this.correction.set(0, 0, 0);
     this.correctionBased = false;
+    this.yawCorrection = 0;
+    this.pitchCorrection = 0;
     this.snapshotsApplied = 0;
     this.snapshotsDropped = 0;
     this.lastSnapshotTick = 0;
@@ -444,6 +457,8 @@ export class Net {
     this.authorityHurtCount = null;
     this.lastError = 0;
     this.worstError = 0;
+    this.lastLookError = 0;
+    this.worstLookError = 0;
     this.snaps = 0;
     this.smoothings = 0;
     this.wireOps = [];
@@ -855,6 +870,43 @@ export class Net {
     this.authorityHurtCount = mine.hurtCount;
   }
 
+  /**
+   * Reconcile the winch's authoritative level after every local command is accounted for.
+   *
+   * The wire already carries this state for observer ropes. The local path used to ignore it,
+   * so a hard adoption cancelled an active authoritative pull and left the operative moving
+   * with no rope. Do not apply an older level while a local fire/cut command is still in flight;
+   * once authority has caught up—or hard adoption is already required—the current level and
+   * anchor are definitive.
+   */
+  #syncLocalGrapple(mine) {
+    const grapple = this.player.grapple ?? this.sim.grapple;
+    if (!grapple) return;
+
+    const state = unpackGrappleBits(mine.grappleBits);
+    if (!state.active) {
+      if (grapple.active) grapple.cancel();
+      return;
+    }
+
+    const resumed = !grapple.active;
+    const frameChanged = grapple.onHull !== state.onHull;
+    grapple.active = true;
+    grapple.onHull = state.onHull;
+    const anchor = state.onHull ? grapple.anchorLocal : grapple.anchorWorld;
+    anchor.set(mine.grappleX, mine.grappleY, mine.grappleZ);
+    grapple.cooldown = 0;
+
+    if (resumed || frameChanged) {
+      grapple.timer = 0;
+      grapple.stuckTime = 0;
+      grapple.lastDist = Infinity;
+      _v.copy(anchor);
+      if (state.onHull) this.trampler.localToWorld(_v);
+      grapple.anchorWasAbove = _v.y > this.player.position.y;
+    }
+  }
+
   /** Adopt CURRENT authority when two states cannot be reconciled in one coordinate frame. */
   #hardAdoptCurrent(mine) {
     const p = this.sim.player;
@@ -884,6 +936,9 @@ export class Net {
 
     const station = b.station > 0 ? this.sim.guns?.[b.station - 1] : null;
     if (station && !station.operator) station.mount(p);
+    // `cancel()` above clears a locally predicted rope before the coordinate-frame rewrite.
+    // Restore it immediately when the CURRENT authority says the pull is still active.
+    this.#syncLocalGrapple(mine);
 
     // A hard authority change may land between fixed steps; refresh the camera now rather
     // than rendering one stale frame before Player.update gets its next turn.
@@ -893,6 +948,8 @@ export class Net {
     this.history.length = 0;
     this.correction.set(0, 0, 0);
     this.correctionBased = b.based;
+    this.yawCorrection = 0;
+    this.pitchCorrection = 0;
     this.lastReconciledSeq = mine.ackSeq;
     this.snaps++;
   }
@@ -954,6 +1011,11 @@ export class Net {
       return;
     }
 
+    // Current grapple state is safe to adopt only after every locally predicted fire/cut edge
+    // has an acknowledgement. Before then this snapshot may legitimately describe the level
+    // from before that edge.
+    if (authorityCaughtUp) this.#syncLocalGrapple(mine);
+
     // Current health and counters still update above, but one sequence gets one positional
     // measurement however many newer snapshots repeat it.
     if (mine.ackSeq <= this.lastReconciledSeq) return;
@@ -986,15 +1048,16 @@ export class Net {
       return;
     }
 
-    // Orientation is paid immediately. Rebase every newer mark by the same amount or each
-    // acknowledgement already in flight will measure and apply this one residual again.
+    // Orientation is a residual just like position. Paying this whole delta on the packet's
+    // render frame made a dropped mouse command a visible snap—the reproduced 300 ms burst
+    // produced five degrees in one frame. `#payCorrection` applies and rebases only the portion
+    // actually paid, so later acknowledgements cannot charge the same turn twice.
     const yawFix = angleDelta(mark.yaw, mine.ackYaw);
     const pitchFix = mine.ackPitch - mark.pitch;
-    p.yaw += yawFix;
-    p.pitch = Math.max(
-      -CFG.player.pitchLimit,
-      Math.min(CFG.player.pitchLimit, p.pitch + pitchFix),
-    );
+    this.yawCorrection = yawFix;
+    this.pitchCorrection = pitchFix;
+    this.lastLookError = Math.hypot(yawFix, pitchFix);
+    if (this.lastLookError > this.worstLookError) this.worstLookError = this.lastLookError;
 
     const r = reconcile(mark, {
       x: mine.ackX,
@@ -1007,7 +1070,6 @@ export class Net {
     this.lastError = r.error;
     if (r.error > this.worstError) this.worstError = r.error;
     while (this.history.length > 0 && this.history[0].seq <= mine.ackSeq) this.history.shift();
-    this.#rebaseHistory(ackState.based, 0, 0, 0, yawFix, pitchFix);
 
     if (r.action === "none") {
       this.correction.set(0, 0, 0);
@@ -1070,19 +1132,47 @@ export class Net {
 
   /** Pay off the newest correction target, in the coordinate frame that authored it. */
   #payCorrection(dt) {
-    if (!this.sim || this.correction.lengthSq() === 0) return;
+    if (!this.sim) return;
+    const positionPending = this.correction.lengthSq() > 0;
+    const lookPending = Math.abs(this.yawCorrection) > 0
+      || Math.abs(this.pitchCorrection) > 0;
+    if (!positionPending && !lookPending) return;
 
     const player = this.sim.player;
     const basedNow = player.base === this.trampler;
     if (basedNow !== this.correctionBased) {
       // Ground and hull-local numbers cannot be mixed. The next authority packet will measure
-      // the new frame; carrying this residual across would manufacture a teleport meanwhile.
+      // the new frame; carrying either residual across would manufacture a teleport or turn.
       this.correction.set(0, 0, 0);
+      this.yawCorrection = 0;
+      this.pitchCorrection = 0;
       return;
     }
 
     // Exponential, which is what `damp` gives every other smoothed quantity in this project.
     const k = 1 - Math.exp(-CFG.net.correctionRate * dt);
+
+    if (lookPending) {
+      const yawStep = this.yawCorrection * k;
+      const requestedPitchStep = this.pitchCorrection * k;
+      const oldPitch = player.pitch;
+      player.yaw += yawStep;
+      player.pitch = Math.max(
+        -CFG.player.pitchLimit,
+        Math.min(CFG.player.pitchLimit, player.pitch + requestedPitchStep),
+      );
+      const pitchStep = player.pitch - oldPitch;
+      this.yawCorrection -= yawStep;
+      // Decay the requested remainder even if the pitch clamp consumed less of it; authority is
+      // clamped by the same rule, so an outward residue at the boundary is only codec noise.
+      this.pitchCorrection -= requestedPitchStep;
+      this.#rebaseHistory(this.correctionBased, 0, 0, 0, yawStep, pitchStep);
+      if (Math.abs(this.yawCorrection) < 1e-6) this.yawCorrection = 0;
+      if (Math.abs(this.pitchCorrection) < 1e-6) this.pitchCorrection = 0;
+    }
+
+    if (!positionPending) return;
+
     _v.copy(this.correction).multiplyScalar(k);
     this.correction.sub(_v);
 

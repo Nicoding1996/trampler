@@ -256,6 +256,13 @@ class LookRegistry {
     for (const mat of this.materials.values()) this.#dress(mat);
   }
 
+  /** Dress only roles backed by one texture set, spreading shader invalidation over the load. */
+  #dressSet(setName) {
+    for (const mat of this.materials.values()) {
+      if (ROLE_TEXTURE[mat.userData.role]?.set === setName) this.#dress(mat);
+    }
+  }
+
   // ---------------------------------------------------------------- browser only
 
   /**
@@ -301,14 +308,20 @@ class LookRegistry {
       );
     });
 
-    await Promise.all(Object.entries(manifest.textures ?? {}).map(async ([role, entry]) => {
+    // One PBR set at a time: three image requests rather than all twenty-four at once. The
+    // art is optional and the flat materials are already playable, so saturating a first-load
+    // connection and decoding/uploading every 1K map together only buys a large hitch. Dressing
+    // each completed set also spreads material recompiles across those network turns instead of
+    // invalidating the whole scene on one frame.
+    for (const [setName, entry] of Object.entries(manifest.textures ?? {})) {
       const [diff, nor, arm] = await Promise.all([
         entry.maps.diff ? load1(entry.maps.diff, true) : null,
         entry.maps.nor_gl ? load1(entry.maps.nor_gl, false) : null,
         entry.maps.arm ? load1(entry.maps.arm, false) : null,
       ]);
-      this.textures.set(role, { diff, nor, arm });
-    }));
+      this.textures.set(setName, { diff, nor, arm });
+      this.#dressSet(setName);
+    }
 
     // Environment lighting. This is the biggest single visual win available:
     // every metal surface in the scene gets its specular response from it, which
