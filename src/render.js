@@ -364,10 +364,68 @@ export class CameraPresentation {
     this.currentYaw = player.yaw;
     this.previousPitch = player.pitch;
     this.currentPitch = player.pitch;
+
+    // A snapshot correction relocates the hull immediately, which is required for collision
+    // and for keeping a rider at the same deck-local point. It must not also become a camera
+    // teleport. Remember the fixed eye in hull space so rebase() can isolate that transform
+    // change from a genuine local-player reconciliation, then retain the opposite visual
+    // offset while the existing authority-correction rate pays it away.
+    this.presentationBase = null;
+    this.baseLocalPosition = new THREE.Vector3();
+    this.baseProjectedPosition = new THREE.Vector3();
+    this.baseCorrection = new THREE.Vector3();
+    this.authorityOffset = new THREE.Vector3();
+    this.baseLocalYaw = 0;
+    this.authorityYawOffset = 0;
+    this.#captureBasedPose();
+  }
+
+  #captureBasedPose() {
+    const base = this.player.base;
+    this.presentationBase = base;
+    if (!base) return;
+    this.baseLocalPosition.copy(this.currentPosition);
+    base.worldToLocal(this.baseLocalPosition);
+    this.baseLocalYaw = this.currentYaw - base.yaw;
   }
 
   /** Shift both endpoints by any correction applied outside the fixed-step loop. */
-  rebase() {
+  rebase(dt = 0) {
+    const decay = Math.exp(-CFG.net.correctionRate * Math.max(0, dt));
+    this.authorityOffset.multiplyScalar(decay);
+    this.authorityYawOffset *= decay;
+    if (this.authorityOffset.lengthSq() < 1e-6) this.authorityOffset.set(0, 0, 0);
+    if (Math.abs(this.authorityYawOffset) < 1e-5) this.authorityYawOffset = 0;
+
+    // The player remains exactly based in simulation while a hull snapshot moves their world
+    // eye. Project the previous hull-local eye through the corrected transform to identify
+    // only that part of the external correction. Cancelling it in presentation removes the
+    // measured 4-8 cm packet-frequency camera step without softening movement or collision.
+    const base = this.player.base;
+    if (base && base === this.presentationBase) {
+      this.baseProjectedPosition.copy(this.baseLocalPosition);
+      base.localToWorld(this.baseProjectedPosition);
+      this.baseCorrection.copy(this.baseProjectedPosition).sub(this.currentPosition);
+      this.authorityOffset.sub(this.baseCorrection);
+      this.authorityYawOffset -= angleDelta(
+        this.currentYaw,
+        base.yaw + this.baseLocalYaw,
+      );
+
+      // A large correction is a changed world, not packet jitter. The same positional
+      // threshold that snaps operative reconciliation keeps presentation attached after a
+      // reset or other discontinuity rather than easing the camera through metres of space.
+      if (this.authorityOffset.length() >= CFG.net.correctionSnapAt) {
+        this.authorityOffset.set(0, 0, 0);
+        this.authorityYawOffset = 0;
+      }
+    } else {
+      // A base transition changes coordinate frames. A residual authored on the deck cannot
+      // follow the player onto the sand (or through a respawn) without inventing motion.
+      this.authorityOffset.set(0, 0, 0);
+      this.authorityYawOffset = 0;
+    }
+
     this.player.eyePosition(this.actualPosition);
     this.correction.copy(this.actualPosition).sub(this.currentPosition);
     this.previousPosition.add(this.correction);
@@ -378,6 +436,7 @@ export class CameraPresentation {
     this.currentYaw = this.player.yaw;
     this.previousPitch += this.player.pitch - this.currentPitch;
     this.currentPitch = this.player.pitch;
+    this.#captureBasedPose();
   }
 
   /** Preserve the old fixed pose immediately before the simulation advances. */
@@ -400,12 +459,14 @@ export class CameraPresentation {
     this.player.eyePosition(this.currentPosition);
     this.currentYaw = this.player.yaw;
     this.currentPitch = this.player.pitch;
+    this.#captureBasedPose();
   }
 
   /** Write the render pose, including any mouse delta not consumed by a fixed step yet. */
   apply(alpha) {
     const t = clamp(alpha, 0, 1);
     this.camera.position.lerpVectors(this.previousPosition, this.currentPosition, t);
+    this.camera.position.add(this.authorityOffset);
 
     let yaw = this.previousYaw + angleDelta(this.previousYaw, this.currentYaw) * t;
     let pitch = this.previousPitch + (this.currentPitch - this.previousPitch) * t;
@@ -413,6 +474,7 @@ export class CameraPresentation {
       yaw -= this.input.mouse.dx * CFG.player.lookSensitivity;
       pitch -= this.input.mouse.dy * CFG.player.lookSensitivity;
     }
+    yaw += this.authorityYawOffset;
     pitch = clamp(pitch, -CFG.player.pitchLimit, CFG.player.pitchLimit);
     this.camera.rotation.set(pitch, yaw, 0, "YXZ");
   }

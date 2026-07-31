@@ -634,7 +634,7 @@ function boot() {
     // frame that owes three steps should apply it once and then predict forward three times,
     // which is exactly what a client does between packets anyway.
     net.applyPending(renderDt, frameMs / 1000);
-    cameraPresentation.rebase();
+    cameraPresentation.rebase(renderDt);
 
     accumulator += absorbMs;
     let steps = 0;
