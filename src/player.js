@@ -75,6 +75,10 @@ export class Player {
     this.timeSinceHurt = 99;
     this.spawnGrace = 0;
     this.deaths = 0;
+    // Monotonic pose-discontinuity signal for pure presentation readers. Polling a counter
+    // keeps respawn/drop lifecycle knowledge out of CameraPresentation without coupling this
+    // simulation module to the renderer.
+    this.relocationCount = 0;
     // Incoming damage multiplier, owned by the economy's kinetic weave. 1 is
     // unarmoured. Hyperbolic on the economy's side so it can never reach zero:
     // the ground having a cost is half the pillar.
@@ -540,6 +544,7 @@ export class Player {
     // Dying throws you off the gun. Through the mount, so the seat learns it is empty
     // -- writing `station.mounted = false` from out here left the gun's own idea of its
     // occupant untouched, which is survivable with one operative and not with four.
+    this.relocationCount++;
     this.station?.dismount(this);
     // Repair ownership is published on Player for the rest of the crew and for snapshots.
     // Death can happen after this frame's Repair pass, so clear it at the teleport itself;
@@ -556,6 +561,7 @@ export class Player {
   }
 
   dropToGround() {
+    this.relocationCount++;
     this.station?.dismount(this);
     // After the dismount, which parks the operative back on the hull -- this is the
     // one release that wants to end up off it.

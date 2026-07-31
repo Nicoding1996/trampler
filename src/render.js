@@ -382,7 +382,20 @@ export class CameraPresentation {
 
   #captureBasedPose() {
     const base = this.player.base;
+    const relocationChanged = this.presentationRelocationCount !== undefined
+      && this.player.relocationCount !== this.presentationRelocationCount;
+    const deathChanged = this.presentationDeaths !== undefined
+      && this.player.deaths !== this.presentationDeaths;
+    if (base !== this.presentationBase || relocationChanged || deathChanged) {
+      // afterStep() can observe a deck/ground transition or respawn after this frame's rebase()
+      // already ran. Clear here as well as in rebase so a deck-authored residual cannot be
+      // rendered once in a new coordinate frame or survive an explicit pose discontinuity.
+      this.authorityOffset.set(0, 0, 0);
+      this.authorityYawOffset = 0;
+    }
     this.presentationBase = base;
+    this.presentationRelocationCount = this.player.relocationCount;
+    this.presentationDeaths = this.player.deaths;
     if (!base) return;
     this.baseLocalPosition.copy(this.currentPosition);
     base.worldToLocal(this.baseLocalPosition);

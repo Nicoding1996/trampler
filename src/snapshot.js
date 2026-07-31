@@ -1039,6 +1039,19 @@ export function encodeInput(cmd) {
 export function decodeInput(buffer) {
   const dv = viewOf(buffer);
   const total = dv.byteLength;
+  // The input layout changed in protocol 9, so an old client necessarily sends a packet of
+  // the old size. Read the one byte whose position is stable across versions before enforcing
+  // this version's exact layout; otherwise every genuine stale-client mismatch is mislabeled
+  // as a truncated current packet and the Worker's diagnostic points at transport corruption.
+  if (total > 0) {
+    const announcedVersion = dv.getUint8(0);
+    if (announcedVersion !== PROTOCOL_VERSION) {
+      throw new SnapshotError(
+        `input protocol ${announcedVersion}, this build speaks ${PROTOCOL_VERSION}`,
+        { cause: "version", got: announcedVersion, want: PROTOCOL_VERSION },
+      );
+    }
+  }
   if (total !== INPUT_BYTES) {
     throw new SnapshotError(
       `input packet is ${total} bytes, expected ${INPUT_BYTES}`,
@@ -1065,7 +1078,20 @@ export function decodeInput(buffer) {
     throw new SnapshotError(`expected an input packet, got kind ${kind}`, { cause: "kind" });
   }
   const cmd = { version, kind };
-  for (const [key, k] of INPUT.slice(2)) cmd[key] = take(k);
+  for (const [key, k] of INPUT.slice(2)) {
+    const value = take(k);
+    // Unlike locally encoded values, bytes from a socket are untrusted. Float32 can represent
+    // NaN and infinities, and either look delta would flow straight into Player.yaw/pitch and
+    // poison authoritative transforms for the rest of the run. Reject the packet at the codec
+    // boundary so malformed intent costs one input tick, as the Worker already promises.
+    if (k === "float" && !Number.isFinite(value)) {
+      throw new SnapshotError(
+        `input field ${key} must be finite`,
+        { cause: "value", field: key, got: value },
+      );
+    }
+    cmd[key] = value;
+  }
   return cmd;
 }
 
