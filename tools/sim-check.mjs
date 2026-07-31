@@ -1,29 +1,26 @@
-// Ask a running Worker whether the real simulation can load and step inside it, and
-// how much it costs per frame there.
+// Ask a LOCAL running Worker whether the real simulation can load and step inside it,
+// and how much it costs per frame there.
 //
 //   npm run dev:mp                    (in one terminal)
 //   node tools/sim-check.mjs
 //
-//   BASE=https://trampler.<subdomain>.workers.dev node tools/sim-check.mjs
-//
-// This is the spike that decides whether the Durable Object can host the
+// This is the spike that decides whether the Durable Object runtime can host the
 // authoritative simulation, or whether the simulation has to stay on a client and the
 // DO becomes an arbitrator. worker/sim-check.js has the reasoning; this file's job is
-// to produce a number that can be trusted.
+// to exercise that runtime boundary and produce a local measurement that can be trusted.
 //
-// Run it against the DEPLOYED Worker as well. Local workerd on a dev machine and an
-// edge PoP are different hardware under different load, and only the second one
-// describes what a player gets.
+// This tool is deliberately loopback-only. The deployed Worker returns 404 for the
+// expensive unauthenticated endpoint; `BASE` is checked before any request so this
+// script cannot accidentally probe a deployment. Use `npm run sim` as a local
+// planning/reference proxy; the CPU available on edge hardware remains unknown.
 //
-// THE SERVER CANNOT TIME ITSELF, SO THIS FILE DOES THE TIMING.
+// THE SERVER CLOCK IS NOT TRUSTED, SO THIS FILE DOES THE TIMING.
 //
 // Cloudflare freezes Date.now() and performance.now() during synchronous execution to
-// mitigate Spectre; they advance only after I/O. So a loop of 400-enemy frames inside
-// one request measures ZERO on the deployed Worker. The first version of this file
-// read that zero as `0.0 ms of CPU per second` and printed "COMFORTABLE — a DO can
-// host this at 60 Hz", which is the most consequential false green available here.
-// Local workerd advances timers normally, so it looked right locally and fabricated
-// the one run that mattered.
+// mitigate Spectre, and local workerd can undercount synchronous CPU too. A loop of
+// 400-enemy frames may therefore look implausibly cheap if timed inside the Worker.
+// The first version trusted that clock and could print "COMFORTABLE" from a measurement
+// of nothing.
 //
 // The fix is DIFFERENCING TWO RUNS ON THIS CLOCK. Ask for a short run and a long run;
 // both pay the same fixed cost (fetch, startup, building the world, filling the pool,
@@ -32,13 +29,27 @@
 //
 // That is the same move worker/index.js already makes for the tick rate -- "the
 // measurement that cannot lie is on the client: count how far `tick` advanced over an
-// interval the CLIENT timed" -- for the same underlying reason. Worth noticing that the
-// pattern was already in the adjacent file and this one still got it wrong.
+// interval the CLIENT timed" -- for the same underlying reason.
 
 // Trimmed because `set BASE=http://... && node ...` in cmd puts the trailing space
 // INSIDE the value, and the resulting error names an invalid URL rather than the
 // stray space that caused it.
 const BASE = (process.env.BASE ?? "http://127.0.0.1:8787").trim();
+
+let baseUrl;
+try {
+  baseUrl = new URL(BASE);
+} catch {
+  console.log(`invalid BASE URL: ${BASE}`);
+  process.exit(1);
+}
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+if (!LOOPBACK_HOSTS.has(baseUrl.hostname.toLowerCase())) {
+  console.log("sim-check is local-only; refusing to request a non-loopback Worker.");
+  console.log(`BASE resolved to ${baseUrl.origin}`);
+  process.exit(1);
+}
 
 // WHAT THE TWO RUN LENGTHS ARE FOR, AND WHY NEITHER OF THEM IS SHORT.
 //
@@ -111,7 +122,7 @@ try {
 } catch (err) {
   console.log(`could not reach ${BASE} — ${err.message}`);
   console.log(
-    "\nStart the lobby with `npm run dev:mp`, or set BASE= to a deployed Worker."
+    "\nStart the lobby with `npm run dev:mp`."
     + "\nTo check the spike's own wiring without a server at all:"
     + "\n    node tools/sim-check-node.mjs",
   );
@@ -248,7 +259,8 @@ console.log(
 );
 
 // What the server thought, kept only as corroboration and clearly labelled. Null when
-// the runtime froze its clock, which is the deployed case and is correct behaviour.
+// the runtime's clock did not advance, which is a valid runtime limitation rather than
+// a fast result.
 if (r.selfTimedMsPerFrame === null) {
   console.log(
     `\n     (the Worker could not time itself: ${r.clockNote})`,
@@ -269,13 +281,13 @@ if (r.selfTimedMsPerFrame === null) {
   //
   // Which means the self-timed figure is untrustworthy even LOCALLY, not just when
   // deployed, and the fact that it happens to sit near the differenced figure above is
-  // two low readings agreeing rather than confirmation. The number to stand behind for
-  // worst-case cost is node's, from `npm run sim`.
+  // two low readings agreeing rather than confirmation. Plain Node is the more stable
+  // local planning/reference proxy; it is not a worst-case bound on edge hardware.
   //
-  // Recorded here rather than resolved because the verdict does not depend on it: the
-  // most pessimistic available reading still leaves roughly 17x headroom in a 16.7 ms
-  // tick, so the architecture question is answered under every interpretation. It is
-  // worth knowing before anyone tries to tune against this number.
+  // Recorded here rather than resolved because the local architecture check still has
+  // roughly 17x headroom in a 16.7 ms tick under either local measurement. That establishes
+  // runtime compatibility and local feasibility, not deployed edge CPU. It is worth knowing
+  // before anyone tries to tune against this number.
   console.log(
     "     NOTE: a self-timed figure well below `npm run sim` is expected and is an"
     + "\n     artefact of workerd's timer gating, not a fast runtime. Do not tune on it.",
@@ -293,9 +305,9 @@ if (r.selfTimedMsPerFrame === null) {
 // than what this measures. 200 ms/s is a twelfth of a core and roughly 4x the node
 // figure for a full run, which is the margin that makes a floor usable as a verdict.
 const verdict = perSecond < 200
-  ? "COMFORTABLE — a DO can host this at 60 Hz"
+  ? "COMFORTABLE — local workerd can host this at 60 Hz"
   : perSecond < 600
-    ? "TIGHT — it fits, but measure the deployed edge before relying on it"
+    ? "TIGHT — it fits locally, but leaves too little margin to rely on"
     : "TOO SLOW — the simulation cannot run server-side at 60 Hz here";
 console.log(`\n${verdict}   (${perSecond.toFixed(1)} ms of CPU per second of wall clock)`);
 console.log(
@@ -303,10 +315,8 @@ console.log(
   + ` ${((msPerFrame / 16.667) * 100).toFixed(1)}% of the tick`,
 );
 
-if (BASE.includes("127.0.0.1") || BASE.includes("localhost")) {
-  console.log(
-    "\nThis was LOCAL workerd on this machine. It is the right way to iterate and the"
-    + "\nwrong number to rely on: re-run with BASE= against the deployed Worker before"
-    + "\ntreating the verdict as settled.",
-  );
-}
+console.log(
+  "\nThis was LOCAL workerd on this machine. It verifies runtime compatibility, not"
+  + "\nedge hardware. The deployed endpoint is deliberately disabled; use `npm run sim`"
+  + "\nas a local planning/reference proxy. Edge CPU remains unknown.",
+);

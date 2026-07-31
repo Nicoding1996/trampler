@@ -12,15 +12,14 @@
 //
 // WHAT THIS SLICE IS FOR
 //
-// It carries NO game state on purpose. It exists to measure the one thing that
-// can invalidate the whole netcode plan: whether a 60 Hz tick inside a Durable
-// Object actually holds 60 Hz. The docs promise unlimited wall time while a
-// WebSocket is in flight and 30 s of CPU per inbound message, which is ample --
-// the simulation costs 0.40 ms a frame at 400 enemies, so 60 Hz is about 24 ms
-// of CPU per second of wall clock. What the docs do not promise is timer
-// *fidelity*. If the tick is ragged, the simulation cannot live here and the
-// architecture changes to a client host with the DO as a relay. Better to know
-// that on day one than in week three.
+// This began as a tick-rate relay spike and now owns the authoritative game state. The
+// architectural check is still whether a 60 Hz tick inside a Durable Object actually
+// holds 60 Hz. Local whole-run measurements put the 400-body crowd around 0.6–0.95 ms
+// per frame, roughly 40–55 ms of CPU per second of wall clock; the sim-check also includes
+// the authority-only rewind-history write. Those are local planning figures, not a bound on
+// edge hardware. What the runtime docs do not promise is timer *fidelity*. If the tick is
+// ragged, the simulation cannot live here and the architecture changes to a client host
+// with the DO as a relay. Better to know that on day one than in week three.
 //
 // HIBERNATION IS DELIBERATELY NOT USED
 //
@@ -34,6 +33,9 @@
 // slots, and a 26 x 16 m deck to fight under. Six players means two with no
 // station to take, which turns the oscillation into a fixed assignment.
 const CREW_MAX = 4;
+// Multiplayer begins with a pair. A one-seat lobby is still useful while the host shares
+// its code, but starting it would create a solo run that nobody else can join afterwards.
+const CREW_MIN = 2;
 
 // The simulation rate. Matches the harness's fixed DT of 1/60 on purpose -- that
 // is the timestep the 829 assertions are measured against, and the game loop
@@ -247,30 +249,20 @@ export default {
       });
     }
 
-    // GET /lobby/sim-check -> can the real simulation load and step in here at all?
+    // GET /lobby/sim-check -> can the real simulation load and step in local workerd?
     //
-    // Dynamically imported so an ordinary session never touches it. See
-    // worker/sim-check.js for what it is asking and why the answer changes the plan.
+    // LOCAL DEVELOPMENT ONLY. The deployed config has an ASSETS binding; returning a
+    // plain 404 there makes the expensive, unauthenticated probe indistinguishable from
+    // an absent route and does so before its frame count is parsed or simulation code is
+    // imported. wrangler.dev.jsonc deliberately has no ASSETS binding, so the same code
+    // remains available on loopback for compatibility checks.
     if (url.pathname === "/lobby/sim-check") {
-      // CLAMPED, because this endpoint is PUBLIC and UNAUTHENTICATED once deployed.
-      //
-      // It was `Number(...) || 120` with no ceiling, which is harmless on localhost and
-      // is a denial-of-service the moment the Worker is on the internet: `?frames=1e9`
-      // builds a 400-body world and steps it until the 30 s CPU limit kills the request.
-      // Self-limiting per request and not per REQUESTER, so anyone can burn 30 s of
-      // billable CPU as often as they like, against an endpoint that exists purely to
-      // answer a development question.
-      //
-      // 5000 frames is 83 seconds of simulated time, comfortably more than any probe
-      // needs -- tools/sim-check.mjs asks for 1200 -- and a few hundred ms of real work.
-      // NaN and negatives fall through to the default rather than to zero, because a
-      // zero-frame run would skip the pool guard and report a pass having measured
-      // nothing.
-      //
-      // Note what is NOT done here: this is not made private. A clamp is the whole fix
-      // for the cost problem, and the endpoint leaks nothing -- it reports frame timings
-      // and finiteness of the project's own open-source simulation. If that changes, or
-      // if it ever reads real session state, it needs a guard rather than a ceiling.
+      if (env.ASSETS) return new Response("Not found", { status: 404 });
+
+      // Keep the local probe bounded too. A mistyped `?frames=1e9` should not pin the
+      // development Worker until its CPU limit, and a zero-frame run would skip the
+      // pool guard and report a pass having measured nothing. 5000 frames is 83 seconds
+      // of simulated time, comfortably more than tools/sim-check.mjs requests.
       const asked = Number(url.searchParams.get("frames"));
       const frames = Number.isFinite(asked) && asked >= 1
         ? Math.min(Math.floor(asked), 5000)
@@ -345,7 +337,12 @@ export class Lobby {
     // `idFromName` is one-way: the object cannot read its own name, so the code
     // is handed in on the first request and kept for the readouts.
     this.code = null;
-    this.phase = "lobby"; // "lobby" | "running"
+    this.phase = "lobby"; // "lobby" | "starting" | "running"
+    // Permission follows a person, not a permanently privileged seat number. The first
+    // arrival hosts; if they leave, the longest-connected survivor is promoted.
+    this.hostSeat = 0;
+    // The one server tick at which the constructed authority became the shared run.
+    this.startTick = null;
 
     /** @type {Map<WebSocket, {seat:number, name:string}>} */
     this.crew = new Map();
@@ -439,6 +436,9 @@ export class Lobby {
 
     const seat = this.#freeSeat();
     const name = url.searchParams.get("name") || `CREW ${seat}`;
+    // Map insertion order is connection order, so the first member is the initial host and
+    // the first survivor is the deterministic promotion target later.
+    if (this.hostSeat === 0) this.hostSeat = seat;
     // `pose` stays null until this client sends one, and the broadcast skips nulls, so
     // a seat that has connected but not yet reported does not appear at the origin --
     // which on this deck is inside the reactor.
@@ -455,7 +455,10 @@ export class Lobby {
       t: "hello",
       seat,
       code: this.code,
+      crewMin: CREW_MIN,
       crewMax: CREW_MAX,
+      hostSeat: this.hostSeat,
+      startTick: this.startTick,
       tickHz: TICK_HZ,
       snapshotHz: TICK_HZ / SNAPSHOT_EVERY,
       phase: this.phase,
@@ -470,7 +473,10 @@ export class Lobby {
     return {
       code: this.code,
       phase: this.phase,
+      hostSeat: this.hostSeat,
+      startTick: this.startTick,
       crew: this.crew.size,
+      crewMin: CREW_MIN,
       crewMax: CREW_MAX,
       tick: this.tick,
       snapshots: this.snapshots,
@@ -619,18 +625,42 @@ export class Lobby {
         };
         break;
 
-      case "start":
-        // Seat 1 only, and only out of the lobby. This is the clause that makes
-        // a join refusal mid-run testable.
-        if (me.seat === 1 && this.phase === "lobby") {
-          this.phase = "running";
-          this.#broadcast({ t: "phase", phase: this.phase });
-          // Not awaited. The message handler must return so the runtime can deliver the
-          // next frame, and the tick loop already tolerates a null sim -- it counts the
-          // ticks it could not step and reports them rather than pretending.
-          this.#beginRun();
+      case "start": {
+        // Starting is a permissioned lobby transition. The Durable Object remains the game
+        // authority; "host" only names who may commit this one shared action.
+        if (this.phase !== "lobby") {
+          this.#send(socket, {
+            t: "start", accepted: false,
+            reason: this.phase === "starting" ? "the run is already starting" : "the run has started",
+          });
+          break;
         }
+        if (me.seat !== this.hostSeat) {
+          this.#send(socket, {
+            t: "start", accepted: false,
+            reason: `only host seat ${this.hostSeat} can start the run`,
+          });
+          break;
+        }
+        if (this.crew.size < CREW_MIN) {
+          this.#send(socket, {
+            t: "start", accepted: false,
+            reason: `waiting for ${CREW_MIN - this.crew.size} more operative`,
+          });
+          break;
+        }
+
+        // STARTING closes the join race immediately, but RUNNING is not announced until the
+        // real world exists. Every browser remains paused for the same first authoritative
+        // baseline instead of one client entering while the Worker is still importing it.
+        this.phase = "starting";
+        this.startTick = null;
+        this.#broadcast({
+          t: "phase", phase: this.phase, hostSeat: this.hostSeat, startTick: null,
+        });
+        this.#beginRun();
         break;
+      }
     }
   }
 
@@ -727,17 +757,57 @@ export class Lobby {
       //
       // `networked: true` gives every seat a de-jitter queue rather than a stub that reports
       // nothing pressed.
+      // A disconnect may happen while the dynamic imports are in flight. Re-check the
+      // accepted lobby condition at the construction boundary so STARTING cannot turn a
+      // now-solo room into an unjoinable run.
+      if (this.phase !== "starting" || this.crew.size < CREW_MIN) {
+        this.phase = "lobby";
+        this.startTick = null;
+        this.#broadcast({
+          t: "phase", phase: this.phase, hostSeat: this.hostSeat, startTick: null,
+          reason: "start cancelled: waiting for a crewmate",
+        });
+        this.#broadcastCrew();
+        return;
+      }
+
       const seatIds = [...this.crew.values()].map((member) => member.seat).sort((a, b) => a - b);
-      this.sim = session.createSession({ seats: seatIds, networked: true, autoReset: true });
+      const nextSim = session.createSession({
+        seats: seatIds,
+        hostSeat: this.hostSeat,
+        networked: true,
+        autoReset: true,
+      });
+
+      // Publish the authority atomically: RUNNING is true only after every constructor has
+      // succeeded. `startTick` is the single server-clock boundary all clients adopt; their
+      // first binary baseline may arrive a few ticks later, but it describes this same run.
+      this.sim = nextSim;
+      this.simError = null;
+      this.startTick = this.tick;
+      this.phase = "running";
       this.#broadcast({
         t: "sim", ready: true, protocol: snap.PROTOCOL_VERSION, seats: seatIds,
+        hostSeat: this.hostSeat, startTick: this.startTick,
       });
+      this.#broadcast({
+        t: "phase", phase: this.phase, hostSeat: this.hostSeat, startTick: this.startTick,
+      });
+      this.#broadcastCrew();
     } catch (err) {
       // Reported as data to every client rather than thrown into the void. A DO that
       // cannot build its world is the single most important thing a player could be told,
       // and the alternative is a fortress that never moves with nothing saying why.
+      this.sim = null;
+      this.phase = "lobby";
+      this.startTick = null;
       this.simError = String(err?.message ?? err);
       this.#broadcast({ t: "sim", ready: false, error: this.simError });
+      this.#broadcast({
+        t: "phase", phase: this.phase, hostSeat: this.hostSeat, startTick: null,
+        reason: "authoritative simulation failed to start",
+      });
+      this.#broadcastCrew();
     } finally {
       this.simBusy = false;
     }
@@ -749,9 +819,21 @@ export class Lobby {
     // Neutralise first, then remove the operative from every shared owner before publishing
     // the sparse roster. Keeping an inert ghost would still reserve guns/repair points and
     // count toward vote majorities, so disconnect is lifecycle state, not only input state.
+    const hostLeft = me.seat === this.hostSeat;
     this.#releaseInput(me.seat);
-    this.removeOperative?.(this.sim, me.seat);
+    // `removeOperative` is loaded before the async construction boundary, while `sim` is
+    // published only after construction succeeds. If STARTING rolls back because somebody
+    // left, the function can therefore exist with no world to remove from; guard the world,
+    // not merely the function, or the next disconnect throws before roster/host cleanup.
+    if (this.sim) this.removeOperative?.(this.sim, me.seat);
     this.crew.delete(socket);
+
+    // Map order is arrival order. Promotion therefore goes to the longest-connected
+    // survivor and is stable across sparse seat reuse; host authority never falls back to
+    // the numeric accident of whichever seat happens to be 1.
+    if (hostLeft) this.hostSeat = this.crew.values().next().value?.seat ?? 0;
+    if (this.sim) this.sim.hostSeat = this.hostSeat;
+
     this.#broadcastCrew();
     if (this.crew.size === 0) this.#stopTicking();
   }
@@ -808,7 +890,7 @@ export class Lobby {
       // clients predict by re-running this same code, so a server that stepped by measured
       // time would disagree with every one of them about the last second. CFG.loop carries
       // the reasoning at length.
-      if (this.sim) this.stepSession(this.sim, STEP_SECONDS);
+      if (this.sim) this.stepSession(this.sim, STEP_SECONDS, this.tick);
       else this.ticksBeforeSim++;
       if (this.tick % SNAPSHOT_EVERY === 0) due = true;
     }
@@ -947,6 +1029,10 @@ export class Lobby {
     this.#broadcast({
       t: "crew",
       phase: this.phase,
+      crewMin: CREW_MIN,
+      crewMax: CREW_MAX,
+      hostSeat: this.hostSeat,
+      startTick: this.startTick,
       crew: [...this.crew.values()]
         .map((c) => ({ seat: c.seat, name: c.name }))
         .sort((a, b) => a.seat - b.seat),

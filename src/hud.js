@@ -339,17 +339,24 @@ export class Hud {
    * remains of that wave are still on you. Same window as the shop, same reason, and
    * the rule is computed in economy.js so it has a test behind it.
    */
-  #pickPanel(economy) {
+  #pickPanel(economy, run) {
     const offers = economy?.pickOpen ? economy.pickEntries : [];
     const open = offers.length > 0;
     cls(this.pick, open ? "panel show" : "panel");
     if (!open) return;
 
+    // The offer list changes rarely, but the deadline is a live clock. Update the heading
+    // before the signature short-circuit so an AFK fallback cannot be technically visible as
+    // one frozen number. Only held-siege picks carry it; cadence picks remain banked forever.
+    const auto = run?.picking
+      ? ` · AUTO-TAKE IN ${Math.ceil(run.pickAutoSeconds)}s`
+      : "";
+    this.pickHead.textContent = `SALVAGE — TAKE ONE OF ${offers.length}${auto}`;
+
     const signature = offers.map((e) => e.index).join(",");
     if (signature === this.pickSignature) return;
     this.pickSignature = signature;
 
-    this.pickHead.textContent = `SALVAGE — TAKE ONE OF ${offers.length}`;
     this.pickItems.innerHTML = offers.map((e, i) => `<div class="it">`
       + `<div class="rn"><span class="key">${i + 1}</span> ${e.name}</div>`
       + `<div class="rd">${e.detail}</div>`
@@ -643,7 +650,7 @@ export class Hud {
     } = ctx;
     this.#shopPanel(economy, run);
     this.#bayPanel(economy, modules);
-    this.#pickPanel(economy);
+    this.#pickPanel(economy, run);
     this.#routePanel(run, economy);
     this.#buffStrip(items);
     this.#incomeTick(economy, dt);
@@ -776,7 +783,8 @@ export class Hud {
     // at a mount and standing at a repair point are never the same place, so those
     // two cannot both be true, but a road choice can overlap either.
     if (economy?.pickOpen) {
-      this.#prompt(`1-${economy.pendingPick.length}`, "TAKE SALVAGE", 1);
+      const auto = run?.picking ? ` · AUTO IN ${Math.ceil(run.pickAutoSeconds)}s` : "";
+      this.#prompt(`1-${economy.pendingPick.length}`, `TAKE SALVAGE${auto}`, 1);
     } else if (run?.choosing) {
       this.#prompt("1-2", "CHOOSE A ROAD", 1);
     } else if (gun?.mounted) {
@@ -861,7 +869,8 @@ export class Hud {
       // It has to be said at all, though. Making the panel wait without saying so
       // would mean the player earned something and simply never found out, which is
       // the same illegibility this whole update is about rather than a fix for it.
-      this.#prompt("1-3", "SALVAGE BANKED — TAKE IT WHEN CLEAR", 1);
+      const auto = run?.picking ? ` · AUTO IN ${Math.ceil(run.pickAutoSeconds)}s` : "";
+      this.#prompt("1-3", `SALVAGE BANKED — TAKE IT WHEN CLEAR${auto}`, 1);
     } else if (economy?.browsing) {
       // Standing at the refit terminal. Below the repair and the fuse warning because
       // shopping is never the urgent thing, and there is no key to press to "open" it —
@@ -905,7 +914,7 @@ export class Hud {
         break;
       case PHASE.HELD:
         pace = economy?.pendingPick?.length
-          ? "take salvage"
+          ? `take salvage${run?.picking ? ` · auto ${Math.ceil(run.pickAutoSeconds)} s` : ""}`
           : run?.choosing ? "choose a road" : "siege held";
         paceCls = "on";
         break;

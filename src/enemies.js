@@ -116,6 +116,27 @@ const _white = new THREE.Color(1, 1, 1);
 // is 400 Vector3s a frame at a full pool, and test 17 pins the whole simulation
 // step at well under a millisecond -- garbage is exactly how that budget goes.
 const _yAxis = new THREE.Vector3(0, 1, 0);
+// Combat history stores carried bodies in hull-local space, exactly like snapshots. One
+// scratch conversion per body avoids allocating vectors in the 60 Hz recording/query loops.
+const _combatLocal = new THREE.Vector3();
+
+const COMBAT_PRESENT = 1;
+const COMBAT_CARRIED = 2;
+const COMBAT_SUBMERGED = 4;
+const GENERATION_MAX = 0xffff;
+
+/** Allocate one fixed-capacity pose frame. Called only while constructing the Horde. */
+function combatFrame(size) {
+  return {
+    tick: -1,
+    generation: new Uint16Array(size),
+    flags: new Uint8Array(size),
+    x: new Float32Array(size),
+    y: new Float32Array(size),
+    z: new Float32Array(size),
+    yaw: new Float32Array(size),
+  };
+}
 
 // Wounded-tint resolution and its darkest step. Four bands is enough to answer the
 // only question a crowd raises -- "which of these is nearly dead" -- and few enough
@@ -255,7 +276,7 @@ export class Horde {
     this.pool = new Array(CFG.enemies.max);
     for (let i = 0; i < CFG.enemies.max; i++) {
       this.pool[i] = {
-        alive: false, type: CHEWER, hp: 0, maxHp: 1,
+        alive: false, generation: 0, type: CHEWER, hp: 0, maxHp: 1,
         // Which wounded-tint band was last written for this body. -1 means "not
         // written yet", which forces one upload on the frame it appears rather than
         // inheriting whatever the previous occupant of this pool slot looked like.
@@ -305,6 +326,36 @@ export class Horde {
         // 0 means the push was along x so the slide runs on z, 1 the other way round.
       };
     }
+
+    // Presentation raycasts must describe the generation that is visibly interpolated,
+    // not whichever body currently occupies the authority-backed pool slot. One fixed proxy
+    // per slot gives Weapon and the HUD a stable, allocation-free target with only the fields
+    // they read; clients arbitrate shots before consequence, so these are never damaged.
+    this.renderTargets = Array.from({ length: this.pool.length }, () => ({
+      alive: false,
+      generation: 0,
+      type: CHEWER,
+      hp: 0,
+      maxHp: 1,
+      yaw: 0,
+    }));
+
+    // One fixed ring for the authority and one fixed render frame for a client. At 60 Hz the
+    // 250 ms policy is fifteen historical poses; two spare frames make inclusive clamping
+    // unambiguous. Typed arrays keep recording allocation-free at a full 420-body pool.
+    this.combatRewindTicks = Math.ceil(
+      (CFG.combat.weapon.rewindMs / 1000) * CFG.loop.stepHz,
+    );
+    this.combatHistory = Array.from(
+      { length: this.combatRewindTicks + 2 },
+      () => combatFrame(this.pool.length),
+    );
+    this.combatCursor = 0;
+    this.combatNewestTick = -1;
+    this.renderCombatFrame = combatFrame(this.pool.length);
+    // Null is the solo path and preserves the original current-pose query exactly. A server
+    // sets this per operative from input.clientTick; Net sets it to the visible render tick.
+    this.combatTick = null;
 
     this.#buildMeshes(scene);
   }
@@ -450,6 +501,10 @@ export class Horde {
     const ang = fwd + (aimed ? arcOffset : 0) + (this.random() * 2 - 1) * spread;
     const r = CFG.waves.spawnRadius * (0.85 + this.random() * 0.3);
 
+    // Zero means "no body" in history and on the wire. Wrapping a 16-bit generation is
+    // harmless within a 250 ms history window and saves two bytes on every live enemy in
+    // every 20 Hz snapshot; the same slot cannot spawn 65,535 times in fifteen ticks.
+    e.generation = (e.generation % GENERATION_MAX) + 1;
     e.alive = true;
     e.type = type;
     e.maxHp = cfg.hp * hpScale;
@@ -516,6 +571,7 @@ export class Horde {
     // two attempts comparable; carrying the stream across a reset would hand the
     // player a different wave pattern and quietly defeat the whole point.
     this.random = makeRandom(this.seed);
+    this.clearRenderCombatFrame();
   }
 
   /** Speed of a type right now, including the road modifier. */
@@ -1455,34 +1511,184 @@ export class Horde {
   // ------------------------------------------------------------------ combat
 
   /**
+   * Record the end-of-authority-tick target poses into a bounded, allocation-free ring.
+   * Carried bodies use hull-local coordinates because that is what snapshots render against
+   * the CURRENT hull; rewinding their old world position would put them behind a moving deck.
+   */
+  recordCombatFrame(tick) {
+    if (!Number.isFinite(tick)) return false;
+    const frame = this.combatHistory[this.combatCursor];
+    frame.tick = Math.round(tick);
+    frame.flags.fill(0);
+
+    for (let i = 0; i < this.pool.length; i++) {
+      const e = this.pool[i];
+      if (!e.alive) continue;
+      const carried = e.onHull || e.latched;
+      frame.generation[i] = e.generation;
+      frame.flags[i] = COMBAT_PRESENT
+        | (carried ? COMBAT_CARRIED : 0)
+        | (isSubmerged(e) ? COMBAT_SUBMERGED : 0);
+
+      _combatLocal.set(e.x, e.y, e.z);
+      if (carried) this.trampler.worldToLocal(_combatLocal);
+      frame.x[i] = _combatLocal.x;
+      frame.y[i] = _combatLocal.y;
+      frame.z[i] = _combatLocal.z;
+      frame.yaw[i] = e.yaw;
+    }
+
+    this.combatNewestTick = frame.tick;
+    this.combatCursor = (this.combatCursor + 1) % this.combatHistory.length;
+    return true;
+  }
+
+  /**
+   * Load the exact blended entity frame the browser will draw after prediction. This is
+   * separate from the authority ring: a render tick may be fractional, and interpolation
+   * has already produced the positions the player's crosshair is visibly touching.
+   */
+  setRenderCombatFrame(tick, entities = []) {
+    const frame = this.renderCombatFrame;
+    const targets = this.renderTargets;
+    frame.tick = Number.isFinite(tick) ? tick : -1;
+    frame.flags.fill(0);
+    for (let i = 0; i < targets.length; i++) targets[i].alive = false;
+
+    for (const w of entities) {
+      const i = w.id;
+      if (!Number.isInteger(i) || i < 0 || i >= this.pool.length) continue;
+      // Inline the wire decode in this full-pool render path. unpackEnemyBits returns an
+      // object, which made interpolation allocate once per visible body per rendered frame.
+      const bitsA = w.bitsA ?? 0;
+      const bitsB = w.bitsB ?? 0;
+      const type = bitsA & 0x07;
+      const state = (bitsA >> 3) & 0x07;
+      const carried = (bitsA & 64) !== 0;
+      const hpFraction = (bitsB & 0x7f) / 0x7f;
+      const generation = w.generation ?? 0;
+      frame.generation[i] = generation;
+      frame.flags[i] = COMBAT_PRESENT
+        | (carried ? COMBAT_CARRIED : 0)
+        | (state === S.BURROWED ? COMBAT_SUBMERGED : 0);
+      frame.x[i] = w.x;
+      frame.y[i] = w.y;
+      frame.z[i] = w.z;
+      frame.yaw[i] = w.yaw;
+
+      const target = targets[i];
+      const maxHp = enemyCfg(type).hp;
+      target.generation = generation;
+      target.type = type;
+      target.hp = hpFraction * maxHp;
+      target.maxHp = maxHp;
+      target.yaw = w.yaw;
+      target.alive = true;
+    }
+    return frame;
+  }
+
+  clearRenderCombatFrame() {
+    this.renderCombatFrame.tick = -1;
+    this.renderCombatFrame.flags.fill(0);
+    for (let i = 0; i < this.renderTargets.length; i++) {
+      this.renderTargets[i].alive = false;
+    }
+    this.combatTick = null;
+  }
+
+  /** Nearest retained authority frame after clamping an untrusted requested tick. */
+  #combatFrameAt(tick) {
+    if (!Number.isFinite(tick)) return null;
+    const render = this.renderCombatFrame;
+    if (render.tick >= 0 && Math.abs(render.tick - tick) < 1e-4) return render;
+    if (this.combatNewestTick < 0) return null;
+
+    const wanted = clamp(
+      Math.round(tick),
+      this.combatNewestTick - this.combatRewindTicks,
+      this.combatNewestTick,
+    );
+    let best = null;
+    let bestDelta = Infinity;
+    for (const frame of this.combatHistory) {
+      if (frame.tick < 0) continue;
+      const delta = Math.abs(frame.tick - wanted);
+      if (delta >= bestDelta) continue;
+      best = frame;
+      bestDelta = delta;
+    }
+    return best;
+  }
+
+  /**
    * Nearest enemy along a ray, as a box matching what is drawn. Callers must pass
    * a maxDist already clipped by world geometry, otherwise you could shoot
    * chewers through the hull -- which would defeat the entire point of putting
    * them underneath it.
+   *
+   * When `combatTick` is set, positions come from the rendered/historical frame while the
+   * returned object is the CURRENT pooled body. Generation and alive checks join those two
+   * facts: an old pose can damage the same still-living enemy, never a new occupant that
+   * recycled its slot and never something already dead on authority.
    */
   raycast(origin, dir, maxDist) {
     let best = null;
     let bestT = maxDist;
+    let bestYaw = 0;
     const pad = CFG.combat.weapon.hitPad;
+    const frame = this.#combatFrameAt(this.combatTick);
+    const renderFrame = frame === this.renderCombatFrame;
 
-    for (const e of this.pool) {
-      if (!e.alive) continue;
-      // Underground, and therefore not a target. Finite by construction: see the
-      // burrowTime comment in config. Nothing can hide here permanently.
-      if (e.state === S.BURROWED) continue;
+    for (let i = 0; i < this.pool.length; i++) {
+      // A presentation frame owns its identity as well as its pose. The authority pool may
+      // already have killed or recycled this slot while interpolation still visibly draws the
+      // older generation, so returning that current body would make the visible target locally
+      // unhittable or report the replacement's type and armour.
+      const e = renderFrame ? this.renderTargets[i] : this.pool[i];
+      let x;
+      let y;
+      let z;
+      let yaw;
+
+      if (frame) {
+        const flags = frame.flags[i];
+        if ((flags & COMBAT_PRESENT) === 0 || (flags & COMBAT_SUBMERGED) !== 0) continue;
+        // Historical authority shots still deal consequence to the real pooled body, and may
+        // do so only while the recorded generation remains its current living occupant.
+        if (!renderFrame && (!e.alive || e.generation !== frame.generation[i])) continue;
+        x = frame.x[i];
+        y = frame.y[i];
+        z = frame.z[i];
+        yaw = frame.yaw[i];
+        if ((flags & COMBAT_CARRIED) !== 0) {
+          _combatLocal.set(x, y, z);
+          this.trampler.localToWorld(_combatLocal);
+          x = _combatLocal.x;
+          y = _combatLocal.y;
+          z = _combatLocal.z;
+        }
+      } else {
+        if (!e.alive || isSubmerged(e)) continue;
+        x = e.x;
+        y = e.y;
+        z = e.z;
+        yaw = e.yaw;
+      }
 
       const cfg = enemyCfg(e.type);
       const h = cfg.radius * 1.2 * cfg.bulk + pad;
       const hy = cfg.height / 2 + pad;
 
-      const t = rayBox(origin, dir, e.x, e.y, e.z, h, hy, h);
+      const t = rayBox(origin, dir, x, y, z, h, hy, h);
       if (t < 0 || t >= bestT) continue;
 
       bestT = t;
       best = e;
+      bestYaw = yaw;
     }
 
-    return best ? { enemy: best, distance: bestT } : null;
+    return best ? { enemy: best, distance: bestT, yaw: bestYaw } : null;
   }
 
   /**

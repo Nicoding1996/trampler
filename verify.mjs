@@ -12020,11 +12020,12 @@ console.log("\n118. A client driven by snapshots ends up on the same fortress");
 // ---------------------------------------------------------------------------
 // SLICE 2: the horde on the wire, and the frame bit that keeps a latched chewer on its leg.
 //
-// The bandwidth slice. The hull/shared state is fixed once; the horde is twelve bytes times however
-// many are alive, so this is the section where "it grew a bit" becomes a real cost. And it
-// is where the frame choice matters most: the two bodies that travel in hull-local space are
-// a boarder on the deck and a chewer holding a leg, which are exactly the two readouts a
-// player uses to decide which of the two positions to be in.
+// The bandwidth slice. The hull/shared state is fixed once; the horde is fourteen bytes times
+// however many are alive, so this is the section where "it grew a bit" becomes a real cost. Two
+// of those bytes are the spawn generation that prevents a recycled pool slot being interpolated
+// or rewound as its previous occupant. And this is where the frame choice matters most: the two
+// bodies that travel in hull-local space are a boarder on the deck and a chewer holding a leg,
+// which are exactly the two readouts a player uses to decide which of the two positions to be in.
 console.log("\n119. The horde crosses the wire, and carried bodies stay carried");
 {
   const server = createSession();
@@ -12057,7 +12058,8 @@ console.log("\n119. The horde crosses the wire, and carried bodies stay carried"
   // ---- BANDWIDTH, asserted so it cannot creep ------------------------------
   const bytes = buffer.byteLength;
   const perBody = ENTITY_BYTES;
-  ok("one body costs twelve bytes", perBody === 12, `${perBody} B each`);
+  ok("one body costs fourteen bytes, including its spawn generation",
+    perBody === 14, `${perBody} B each`);
   ok("the snapshot is the size the format predicts", bytes === snapshotBytes(liveState),
     `${bytes} B for ${live} bodies and ${server.operatives.length} operative(s)`);
   // The realistic peak: wave five at a four-crew scale is 30 x 2.5 = 75 bodies, with the four
@@ -12073,12 +12075,12 @@ console.log("\n119. The horde crosses the wire, and carried bodies stay carried"
   });
   const peak = bytesAt(75);
   const cap = bytesAt(CFG.enemies.max);
-  ok("a four-crew wave five stays under 30 KiB/s per client",
-    (peak * CFG.net.sendHz) / 1024 < 30,
+  ok("a four-crew wave five stays under 35 KiB/s per client",
+    (peak * CFG.net.sendHz) / 1024 < 35,
     `${(peak / 1024).toFixed(2)} KiB per snapshot -> `
     + `${((peak * CFG.net.sendHz) / 1024).toFixed(1)} KiB/s`);
-  ok("and even a structurally full pool stays inside 115 KiB/s per client",
-    (cap * CFG.net.sendHz) / 1024 < 115,
+  ok("and even a structurally full pool stays inside 130 KiB/s per client",
+    (cap * CFG.net.sendHz) / 1024 < 130,
     `${CFG.enemies.max} bodies -> ${((cap * CFG.net.sendHz) / 1024).toFixed(1)} KiB/s`);
 
   // ---- the round trip ------------------------------------------------------

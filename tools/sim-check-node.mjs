@@ -14,18 +14,23 @@
 // cannot host this simulation" when it actually meant "this file is three arguments
 // stale".
 //
-// Nothing caught that. `npm run audit` and `npm run imports` both scope to src/, and
-// no static check can catch a Player passed where a Crew was wanted -- both are
-// objects, and the call is arity-legal because `seed` defaults.
+// That failure predated the current static coverage. `npm run audit` and `npm run
+// imports` now scan worker/, tools/ and server.mjs as well as src/, so stale CFG paths,
+// imports and exports here are no longer invisible. No static check can catch a Player
+// passed where a Crew was wanted -- both are objects, and the call is arity-legal because
+// `seed` defaults.
 //
 // So the spike is split in two by WHAT IT CAN ANSWER:
 //
 //   this file            is the CODE correct? Node, no wrangler, runs in a second.
-//   tools/sim-check.mjs  is the RUNTIME capable? needs workerd, and the deployed edge.
+//   tools/sim-check.mjs  can the same code run in local workerd?
 //
 // The first is the one that rots, so the first is the one that has to be cheap. The
-// second is the one that decides the architecture, and it is still the number to trust
-// for that -- edge hardware is not this machine, and Node is not workerd.
+// second catches runtime-specific load and execution failures before deployment. The
+// deployed endpoint is deliberately absent: it was an unauthenticated expensive route,
+// and repeated probes had already caused 503s. Both timing paths are local: plain Node is
+// a planning/reference proxy, while local workerd corroborates runtime compatibility.
+// Neither one bounds the CPU available on edge hardware; that remains unknown.
 //
 // The ms/frame figure here is therefore a REFERENCE, not the verdict. Compare it
 // against test 17, which times the same 400 bodies through the harness's own step().
@@ -107,9 +112,8 @@ if (!r.clockAdvanced || r.selfTimedMsPerFrame === null) {
 
 console.log(
   "\nThis says the SPIKE IS WIRED CORRECTLY, and prices the simulation on THIS machine."
-  + "\nIt says nothing about workerd or about the edge -- for that, `npm run dev:mp` then"
-  + "\n`node tools/sim-check.mjs`, and then again with BASE= against the deployed Worker."
-  + "\nThat script does its own timing on the client's clock, because a deployed Worker"
-  + "\ncannot time itself: Cloudflare freezes Date.now() and performance.now() outside"
-  + "\nI/O to mitigate Spectre.",
+  + "\nTo verify the workerd boundary, run `npm run dev:mp` and then"
+  + "\n`node tools/sim-check.mjs`. That endpoint is intentionally local-only; deployed"
+  + "\nWorkers return 404. Treat this plain-Node result as a local planning/reference"
+  + "\nproxy only; the CPU available on edge hardware remains unknown.",
 );

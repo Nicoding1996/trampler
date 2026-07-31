@@ -16,7 +16,9 @@ import { Weapon } from "./weapon.js";
 import { Repair } from "./repair.js";
 import { DeckGun, handleStationInput } from "./deckgun.js";
 import { Emitters } from "./emitters.js";
-import { Economy, routePurchaseInput } from "./economy.js";
+import {
+  Economy, purchaseInputContext, purchaseInputOwner, routePurchaseInput,
+} from "./economy.js";
 import { Events } from "./events.js";
 import { Items } from "./items.js";
 import { Modules } from "./modules.js";
@@ -142,6 +144,20 @@ function boot() {
     lossTimer: 0,
   };
   const net = new Net(scene, player, trampler, localSim);
+  // Number-key ownership is part of the edge, not of the later fixed step that sends it.
+  // A snapshot may change the run between those moments, so resolve against the panel that
+  // was visible in the DOM keydown event. Solo keeps no metadata and routes exactly as before.
+  input.setPurchaseOwnerResolver((code) => {
+    if (!net.multiplayer || !CFG.economy.keys.includes(code)) return undefined;
+    return {
+      owner: purchaseInputOwner({
+        economy,
+        run,
+        bayOpen: localOperative.bayOpen,
+      }),
+      context: purchaseInputContext(localSim.resetId, run),
+    };
+  });
 
   // Art is loaded asynchronously and applied to materials that already exist, so
   // the first frames draw in flat colours and then dress themselves. A missing
@@ -161,8 +177,8 @@ function boot() {
   // working netcode, because the only thing that had ever sent `start` was the smoke test.
   //
   // Bound to the same gesture as the mixer, and for the same reason: clicking the gate is the
-  // one unambiguous "I am ready to play". Seat 1 only and idempotent, both enforced inside
-  // `net.start()`, so this can fire on every click without consequence.
+  // one unambiguous "I am ready to play". The explicit current host alone may start, and
+  // `net.start()` also holds the gesture until at least one crewmate is present.
   gate.addEventListener("click", () => net.start());
   canvas.addEventListener("pointerdown", () => net.start());
 

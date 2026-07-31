@@ -35,7 +35,9 @@ import { Weapon } from "./weapon.js";
 import { Repair } from "./repair.js";
 import { DeckGun, handleStationInput } from "./deckgun.js";
 import { Emitters } from "./emitters.js";
-import { Economy, routePurchaseInput } from "./economy.js";
+import {
+  Economy, PURCHASE_OWNER, purchaseInputContext, routePurchaseInput,
+} from "./economy.js";
 import { Events } from "./events.js";
 import { Items } from "./items.js";
 import { Modules } from "./modules.js";
@@ -46,6 +48,8 @@ import {
   packHullBits, unpackHullBits, packPhaseBits, unpackPhaseBits,
   packEnemyBits, unpackEnemyBits, packOperativeBits, unpackOperativeBits,
   packWeaponBits, unpackWeaponBits, packGrappleBits, HELD_BIT, EDGE_BIT,
+  PURCHASE_OWNER_MASK, PURCHASE_OWNER_SHIFT,
+  PURCHASE_CONTEXT_MASK, PURCHASE_CONTEXT_SHIFT,
 } from "./snapshot.js";
 
 /** Scratch, hoisted. `snapshotOf` runs 20 times a second over up to 420 bodies. */
@@ -72,6 +76,22 @@ export function idleInput() {
     endFrame() {},
   };
 }
+
+const PURCHASE_OWNER_CODE = Object.freeze({
+  [PURCHASE_OWNER.PICK]: 1,
+  [PURCHASE_OWNER.ROUTE]: 2,
+  [PURCHASE_OWNER.BAY]: 3,
+  [PURCHASE_OWNER.REFIT]: 4,
+  [PURCHASE_OWNER.DISCARD]: 5,
+});
+const PURCHASE_OWNER_FROM_CODE = Object.freeze([
+  undefined,
+  PURCHASE_OWNER.PICK,
+  PURCHASE_OWNER.ROUTE,
+  PURCHASE_OWNER.BAY,
+  PURCHASE_OWNER.REFIT,
+  PURCHASE_OWNER.DISCARD,
+]);
 
 /**
  * An `Input` driven from decoded network commands, with a de-jitter queue.
@@ -155,7 +175,11 @@ export function netInput({
         // and its last W or trigger state is not permission to act until it returns.
         current = {
           ...current,
-          held: starvedTicks <= maxHoldTicks ? current.held : 0,
+          // Ownership is command metadata, not a level. Grace may repeat W/fire, but never
+          // a panel identity after the edge it described has already been consumed.
+          held: starvedTicks <= maxHoldTicks
+            ? current.held & ~(PURCHASE_OWNER_MASK | PURCHASE_CONTEXT_MASK)
+            : 0,
           edges: 0,
           lookDx: 0,
           lookDy: 0,
@@ -208,6 +232,14 @@ export function netInput({
 
     get queued() { return queue.length; },
     get seq() { return current.seq; },
+    get clientTick() { return current.clientTick; },
+    get purchaseOwner() {
+      const code = (current.held & PURCHASE_OWNER_MASK) >> PURCHASE_OWNER_SHIFT;
+      return PURCHASE_OWNER_FROM_CODE[code];
+    },
+    get purchaseContext() {
+      return (current.held & PURCHASE_CONTEXT_MASK) >> PURCHASE_CONTEXT_SHIFT;
+    },
     // True only on the tick that consumed a command, never on a repeated grace tick. The
     // acknowledgement pose is captured from this distinction after the complete sim step.
     get fresh() { return fresh; },
@@ -259,12 +291,23 @@ const EDGE_FOR = {
  * correct kind of ugly: the alternative is a press that works in single player and vanishes
  * in multiplayer.
  */
-export function readInput(input, { seq, clientTick }) {
+export function readInput(input, {
+  seq, clientTick, purchaseOwner, purchaseContext = 0,
+}) {
   let held = 0;
   for (const [code, bit] of Object.entries(HELD_FOR)) {
     if (input.down(code)) held |= bit;
   }
   if (input.mouseDown(0)) held |= HELD_BIT.fire;
+  // Event-time ownership and its episode use nine spare bits in the existing held u16.
+  // They are read only beside number-key edges; preserving both through the queue prevents
+  // later phases, restarts or earlier seats in one authority tick from reinterpreting it.
+  const ownerCode = PURCHASE_OWNER_CODE[purchaseOwner] ?? 0;
+  held |= (ownerCode << PURCHASE_OWNER_SHIFT) & PURCHASE_OWNER_MASK;
+  const contextCode = Number.isFinite(purchaseContext)
+    ? Math.trunc(purchaseContext) & 0x3f
+    : 0;
+  held |= (contextCode << PURCHASE_CONTEXT_SHIFT) & PURCHASE_CONTEXT_MASK;
 
   let edges = 0;
   for (const [code, bit] of Object.entries(EDGE_FOR)) {
@@ -307,6 +350,9 @@ export function createSession({
   // A count preserves every existing call site; an explicit array preserves sparse lobby
   // identities such as [1, 3] instead of silently inventing ghost seat 2.
   seats = 1,
+  // A host is a permission role, not a seat-number convention. The Worker supplies the
+  // current role explicitly; solo and existing harness call sites default to the first seat.
+  hostSeat = null,
   // A server passes true, so every seat gets a de-jitter queue instead of a stub that
   // reports nothing pressed. Off by default because the harness and `tools/scene-cost.mjs`
   // both build sessions nobody is playing, and a queue they never feed would starve on every
@@ -321,6 +367,10 @@ export function createSession({
       || seatIds.some((seat) => !Number.isInteger(seat) || seat < 1)
       || new Set(seatIds).size !== seatIds.length) {
     throw new Error(`invalid operative seats [${seatIds.join(",")}]`);
+  }
+  const initialHostSeat = hostSeat ?? seatIds[0];
+  if (!Number.isInteger(initialHostSeat) || !seatIds.includes(initialHostSeat)) {
+    throw new Error(`host seat ${initialHostSeat} is not in [${seatIds.join(",")}]`);
   }
 
   const camera = new THREE.PerspectiveCamera(85, 16 / 9, 0.1, 2000);
@@ -370,6 +420,9 @@ export function createSession({
     treasury: economy.treasury,
     networked,
     autoReset,
+    // The host may move when a socket leaves; it is an explicit session role so shared
+    // destructive actions never inherit permission merely by occupying seat 1.
+    hostSeat: initialHostSeat,
     resetId: 0,
     lossTimer: 0,
   };
@@ -481,6 +534,7 @@ export function removeOperative(sim, seat) {
   sim.repair = primary?.repair ?? null;
   sim.items = primary?.items ?? null;
   sim.economy = primary?.economy ?? null;
+  if (sim.hostSeat === seat) sim.hostSeat = primary?.seat ?? 0;
   return op;
 }
 
@@ -567,8 +621,11 @@ export function resetSession(sim, { advanceGeneration = true } = {}) {
  * `dt` is always the fixed step. Never a measured frame time: the server counts ticks, and
  * a variable dt here would make the authority disagree with every client's prediction of
  * its own last second. That is the whole reason CFG.loop exists.
+ *
+ * `authorityTick` is optional so the harness and local tools keep their existing call sites.
+ * The Worker supplies it; only an authority needs a historical target ring.
  */
-export function stepSession(sim, dt) {
+export function stepSession(sim, dt, authorityTick = null) {
   // Each operative's queue advances exactly once per tick, before anything reads it. Doing it
   // here rather than inside the per-seat loop below matters: `handleStationInput` and the
   // purchase router both arbitrate BETWEEN operatives, so every seat's command for this tick
@@ -576,13 +633,14 @@ export function stepSession(sim, dt) {
   for (const op of sim.operatives) op.input.advance?.();
 
   // Shared run actions are consumed before the world advances, matching main.js's
-  // pre-step toggle slot. One restart wins the tick and releases every queued input;
-  // continuing after it would immediately advance the freshly reset encounter.
-  for (const op of sim.operatives) {
-    if (op.input.pressed("KeyK")) {
-      resetSession(sim);
-      return;
-    }
+  // pre-step toggle slot. Restart is destructive session control, so it belongs to the
+  // explicit host role rather than to whichever operative happens to be visited first.
+  // Automatic loss recovery below remains server-owned and needs no player permission.
+  const host = sim.operatives.find((op) => op.seat === sim.hostSeat);
+  if (host?.input.pressed("KeyK")) {
+    resetSession(sim);
+    sim.horde.recordCombatFrame(authorityTick);
+    return;
   }
   for (const op of sim.operatives) {
     if (op.input.pressed("KeyQ")) sim.director.callEarly();
@@ -611,6 +669,10 @@ export function stepSession(sim, dt) {
         op.weapon.shotsThisKey = 0;
       }
     }
+    // Rewind TARGETS to the server tick this operative was rendering. `clientTick` is
+    // untrusted and Horde clamps it into its bounded ring; shooter pose and geometry remain
+    // current. Setting this per seat is essential because four clients can render four ticks.
+    sim.horde.combatTick = Number.isFinite(input.clientTick) ? input.clientTick : null;
     handleStationInput(sim.guns, input, op.player);
     op.grapple.handleInput(input);
     op.player.update(dt, input);
@@ -623,10 +685,18 @@ export function stepSession(sim, dt) {
     if (input.pressed(CFG.fortress.toggleKey)) op.bayOpen = !op.bayOpen;
     // Blocking crew decisions outrank a personal bay and cannot be hidden underneath it.
     if (sim.run.choosing || sim.run.picking) op.bayOpen = false;
-    routePurchaseInput({ economy: op.economy, run: sim.run, bayOpen: op.bayOpen, input, dt });
+    routePurchaseInput({
+      economy: op.economy,
+      run: sim.run,
+      bayOpen: op.bayOpen,
+      input,
+      dt,
+      purchaseContext: purchaseInputContext(sim.resetId, sim.run),
+    });
     op.grapple.update(dt);
     input.endFrame();
   }
+  sim.horde.combatTick = null;
 
   // The horde LAST, so contact damage is dealt against where every operative actually ended
   // the tick. This is also the call that hurts the crew — `p.hurt()` lives inside it — which
@@ -649,6 +719,11 @@ export function stepSession(sim, dt) {
       sim.lossTimer = 0;
     }
   }
+
+  // End-of-tick, after movement, damage, death and any automatic reset: this is the state a
+  // snapshot carrying `authorityTick` describes. The ring is preallocated, so recording a
+  // full horde adds no per-enemy objects to the authority's hot path.
+  sim.horde.recordCombatFrame(authorityTick);
 }
 
 /**
@@ -738,6 +813,7 @@ export function snapshotOf(sim, tick) {
       bossLeg: run.isBossLeg,
     }),
     runLeg: run.leg,
+    pickDeadlineMs: Math.max(0, Math.round(run.pickDeadline * 1000)),
 
     threatScale: run.threatScale,
     extraCount: run.extraCount,
@@ -906,6 +982,7 @@ export function entitiesOf(sim) {
 
     out.push({
       id: i,
+      generation: e.generation,
       bitsA: bits.bitsA,
       bitsB: bits.bitsB,
       x: _enc.x,
@@ -928,9 +1005,9 @@ export function entitiesOf(sim) {
  * which is rubber-banding, and is exactly the failure the relay had at the whole-simulation
  * level.
  *
- * Bodies are matched by POOL INDEX. A slot holds one enemy at a time, so an index is a
- * stable identity for as long as that body lives, which is what lets the caller interpolate
- * rather than redraw 400 unrelated positions every 50 ms.
+ * Bodies are matched by pool index plus spawn generation. The slot locates the fixed pooled
+ * object; generation says whether it is still the same life. Both are required because a body
+ * can die and its slot can be reused between two 20 Hz packets.
  */
 export function applyEntities(sim, entities) {
   const t = sim.trampler;
@@ -948,6 +1025,7 @@ export function applyEntities(sim, entities) {
 
     const b = unpackEnemyBits(w.bitsA, w.bitsB);
     e.alive = true;
+    e.generation = w.generation ?? 0;
     e.type = b.type;
     e.state = b.state;
     e.onHull = b.carried && b.state === ENEMY_STATE.ON_DECK;
@@ -1254,6 +1332,7 @@ export function applySnapshot(sim, state, localSeat = 0) {
   d.calledEarly = pb.calledEarly;
   sim.run.phase = pb.runPhase;
   sim.run.leg = state.runLeg;
+  sim.run.pickDeadline = (state.pickDeadlineMs ?? 0) / 1000;
   d.siegeLength = sim.run.siegeLength;
   d.run = sim.run;
   sim.run.seenResolved = d.resolved;

@@ -38,8 +38,8 @@ import { Weapon } from "../src/weapon.js";
 import { Events } from "../src/events.js";
 // From enemies.js, not config.js: the type ids are indices into ENEMY_TYPE_KEYS and
 // they are exported alongside the pool that uses them. Reaching for a non-existent
-// `ENEMY_TYPE` on CFG cost a round trip here -- and note it would NOT have been caught
-// by `npm run audit`, whose CFG-path check scopes to src/ and never looks at worker/.
+// `ENEMY_TYPE` on CFG once cost a round trip here. That miss predates the expanded
+// checks: `npm run audit` now scans worker/, tools/ and server.mjs as well as src/.
 import { CHEWER } from "../src/enemies.js";
 
 const STEP = 1 / CFG.loop.stepHz;
@@ -71,13 +71,13 @@ const STRESS_POOL = 400;
  * form under "Tests that lie": scaffolding that fights the thing it is measuring, and a
  * red result that is wrong is more expensive than no result at all.
  *
- * Note what does NOT close this. `npm run audit` and `npm run imports` both scope to
- * src/, so nothing here is checked for CFG paths, import resolution or named exports —
- * that gap is being closed alongside this repair, and it has now cost something twice.
- * But no static check catches "a Player was passed where a Crew was wanted": both are
- * objects and the call is arity-legal, because `seed` defaults. The only thing that
- * catches it is running this file, which is the argument for running it after any
- * change to a simulation module's signature rather than only before a deploy.
+ * Static coverage now closes part of this: `npm run audit` and `npm run imports`
+ * include worker/, tools/ and server.mjs as well as src/, so this file's CFG paths,
+ * imports and named exports are checked. But no static check catches "a Player was
+ * passed where a Crew was wanted": both are objects and the call is arity-legal,
+ * because `seed` defaults. The only thing that catches it is running this file, which
+ * is the argument for running it after any change to a simulation module's signature
+ * rather than only before a deploy.
  */
 function wiringFault({ crew, player, horde, trampler, director }) {
   if (typeof crew?.worstHealthFraction !== "function") {
@@ -203,6 +203,9 @@ export function simCheck(frames = 120) {
       player.update(STEP, input);
       weapon.update(STEP, input);
       horde.update(STEP, crew);
+      // Production records after the complete authority tick. Include the same 420-slot
+      // write here or this architecture budget omits the server-only rewind cost.
+      horde.recordCombatFrame(i + 1);
       input.endFrame();
     }
     const cpuMs = Date.now() - cpu0;

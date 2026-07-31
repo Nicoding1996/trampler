@@ -33,11 +33,11 @@ import { makeRandom } from "./util.js";
 // phase that does not exist. The inverse is just as bad and this header briefly had
 // it — PICKING was added to the enum while the list above still said three.
 //
-// One deliberate constraint: nothing here advances on a timer. A finished siege
-// sits in HELD until a human presses a key. Partly design -- finishing something
-// should be a thing you get to sit in rather than something the game clears for
-// you -- and partly so a headless test of "does a siege end" cannot be
-// invalidated by the run structure quietly starting the next one.
+// One deliberate constraint: ordinary progression never advances on a timer. A finished
+// siege waits for the crew to choose its road, and a personal pick waits indefinitely while
+// the siege is still live. The sole exception is the anti-deadlock boundary between them: once
+// a held siege is waiting only on personal picks, a visible deadline takes slot 1 for any
+// connected operative who never answers. Without it one AFK socket owns the whole crew's run.
 
 /**
  * What a road costs and what it pays, as text.
@@ -149,6 +149,13 @@ export class Run {
     this.offers = [];
     this.history = [];
     this.lastArrival = null;   // payout banner for the frame we arrived
+    // Absolute director time, so the authority and every snapshot-driven client count down
+    // from the same clock. Zero means no personal choice is blocking shared progression.
+    this.pickDeadline = 0;
+    // Ephemeral ownership fence for the exact frame a deadline resolves. A number key pressed
+    // on that boundary belongs to the pick that just disappeared, never to the newly opened
+    // road ballot or a panel underneath it. Cleared at the start of every Run.update().
+    this.pickResolvedThisFrame = false;
 
     // Who has voted for which offered road. Keyed by the operative rather than by an
     // array position: membership order may close up after a disconnect, while the
@@ -219,6 +226,9 @@ export class Run {
    * being held, at which point it offers roads -- it never advances anything itself.
    */
   update() {
+    // Per-frame, not progression state. The router reads this later in the same simulation
+    // step and endFrame clears the physical key edge after every operative has been fenced.
+    this.pickResolvedThisFrame = false;
     this.#payWavePick();
 
     if (this.phase === RUN.SIEGE && this.director.held) {
@@ -232,14 +242,30 @@ export class Run {
         // on -- but an offer left untaken when the biome ends would sit on screen
         // asking for a keypress that can no longer matter.
         this.phase = RUN.DONE;
+        this.pickDeadline = 0;
         for (const economy of this.economies) economy.pendingPick = [];
       } else {
         // The reward is personal: every active operative gets a choice from their own seeded
         // pool. Existing cadence picks stay banked rather than being overwritten.
         this.phase = RUN.PICKING;
+        this.pickDeadline = this.director.elapsed + CFG.economy.pickAutoAfter;
         for (const economy of this.economies) {
           if (!economy.pendingPick.length) economy.offerPick();
         }
+      }
+    }
+
+    // A connected but inactive operative must not own a permanent veto over the road ballot.
+    // Slot zero is deterministic because the offer itself came from the seeded stream; no
+    // extra random draw is introduced at the deadline. This bypasses `pickOpen` deliberately:
+    // an AFK body may be standing beside a remnant forever, which is exactly the state that
+    // needs a bounded answer. Active players see the deadline in three HUD channels.
+    if (this.phase === RUN.PICKING
+        && this.pickDeadline > 0
+        && this.director.elapsed >= this.pickDeadline) {
+      for (const economy of this.economies) {
+        if (economy.pendingPick.length === 0) continue;
+        if (economy.autoTakePick(0)) this.pickResolvedThisFrame = true;
       }
     }
 
@@ -248,12 +274,19 @@ export class Run {
     if (this.phase === RUN.PICKING
         && this.economies.every((economy) => economy.pendingPick.length === 0)) {
       this.phase = RUN.CHOOSING;
+      this.pickDeadline = 0;
       this.#offerRoads();
     }
   }
 
   get picking() {
     return this.phase === RUN.PICKING;
+  }
+
+  /** Whole seconds until unresolved personal picks are deterministically taken. */
+  get pickAutoSeconds() {
+    if (!this.picking || this.pickDeadline <= 0) return 0;
+    return Math.max(0, this.pickDeadline - (this.director?.elapsed ?? 0));
   }
 
   /**

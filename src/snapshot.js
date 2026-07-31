@@ -41,7 +41,7 @@
 // refused it, because "could not connect" sends someone to check their network when the
 // actual problem is a stale browser tab holding last week's JavaScript. That specific
 // case is not hypothetical for a project with no build step and no cache busting.
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 // Message kinds. One byte, so there is room to add the horde and the operatives in later
 // slices without touching anything here.
@@ -77,6 +77,15 @@ export const HELD_BIT = {
   fire: 32,
   repair: 64,
 };
+
+// Nine high bits of the existing held u16 carry number-key ownership metadata: three for
+// the visible panel and six for its road/restart episode. These are command metadata rather
+// than simulated held levels, and keep ownership through queue delay without increasing
+// INPUT_BYTES.
+export const PURCHASE_OWNER_SHIFT = 7;
+export const PURCHASE_OWNER_MASK = 0x0380;
+export const PURCHASE_CONTEXT_SHIFT = 10;
+export const PURCHASE_CONTEXT_MASK = 0xfc00;
 
 export const EDGE_BIT = {
   jump: 1,
@@ -283,6 +292,10 @@ const BODY = [
   // director phase (3 bits) + run phase (2 bits) + calledEarly + boss leg, packed.
   ["phaseBits", "bits"],
   ["runLeg", "count"],
+  // Absolute director-clock deadline for the only timed run transition: unanswered
+  // personal picks at a held siege. Zero outside PICKING. Absolute rather than a remaining
+  // duration so every client derives the same countdown from the elapsed clock above.
+  ["pickDeadlineMs", "millis"],
 
   // ---- shared run/economy state -------------------------------------------
   ["threatScale", "scalar"],
@@ -344,12 +357,12 @@ const REPEATED = [
 ];
 
 /**
- * ONE ENEMY, TWELVE BYTES. Appended after REPEATED, prefixed by a 16-bit count.
+ * ONE ENEMY, FOURTEEN BYTES. Appended after REPEATED, prefixed by a 16-bit count.
  *
  * This is the section that actually scales with crowd size: shared and per-operative state is
- * fixed for a roster, while the horde is 12 bytes per live body. With a four-seat roster and
- * every repeated shared section present, roughly 100 bodies are 1.7 KiB per snapshot (about
- * 35 KiB/s per client); the structural 420-body cap is about 5.5 KiB (about 110 KiB/s).
+ * fixed for a roster, while the horde is 14 bytes per live body. With a four-seat roster and
+ * every repeated shared section present, roughly 100 bodies are 1.9 KiB per snapshot (about
+ * 39 KiB/s per client); the structural 420-body cap is about 6.3 KiB (about 126 KiB/s).
  * Both remain comfortable, and the harness derives those totals from real arrays so protocol
  * growth cannot hide behind a stale hand-written count.
  *
@@ -360,12 +373,14 @@ const REPEATED = [
  * inputs to a computation it must not perform. Sending them would also be the invitation to
  * run the AI locally "just for smoothness", which is how two simulations start disagreeing.
  *
- * `id` is the POOL INDEX, which is a stable identity for as long as a body lives: a slot
- * holds one enemy at a time, and `spawn()` claims a free one. That is what lets a client
- * interpolate a body between snapshots rather than seeing 400 unrelated positions.
+ * `(id, generation)` is the body's identity. `id` is the pool index and remains stable for
+ * one life; `generation` increments whenever that slot is spawned again. The second half is
+ * what prevents interpolation and lag compensation from joining an old pose to a new occupant
+ * when a slot dies and is reused between snapshots.
  */
 const ENTITY = [
   ["id", "tally"],
+  ["generation", "tally"],
   // type | state | carried | flash, packed. See packEnemyBits.
   ["bitsA", "bits"],
   // health in 7 bits | fuse lit in the high bit, packed. See packEnemyBits.
@@ -437,7 +452,9 @@ const OPERATIVE = [
   ["refitCallouts", "tally"],
   // weapon slot (1 bit) | cooldown in tenths (4 bits) | rolling trigger sequence (3 bits).
   // Folding values that already belonged to the weapon into one byte leaves the six tracer
-  // coordinates as the only wire growth and keeps the measured four-crew case below 30 KiB/s.
+  // coordinates as the only operative-wire growth. The measured four-crew case stayed below
+  // 30 KiB/s until enemy generations deliberately added two bytes per live body; it is now
+  // held below 35 KiB/s by the harness.
   ["weaponBits", "bits"],
   ["weaponSwaps", "tally"],
 
@@ -924,9 +941,9 @@ const INPUT = [
   // Monotonic per client, never reset within a connection. The server echoes the last one it
   // consumed back in `ackSeq`, and that pairing is the whole of reconciliation.
   ["seq", "millis"],
-  // What tick the CLIENT believed it was on. Not trusted for anything — a client could claim
-  // any number — but it is what a later slice needs for lag compensation, and it costs four
-  // bytes to have the history rather than to start collecting it later.
+  // The server tick whose targets the CLIENT was rendering for this command. Untrusted — a
+  // client can claim any number — so the authority clamps it into the configured 250 ms
+  // history before a ray query. It rewinds targets only, never the shooter or world geometry.
   ["clientTick", "millis"],
   ["held", "tally"],
   ["edges", "tally"],
@@ -1061,15 +1078,15 @@ export function lerpSnapshot(a, b, t) {
 
   const out = { ...b };
 
-  // Entities, matched by pool id. A body present in `b` but not `a` has just spawned and has
-  // no history to blend from, so it appears at its authoritative position rather than sliding
-  // in from wherever the slot's previous occupant died.
+  // Entities, matched by pool id AND spawn generation. A body present in `b` but not `a`,
+  // or a slot whose occupant changed between them, has no history to blend from and appears
+  // at its authoritative position rather than sliding in from the previous body's death.
   const prev = new Map();
   for (const e of a.entities ?? []) prev.set(e.id, e);
 
   out.entities = (b.entities ?? []).map((e) => {
     const p = prev.get(e.id);
-    if (!p) return e;
+    if (!p || p.generation !== e.generation) return e;
     // Bit 64 of bitsA is `carried`. Compared before blending, because it names the frame the
     // coordinates are in.
     if (((p.bitsA ^ e.bitsA) & 64) !== 0) return e;

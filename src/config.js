@@ -507,6 +507,13 @@ export const CFG = {
       seed: 4242,       // cone spread draws from this, never Math.random
       range: 220,
 
+      // Maximum authoritative target rewind. The client renders 120 ms behind live to smooth
+      // WebSocket delivery, so a shot must query that rendered tick rather than the body's
+      // current pose or the tracer visibly passes through its target. 250 ms covers playback
+      // delay plus ordinary one-way jitter while bounding a dishonest client's claim; the
+      // server clamps every requested tick into this window and never rewinds the shooter.
+      rewindMs: 250,
+
       // Enemies are hit as BOXES matching what is drawn, not as spheres. A
       // sphere disagrees with the rendered silhouette, so the crosshair could
       // sit visibly on an enemy and still miss. The pad is deliberate aim
@@ -1456,6 +1463,13 @@ export const CFG = {
     // is the feature: a fixed shop meant every run bought the same things in the
     // same order, so nothing about a build differed between playthroughs.
     seed: 515151,
+
+    // How long a held siege may wait on a connected operative's personal choice before
+    // slot 1 is taken for them. Thirty seconds is long enough to read three two-line offers
+    // without turning one AFK socket into a permanent veto on the crew's road vote. The
+    // countdown is authoritative and shown on the panel, prompt and phase readout; invisible
+    // auto-picking would solve progression by making the reward look broken instead.
+    pickAutoAfter: 30,
 
     // How many items are offered as the free pick for holding a siege. Three is the
     // number that makes it a decision: two is a coin toss and four is a list you

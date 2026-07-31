@@ -312,8 +312,9 @@ export class Weapon {
     // reciting a number off the type.
     this.aimArmour = blocked
       ? 0
-      : Math.max(0, armourAt(enemyCfg(hit.enemy.type), hit.enemy.yaw, _dir.x, _dir.z)
-        - this.armourPierce);
+      : Math.max(0, armourAt(
+        enemyCfg(hit.enemy.type), hit.yaw ?? hit.enemy.yaw, _dir.x, _dir.z,
+      ) - this.armourPierce);
     return this.aimTarget;
   }
 
@@ -468,7 +469,7 @@ export class Weapon {
       // plate you walked around. Composes with sabot for free, and stays zero for
       // every type whose armour is omnidirectional.
       const cfg = enemyCfg(hit.enemy.type);
-      const flank = cfg.armour - armourAt(cfg, hit.enemy.yaw, dir.x, dir.z);
+      const flank = cfg.armour - armourAt(cfg, hit.yaw ?? hit.enemy.yaw, dir.x, dir.z);
 
       // ARBITRATED: THE CLIENT FIRES FOR FEEDBACK AND DEALS NOTHING.
       //

@@ -495,7 +495,9 @@ if (snaps.length >= 2) {
   seat1.socket.send(JSON.stringify({ t: "start" }));
   const phase = await Promise.race([phased, sleep(2000).then(() => "timeout")]);
   console.log("");
-  ok(phase === "running", "seat 1 can start the run", `phase ${phase}`);
+  ok(phase === "starting",
+    "the host opens one authoritative start transition before the world is announced",
+    `phase ${phase}`);
 
   // ---- THE SHARED FORTRESS, over a real socket -----------------------------
   //
@@ -521,8 +523,9 @@ if (snaps.length >= 2) {
     }
     const buildMs = performance.now() - waitStart;
 
-    ok(ready !== null, "starting a run builds the authoritative simulation",
-      ready ? `ready in ${buildMs.toFixed(0)} ms` : "never became ready");
+    ok(ready?.phase === "running",
+      "the start transition builds the authority before announcing running",
+      ready ? `ready in ${buildMs.toFixed(0)} ms, phase ${ready.phase}` : "never became ready");
 
     if (ready) {
       // A tick counter can advance without a world behind it, so assert the WORLD moved.
@@ -661,7 +664,7 @@ if (snaps.length >= 2) {
 
           const ids = new Set(withHorde.entities.map((e) => e.id));
           ok(ids.size === n,
-            "and a unique pool id each, which is what lets a client interpolate them",
+            "and a unique pool id each; interpolation identifies a body by (id, generation)",
             `${ids.size} distinct ids`);
 
           note(

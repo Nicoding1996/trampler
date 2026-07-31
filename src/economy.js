@@ -976,6 +976,21 @@ export class Economy {
     // method and the router is not the only thing that could reach it. A rule enforced
     // solely at the call site is a rule the next caller does not have.
     if (!this.pickOpen) return null;
+    return this.#claimPick(slot, false);
+  }
+
+  /**
+   * Resolve an unanswered held-siege pick without requiring the inactive operative's body
+   * to be in a safe reading position. Run owns the visible deadline and is the only caller;
+   * keeping this separate from `takePick` prevents an ordinary call site from accidentally
+   * bypassing the safety rule.
+   */
+  autoTakePick(slot = 0) {
+    if (this.pendingPick.length === 0) return null;
+    return this.#claimPick(slot, true);
+  }
+
+  #claimPick(slot, automatic) {
     const catIndex = this.pendingPick[slot];
     if (catIndex === undefined) return null;
     const item = CFG.economy.catalogue[catIndex];
@@ -989,7 +1004,7 @@ export class Economy {
 
     this.lastBought = {
       name: item.name,
-      detail: `${item.detail} · salvaged`,
+      detail: `${item.detail} · ${automatic ? "auto-salvaged" : "salvaged"}`,
       stacks: this.stacks[item.id],
       cost: 0,
     };
@@ -1086,6 +1101,34 @@ export class Economy {
   }
 }
 
+// The number-key owner is also carried on network commands. A delayed edge must keep the
+// panel it was pressed against: inferring from the authority's later phase can turn a pick
+// into a road vote, or a completed vote into a refit purchase.
+export const PURCHASE_OWNER = Object.freeze({
+  PICK: "pick",
+  ROUTE: "route",
+  BAY: "bay",
+  REFIT: "refit",
+  DISCARD: "discard",
+});
+
+/** Pure ownership half of routePurchaseInput, shared with the browser's keydown latch. */
+export function purchaseInputOwner({ economy, run, bayOpen }) {
+  if (run?.pickResolvedThisFrame || economy.pickOpen) return PURCHASE_OWNER.PICK;
+  if (run?.choosing) return PURCHASE_OWNER.ROUTE;
+  if (bayOpen) return PURCHASE_OWNER.BAY;
+  return PURCHASE_OWNER.REFIT;
+}
+
+// Six spare bits distinguish a later episode with the same owner. A road arrival changes
+// roadsTaken; a restart changes resetId while rewinding roadsTaken, so neither a pre-road
+// refit key nor a pre-restart key can become valid again after a full owner cycle.
+export function purchaseInputContext(resetId, run) {
+  const reset = Number.isFinite(resetId) ? Math.trunc(resetId) : 0;
+  const roads = run?.roadsTaken?.length ?? 0;
+  return (reset * 4 + roads) & 0x3f;
+}
+
 /**
  * Decide which of the four things competing for the number keys owns them this
  * frame, and run exactly that one.
@@ -1116,7 +1159,35 @@ export class Economy {
  *
  * @param bayOpen whether the refit bay is up.
  */
-export function routePurchaseInput({ economy, run, bayOpen, input, dt }) {
+export function routePurchaseInput({
+  economy, run, bayOpen, input, dt, purchaseContext,
+}) {
+  const currentOwner = purchaseInputOwner({ economy, run, bayOpen });
+  const intendedOwner = input.purchaseOwner;
+  const staleContext = intendedOwner !== undefined
+    && input.purchaseContext !== purchaseContext;
+  // Network queues preserve an edge longer than any one run phase. If its event-time owner
+  // is no longer current, or a road/restart completed a full cycle back to the same owner,
+  // claim it for that old owner and discard it: never let a pick edge become a road vote, or
+  // a route edge become a bay/refit purchase after another seat closes the ballot.
+  // Metadata-free solo and harness inputs retain the current-state rule.
+  if (intendedOwner !== undefined && (intendedOwner !== currentOwner || staleContext)) {
+    economy.update(dt, null);
+    return intendedOwner === PURCHASE_OWNER.PICK
+      ? { owner: intendedOwner, took: null }
+      : { owner: intendedOwner, arrival: null };
+  }
+
+  // The deadline is evaluated before key routing. If it auto-resolved this operative's
+  // pick on the exact tick they finally pressed 1 or 2, that edge still belongs to the
+  // disappearing pick; interpreting it as a road vote can commit a shared choice they never
+  // made. Claim the key set for this one frame and let endFrame discard every edge. Income
+  // still updates, exactly as it does for the ordinary pick and route owners below.
+  if (run?.pickResolvedThisFrame) {
+    economy.update(dt, null);
+    return { owner: "pick", took: null };
+  }
+
   // Highest precedence, because it is the only one of these states the crew cannot
   // leave by doing something else: the shop can be ignored and the bay can be shut,
   // but a pending pick blocks the road choice behind it until it is taken.

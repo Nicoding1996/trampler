@@ -182,7 +182,6 @@ export class Net {
     // whole of reconciliation. A sequence that restarted would make an old ack look current.
     this.inputSeq = 0;
     this.inputsSent = 0;
-    this.clientTick = 0;
     // What the server has acknowledged for OUR seat, so the HUD can show how far behind the
     // authority is without the number having to be inferred from a timestamp.
     this.ackSeq = 0;
@@ -207,9 +206,14 @@ export class Net {
     this.seat = 0;
     this.code = "";
     this.crew = [];
+    this.crewMin = 2;
+    this.crewMax = 4;
+    this.hostSeat = 0;
+    this.startTick = null;
     this.phase = "";
     this.status = "SOLO";
     this.error = "";
+    this.startRefusal = "";
 
     /** seat -> { buffer: [], avatar, lastAt } */
     this.remotes = new Map();
@@ -321,18 +325,30 @@ export class Net {
    * asked it to. That is the project's own recurring lesson — a module can be correct and
    * uncalled — arriving for the third time, and the second time in this feature.
    *
-   * SEAT 1 ONLY, matching the lobby's own rule. The server refuses it from anyone else and
-   * refuses it once a run is going, so this is idempotent and safe to call from every gesture
-   * that might mean "I am ready".
+   * HOST ONLY, matching the lobby's explicit transferable role. The server enforces the
+   * permission too; this client-side gate exists so a guest click cannot hide the lobby or
+   * acquire pointer lock while everybody is still waiting. The host may commit only once at
+   * least two operatives are present.
    */
   start() {
+    if (!this.sessionActive || this.phase === "running" || this.phase === "starting") return false;
+    if (!this.isHost) {
+      this.#say(`WAITING FOR HOST SEAT ${this.hostSeat || "—"}`);
+      return false;
+    }
+    if (this.crew.length < this.crewMin) {
+      this.#say("WAITING FOR A CREWMATE");
+      return false;
+    }
     this.startRequested = true;
+    this.startRefusal = "";
     this.#tryStart();
+    return true;
   }
 
   #tryStart() {
-    if (!this.startRequested || !this.connected || this.seat !== 1) return;
-    if (this.phase === "running") return;
+    if (!this.startRequested || !this.connected || !this.isHost) return;
+    if (this.phase !== "lobby" || this.crew.length < this.crewMin) return;
     try {
       this.socket.send(JSON.stringify({ t: "start" }));
     } catch { /* the close handler will report it */ }
@@ -360,6 +376,7 @@ export class Net {
     this.correction.set(0, 0, 0);
     this.correctionBased = false;
     this.renderEntities = null;
+    this.sim?.horde?.clearRenderCombatFrame?.();
     if (this.buffer.length === 0) {
       this.renderTick = null;
       this.renderReady = false;
@@ -398,6 +415,10 @@ export class Net {
     this.seat = 0;
     this.code = "";
     this.crew = [];
+    this.hostSeat = 0;
+    this.startTick = null;
+    this.phase = "";
+    this.startRefusal = "";
   }
 
   /** Drop every fact tied to one authoritative run, so solo/rejoin cannot replay it. */
@@ -429,6 +450,7 @@ export class Net {
     this.wireAt = 0;
     this.sendAcc = 0;
     this.simReady = false;
+    this.sim?.horde?.clearRenderCombatFrame?.();
     if (this.sim?.weapon) this.sim.weapon.arbitrated = false;
     const localOp = this.sim?.operatives?.find((op) => op.player === this.player);
     if (localOp) localOp.seat = 0;
@@ -450,7 +472,13 @@ export class Net {
       case "hello":
         this.seat = msg.seat;
         this.code = msg.code;
+        this.phase = msg.phase;
+        this.hostSeat = msg.hostSeat ?? 0;
+        this.crewMin = msg.crewMin ?? this.crewMin;
+        this.crewMax = msg.crewMax ?? this.crewMax;
+        this.startTick = msg.startTick ?? null;
         this.error = "";
+        this.startRefusal = "";
         if (this.ui?.gateError) this.ui.gateError.textContent = "";
         // The browser owns one simulated operative. Its lobby seat arrives asynchronously;
         // name the kit now so sparse IDs are looked up by identity rather than array index.
@@ -474,9 +502,25 @@ export class Net {
         this.#tryStart();
         break;
 
-      case "crew":
+      case "crew": {
+        const rosterChanged = msg.crew.length !== this.crew.length
+          || msg.crew.some((member, i) => {
+            const previous = this.crew[i];
+            return previous?.seat !== member.seat || previous?.name !== member.name;
+          });
         this.crew = msg.crew;
         this.phase = msg.phase;
+        this.hostSeat = msg.hostSeat ?? this.hostSeat;
+        this.crewMin = msg.crewMin ?? this.crewMin;
+        this.crewMax = msg.crewMax ?? this.crewMax;
+        this.startTick = msg.startTick ?? null;
+        // Preserve a STARTING rollback's reason through the immediately following crew
+        // broadcast, whose roster is unchanged. A real join/leave is the next actionable
+        // state and clears the old refusal.
+        if (rosterChanged) {
+          this.startRefusal = "";
+          if (this.ui?.gateError && !this.error) this.ui.gateError.textContent = "";
+        }
         // Anyone no longer on the list has left; their avatar must go with them or
         // it stands on the deck forever.
         for (const seat of [...this.remotes.keys()]) {
@@ -484,10 +528,67 @@ export class Net {
         }
         this.#renderCrew();
         break;
+      }
 
-      case "phase":
+      case "phase": {
+        const previousPhase = this.phase;
         this.phase = msg.phase;
+        this.hostSeat = msg.hostSeat ?? this.hostSeat;
+        this.startTick = msg.startTick ?? null;
+        const rolledBack = previousPhase === "starting" && msg.phase === "lobby";
+        if (rolledBack) {
+          // The host click already acquired pointer lock. If construction is cancelled
+          // because the crew changed during its async imports, return every client to the
+          // visible lobby instead of leaving a paused simulation behind a hidden gate.
+          this.startRequested = false;
+          this.simReady = false;
+          this.startRefusal = msg.reason || "start cancelled";
+          if (this.ui?.gateError) this.ui.gateError.textContent = this.startRefusal;
+          // Input's pointerlockchange listener normally relabels an unlocked gate as
+          // RESUME. This is not a paused run; install a later one-shot listener so the
+          // lobby labels win after that generic handler has run.
+          if (document.pointerLockElement) {
+            document.addEventListener("pointerlockchange", () => {
+              this.ui?.gate?.classList.remove("hidden", "resume");
+              this.#renderCrew();
+            }, { once: true });
+          }
+          document.exitPointerLock?.();
+          this.ui?.gate?.classList.remove("hidden", "resume");
+        } else if (msg.phase === "starting" || msg.phase === "running") {
+          this.startRequested = false;
+          // A construction failure is retryable on the same socket. An accepted authority
+          // transition supersedes that old failure; transport failures cannot reach here.
+          this.error = "";
+          this.startRefusal = "";
+          if (this.ui?.gateError) this.ui.gateError.textContent = "";
+        }
         this.#renderCrew();
+        break;
+      }
+
+      case "start":
+        if (msg.accepted === false) {
+          this.startRequested = false;
+          this.startRefusal = msg.reason || "start refused";
+          if (this.ui?.gateError) this.ui.gateError.textContent = this.startRefusal;
+          // The roster can change after the host's click passes the local gate but before the
+          // authority checks it. A refusal while the server is still in LOBBY must undo the
+          // pointer lock acquired by that click; otherwise the host is left behind a hidden
+          // awaiting-authority gate until Escape, mislabeled as a paused run when it returns.
+          if (this.phase === "lobby") {
+            if (document.pointerLockElement) {
+              document.addEventListener("pointerlockchange", () => {
+                this.ui?.gate?.classList.remove("hidden", "resume");
+                this.#renderCrew();
+              }, { once: true });
+            }
+            document.exitPointerLock?.();
+            this.ui?.gate?.classList.remove("hidden", "resume");
+            this.#renderCrew();
+          }
+          this.#say(`START REFUSED — ${this.startRefusal.toUpperCase()}`);
+        }
         break;
 
       case "poses":
@@ -508,6 +609,8 @@ export class Net {
         // than inferring from "no snapshots have arrived": a client cannot otherwise tell
         // a server still loading from a server that failed, and those are different waits.
         this.simReady = !!msg.ready;
+        this.hostSeat = msg.hostSeat ?? this.hostSeat;
+        this.startTick = msg.startTick ?? this.startTick;
         if (msg.error) this.#fail(`the server could not build the world — ${msg.error}`);
         this.#renderCrew();
         break;
@@ -553,6 +656,7 @@ export class Net {
       this.renderTick = null;
       this.renderReady = false;
       this.renderEntities = null;
+      this.sim?.horde?.clearRenderCombatFrame?.();
       this.history.length = 0;
       this.correction.set(0, 0, 0);
       this.correctionBased = false;
@@ -684,6 +788,14 @@ export class Net {
         // targeting therefore see newest authority rather than a 120 ms-old visual pose.
         const blended = lerpSnapshot(pair.a, pair.b, pair.t);
         this.renderEntities = blended.entities ?? null;
+        // The local presentation ray and the authority now ask about one named server tick.
+        // Load the already-blended positions rather than approximating them from the newest
+        // pool; applyPresentation draws this exact array after the predicted steps below.
+        this.sim.horde.setRenderCombatFrame(
+          this.renderTick,
+          this.renderEntities ?? [],
+        );
+        this.sim.horde.combatTick = this.renderTick;
         this.wireOps = blended.operatives ?? [];
         this.wireAt = latestPacket.at;
         applied = true;
@@ -1010,8 +1122,11 @@ export class Net {
     // by the Worker while the browser moved locally, so the first snapshot looked like a
     // teleport back to spawn. Sequence zero remains the baseline until authority exists.
     if (!this.authoritative || !this.connected || !this.seat) return false;
-    this.clientTick++;
     this.inputSeq++;
+    // This is the target frame visibly under the crosshair, not a second local counter. The
+    // authority treats it only as an untrusted rewind request and clamps it to 250 ms; rounding
+    // costs at most half a 60 Hz tick while preserving the existing four-byte input field.
+    const clientTick = Math.max(0, Math.round(this.renderTick ?? this.lastSnapshotTick));
     // THE SAME KEY THE SERVER WILL USE. Set before the step that fires, so a locally-drawn tracer
     // scatters exactly as the authoritative round does. Without this the two ends draw from
     // independent streams and the beam points somewhere the shot did not go — permanently, from
@@ -1026,7 +1141,12 @@ export class Net {
     }
     const cmd = readInput(input, {
       seq: this.inputSeq,
-      clientTick: this.clientTick,
+      clientTick,
+      // Captured by Input's keydown handler against the panel actually visible then. Do not
+      // infer this from sim state here: applyPending may have installed a newer phase while
+      // the edge waited through a zero-step render frame.
+      purchaseOwner: input.purchaseOwner,
+      purchaseContext: input.purchaseContext,
     });
     if (!includeEdges) cmd.edges = 0;
     try {
@@ -1042,6 +1162,11 @@ export class Net {
   /** How far the server is behind this client's input, in commands. */
   get inputLag() {
     return Math.max(0, this.inputSeq - this.ackSeq);
+  }
+
+  /** Is this socket the lobby's current, transferable host? */
+  get isHost() {
+    return this.seat > 0 && this.seat === this.hostSeat;
   }
 
   /** Is this browser committed to a lobby, including while its transport is down? */
@@ -1554,6 +1679,8 @@ export class Net {
 
   #bindUi() {
     this.ui = {
+      gate: document.getElementById("gate"),
+      cta: document.querySelector("#gate .cta"),
       panel: document.getElementById("mp"),
       host: document.getElementById("mp-host"),
       join: document.getElementById("mp-join"),
@@ -1565,6 +1692,33 @@ export class Net {
       gateError: document.getElementById("gate-err"),
     };
     if (!this.ui.panel) return;
+
+    // Input owns the actual pointer-lock request on the gate's bubble phase. Intercept a
+    // multiplayer click first when this browser is not allowed to use it: guests wait for
+    // the host, a solo host waits for a crewmate, and everyone waits for the first shared
+    // authority baseline. Browser security forbids granting pointer lock remotely, so guests
+    // still click once after RUNNING; that gesture joins an already common server timeline.
+    this.ui.gate?.addEventListener("click", (e) => {
+      if (e.target.closest?.("#mp")) return;
+      if (!this.sessionActive) return;
+
+      const hostCanStart = this.connected
+        && this.phase === "lobby"
+        && this.isHost
+        && this.crew.length >= this.crewMin;
+      const canEnterRun = this.connected
+        && this.phase === "running"
+        && this.authoritative;
+      if (hostCanStart || canEnterRun) return;
+
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (!this.connected) this.#say("WAITING FOR THE LOBBY");
+      else if (this.phase === "starting") this.#say("STARTING TOGETHER…");
+      else if (this.phase === "running") this.#say("CONNECTING TO THE SHARED START…");
+      else if (!this.isHost) this.#say(`WAITING FOR HOST SEAT ${this.hostSeat || "—"}`);
+      else this.#say("WAITING FOR A CREWMATE");
+    }, true);
 
     // The gate's own click handler requests pointer lock, which hides the gate and
     // starts the game. Without this, reaching for the join button starts a solo run.
@@ -1639,27 +1793,66 @@ export class Net {
       if (this.ui.scope) this.ui.scope.textContent = "";
       return;
     }
-    this.ui.crew.textContent =
-      `${this.code} · ${this.crew.map((c) => `${c.seat}:${c.name}`).join("  ")}`;
+
+    this.ui.crew.textContent = `${this.code} · ${this.crew
+      .map((c) => `${c.seat}:${c.name}${c.seat === this.hostSeat ? " (HOST)" : ""}`)
+      .join("  ")}`;
     if (this.ui.copy) this.ui.copy.hidden = false;
-    // Preserve a named refusal. A late crew/sim event may still be queued after a close;
-    // replacing the error with a normal seat status would hide the reason the gate reopened.
+
+    // Preserve a named transport refusal. A late crew/sim event may still be queued after a
+    // close; replacing the error with a normal seat status would hide why the gate reopened.
     if (this.seat && !this.error) {
-      this.#say(
-        `SEAT ${this.seat} OF ${this.crew.length} — share the code, then click to play`,
-      );
+      if (this.startRefusal) {
+        this.#say(`START REFUSED — ${this.startRefusal.toUpperCase()}`);
+      } else if (this.phase === "lobby") {
+        if (this.isHost) {
+          this.#say(this.crew.length < this.crewMin
+            ? `HOST · SEAT ${this.seat} — WAITING FOR A CREWMATE`
+            : `HOST · ${this.crew.length} OPERATIVES — CLICK TO START`);
+        } else {
+          this.#say(`SEAT ${this.seat} OF ${this.crew.length} — WAITING FOR HOST SEAT ${this.hostSeat}`);
+        }
+      } else if (this.phase === "starting") {
+        this.#say(`SEAT ${this.seat} OF ${this.crew.length} — STARTING TOGETHER…`);
+      } else if (this.phase === "running") {
+        this.#say(this.authoritative
+          ? `SEAT ${this.seat} OF ${this.crew.length} — AUTHORITATIVE RUN`
+          : `SEAT ${this.seat} OF ${this.crew.length} — JOINING SHARED START…`);
+      }
     }
 
-    // WHAT IS ACTUALLY SHARED, said here rather than discovered by playing. This sentence is
-    // derived from the client's real authority state: `simReady` means the Worker built the
-    // run, while `authoritative` means this browser has applied its first complete snapshot.
+    if (this.ui.cta) {
+      const resuming = this.ui.gate?.classList.contains("resume");
+      if (this.phase === "lobby") {
+        this.ui.cta.textContent = this.isHost
+          ? (this.crew.length >= this.crewMin ? "CLICK TO START" : "WAITING FOR CREWMATE")
+          : "WAITING FOR HOST";
+      } else if (this.phase === "starting") {
+        this.ui.cta.textContent = "STARTING TOGETHER…";
+      } else if (this.phase === "running" && !this.authoritative) {
+        this.ui.cta.textContent = "CONNECTING TO SHARED START…";
+      } else if (this.phase === "running") {
+        this.ui.cta.textContent = resuming ? "CLICK TO RESUME" : "CLICK TO PLAY";
+      }
+    }
+
+    // WHAT IS ACTUALLY SHARED, said here rather than discovered by playing. STARTING is a
+    // real server phase: nobody receives RUNNING until construction succeeds, and startTick
+    // identifies the one authority-clock boundary all clients then follow.
     if (this.ui.scope) {
-      const shared = this.authoritative
-        ? "AUTHORITATIVE RUN — one fortress, one clock, one horde, one damage state."
-        : this.simReady
-          ? "CONNECTING TO THE AUTHORITATIVE RUN…"
-          : "WAITING FOR THE SERVER TO BUILD THE AUTHORITATIVE RUN…";
-      this.ui.scope.textContent = this.crew.length > 1
+      let shared;
+      if (this.phase === "lobby") {
+        shared = `LOBBY — the host starts one shared run for ${this.crewMin}–${this.crewMax} operatives.`;
+      } else if (this.phase === "starting") {
+        shared = "STARTING TOGETHER — building one authority before any client advances.";
+      } else if (this.authoritative) {
+        shared = `AUTHORITATIVE RUN · START TICK ${this.startTick ?? "—"} — one fortress, one clock, one horde, one damage state.`;
+      } else if (this.simReady) {
+        shared = `CONNECTING TO SHARED START TICK ${this.startTick ?? "—"}…`;
+      } else {
+        shared = "WAITING FOR THE SERVER TO BUILD THE AUTHORITATIVE RUN…";
+      }
+      this.ui.scope.textContent = this.crew.length > 1 || this.phase === "running"
         ? shared
         : `${shared} WAITING FOR A CREWMATE.`;
     }

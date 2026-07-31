@@ -44,8 +44,7 @@ node tools/sim-cost-window.mjs            # per-frame cost ACROSS a run, by dens
 npm run dev:mp        # the lobby on 8787; the game stays on 5173
 npm run smoke:lobby   # tick rate and named refusals, against a running lobby
 npm run sim           # can the real sim load and step? plain node, no server
-npm run sim:worker    # the same question inside workerd, and it times it itself
-BASE=https://... npm run sim:worker       # ...and against the deployed edge
+npm run sim:worker    # the same question inside local workerd; client-timed
 
 # invariant 21, after a change to a simulation module or a seed
 node verify.mjs > d1.txt && node verify.mjs > d2.txt && npm run diff

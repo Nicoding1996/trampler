@@ -13,6 +13,11 @@ export class Input {
     this.mouseHeld = new Set();
     this.mouseJustPressed = new Set();
     this.locked = false;
+    // The resolver is installed by main once the economy/run objects exist. Ownership is
+    // latched in the DOM event itself, before a newer snapshot can change the visible panel.
+    this.purchaseOwnerResolver = null;
+    this.purchaseOwner = undefined;
+    this.purchaseContext = undefined;
     // The first gate is session setup; every later gate is only a way to reacquire pointer
     // lock. Without this distinction, alt-tab or Escape resurrects the title, host controls,
     // and join form on top of a run that never actually ended.
@@ -22,6 +27,19 @@ export class Input {
     addEventListener("keydown", (e) => {
       if (e.code === "Tab") e.preventDefault();
       if (e.repeat) return;
+      const purchase = this.purchaseOwnerResolver?.(e.code);
+      if (purchase !== undefined) {
+        // One wire command has one edge mask. If two number presses from different visible
+        // owners/episodes coalesce before a fixed step, discarding both is safer than
+        // inventing an order the mask cannot represent and committing a shared choice.
+        if (this.purchaseOwner === undefined) {
+          this.purchaseOwner = purchase.owner;
+          this.purchaseContext = purchase.context;
+        } else if (this.purchaseOwner !== purchase.owner
+            || this.purchaseContext !== purchase.context) {
+          this.purchaseOwner = "discard";
+        }
+      }
       this.held.add(e.code);
       this.justPressed.add(e.code);
     });
@@ -68,6 +86,11 @@ export class Input {
     });
   }
 
+  /** Resolve the number-key owner at DOM-event time; undefined means this key is unrelated. */
+  setPurchaseOwnerResolver(resolve) {
+    this.purchaseOwnerResolver = typeof resolve === "function" ? resolve : null;
+  }
+
   /** Clear all intent when this document can no longer own the controls. */
   clear() {
     this.held.clear();
@@ -76,6 +99,8 @@ export class Input {
     this.mouseJustPressed.clear();
     this.mouse.dx = 0;
     this.mouse.dy = 0;
+    this.purchaseOwner = undefined;
+    this.purchaseContext = undefined;
   }
 
   down(code) {
@@ -131,5 +156,7 @@ export class Input {
     this.mouseJustPressed.clear();
     this.mouse.dx = 0;
     this.mouse.dy = 0;
+    this.purchaseOwner = undefined;
+    this.purchaseContext = undefined;
   }
 }
