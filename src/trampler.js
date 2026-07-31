@@ -114,9 +114,21 @@ export class Trampler {
     const mastMat = Look.std("mast", { color: 0x7a7f88, roughness: 0.68, metalness: 0.4 });
     const crateMat = Look.std("crate", { color: 0xa8845c, roughness: 0.8, metalness: 0.1 });
     const legMat = Look.std("leg", { color: 0x5c6066, roughness: 0.62, metalness: 0.55 });
-    const reactorMat = new THREE.MeshStandardMaterial({
-      color: 0x2a3f2c, emissive: 0x63e06a, emissiveIntensity: 0.9, roughness: 0.5,
+    // The gameplay reactor remains one solid box, but it no longer glows as one.
+    // A textured, opaque casing makes the occlusion volume honest; the dedicated
+    // emissive material is reserved for the recessed windows and service ports
+    // built in #buildReactorDynamo().
+    const reactorShellMat = Look.std("mast", {
+      color: 0x3f4a43, roughness: 0.76, metalness: 0.42,
     });
+    const reactorMat = new THREE.MeshStandardMaterial({
+      color: 0x0d1911,
+      emissive: 0x63e06a,
+      emissiveIntensity: 1.05,
+      roughness: 0.38,
+      metalness: 0.12,
+    });
+    this.reactorShellMat = reactorShellMat;
     this.reactorMat = reactorMat;
     this.legMat = legMat;
     this.hullMat = hullMat;
@@ -151,8 +163,9 @@ export class Trampler {
       // stern engine block
       [box(-5, 0, 8.5, 5, 2.6, 12, "engine"), mastMat, 1.8],
 
-      // the reactor: what boarders come for, and what losing ends the run
-      [box(-2.5, 0, 3, 2.5, 2.4, 7, "reactor"), reactorMat, 2.0],
+      // The reactor's exact solid box is its collider, deck obstacle, grapple
+      // target and bullet occluder. The armoured dynamo around it is visual only.
+      [box(-2.5, 0, 3, 2.5, 2.4, 7, "reactor"), reactorShellMat, 2.0],
 
       // central mast with an overhanging crow's nest -- the nest cannot be
       // walked to, so it is a pure grapple destination
@@ -427,6 +440,205 @@ export class Trampler {
   }
 
   /**
+   * Build the reactor as an armoured industrial dynamo around its original box.
+   *
+   * Every part here is presentation only. The structural reactor mesh remains the
+   * sole collider, obstacle, grapple target and shot occluder, so the recessed
+   * windows are backed by real solid geometry and none of these small protrusions
+   * invent a new movement or attack surface.
+   */
+  #buildReactorDynamo(mastMat, trimMat) {
+    const darkMat = Look.std("hull", {
+      color: 0x242b28, roughness: 0.86, metalness: 0.3,
+    });
+
+    const position = new THREE.Vector3();
+    const scale = new THREE.Vector3(1, 1, 1);
+    const identity = new THREE.Quaternion();
+    const matrix = new THREE.Matrix4();
+    const place = (mesh, index, x, y, z, sx, sy, sz, quaternion = identity) => {
+      position.set(x, y, z);
+      scale.set(sx, sy, sz);
+      matrix.compose(position, quaternion, scale);
+      mesh.setMatrixAt(index, matrix);
+    };
+    const bank = (name, geometry, material, count, castShadow = false, dynamic = false) => {
+      const mesh = new THREE.InstancedMesh(geometry, material, count);
+      mesh.name = `trampler_reactor_${name}`;
+      mesh.instanceMatrix.setUsage(dynamic ? THREE.DynamicDrawUsage : THREE.StaticDrawUsage);
+      mesh.castShadow = castShadow;
+      mesh.receiveShadow = true;
+      // All banks sit on one known piece of deck furniture. Skipping per-instance
+      // bounds is cheaper and avoids a zero-scaled closed port corrupting culling.
+      mesh.frustumCulled = false;
+      this.group.add(mesh);
+      return mesh;
+    };
+
+    // Four transverse armour bands wrap the top and both flanks. One instanced
+    // bank makes the casing read as a load-bearing casting rather than another
+    // decorated crate, for one visible call and one shadow call.
+    const unitBox = new THREE.BoxGeometry(1, 1, 1);
+    const ribZ = [3.2, 4.4, 5.6, 6.8];
+    const ribs = bank("armour_ribs", unitBox, mastMat, ribZ.length * 3, true);
+    let instance = 0;
+    for (const z of ribZ) {
+      place(ribs, instance++, 0, 2.46, z, 5.16, 0.14, 0.22);
+      place(ribs, instance++, -2.56, 1.2, z, 0.14, 2.5, 0.22);
+      place(ribs, instance++, 2.56, 1.2, z, 0.14, 2.5, 0.22);
+    }
+    ribs.instanceMatrix.needsUpdate = true;
+
+    // Three recessed coil windows on each flank. The dark backing is deliberately
+    // larger than the glow: it reads as an opening in thick armour, while the
+    // unchanged opaque reactor box directly behind it keeps every shot honest.
+    const windowZ = [3.75, 5.0, 6.25];
+    const recesses = bank("window_recesses", unitBox, darkMat, windowZ.length * 2);
+    const windows = bank("coil_windows", unitBox, this.reactorMat, windowZ.length * 2);
+    instance = 0;
+    for (const side of [-1, 1]) {
+      for (const z of windowZ) {
+        place(recesses, instance, side * 2.535, 1.35, z, 0.11, 0.82, 0.72);
+        place(windows, instance, side * 2.57, 1.35, z, 0.08, 0.50, 0.48);
+        instance++;
+      }
+    }
+    recesses.instanceMatrix.needsUpdate = true;
+    windows.instanceMatrix.needsUpdate = true;
+    this.reactorWindows = windows;
+
+    // The three ports are the reactor's three configured attacker slots made
+    // physical. Casing modules close the two outer ports with armour shutters;
+    // the centre can never close because reactorSlotCount can never fall below one.
+    this.reactorCouplingXs = [-1.4, 0, 1.4];
+    const rings = bank(
+      "service_rings",
+      new THREE.TorusGeometry(0.34, 0.09, 7, 14),
+      trimMat,
+      this.reactorCouplingXs.length,
+    );
+    for (let i = 0; i < this.reactorCouplingXs.length; i++) {
+      place(rings, i, this.reactorCouplingXs[i], 0.47, 2.86, 1, 1, 1);
+    }
+    rings.instanceMatrix.needsUpdate = true;
+
+    this.reactorCouplingWindows = bank(
+      "service_windows",
+      new THREE.CylinderGeometry(0.235, 0.235, 0.08, 14),
+      this.reactorMat,
+      this.reactorCouplingXs.length,
+      false,
+      true,
+    );
+    this.reactorCouplingShutters = bank(
+      "service_shutters", unitBox, this.reactorShellMat, 2, false, true,
+    );
+    this.reactorCouplingQuaternion = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(1, 0, 0), Math.PI / 2,
+    );
+    this.reactorShutterQuaternion = new THREE.Quaternion();
+    this.reactorCouplingState = -1;
+    this.reactorCouplingMatrix = new THREE.Matrix4();
+    this.reactorCouplingPosition = new THREE.Vector3();
+    this.reactorCouplingScale = new THREE.Vector3();
+    this.#syncReactorCouplings();
+
+    // A front flywheel is the moving read on load. It is backed by the solid box,
+    // sits above the service ports, and rotates as one group so six spokes still
+    // cost only two calls (ring + instanced spokes), not seven separate meshes.
+    const rotor = new THREE.Group();
+    rotor.name = "trampler_reactor_flywheel";
+    rotor.position.set(0, 1.55, 2.80);
+    this.group.add(rotor);
+
+    const wheel = new THREE.Mesh(new THREE.TorusGeometry(0.66, 0.105, 8, 18), trimMat);
+    wheel.name = "trampler_reactor_flywheel_rim";
+    wheel.castShadow = false;
+    wheel.receiveShadow = true;
+    rotor.add(wheel);
+
+    const spokes = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(1.12, 0.105, 0.105), trimMat, 6,
+    );
+    spokes.name = "trampler_reactor_flywheel_spokes";
+    spokes.castShadow = false;
+    spokes.receiveShadow = true;
+    spokes.frustumCulled = false;
+    for (let i = 0; i < 6; i++) {
+      const q = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(0, 0, 1), (i / 6) * Math.PI,
+      );
+      place(spokes, i, 0, 0, 0, 1, 1, 1, q);
+    }
+    spokes.instanceMatrix.needsUpdate = true;
+    rotor.add(spokes);
+
+    const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.19, 0.19, 0.22, 10), darkMat);
+    hub.name = "trampler_reactor_flywheel_hub";
+    hub.rotation.x = Math.PI / 2;
+    hub.castShadow = false;
+    hub.receiveShadow = true;
+    rotor.add(hub);
+    this.reactorRotor = rotor;
+    this.reactorPhase = 0;
+
+    // Twin power conduits bridge the physical gap to the stern engine block.
+    // Their route explains where the reactor's output goes without adding a
+    // decorative collider across the deck.
+    const pipeQuaternion = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(1, 0, 0), Math.PI / 2,
+    );
+    const conduits = bank(
+      "power_conduits",
+      new THREE.CylinderGeometry(0.13, 0.13, 1.7, 9),
+      trimMat,
+      2,
+    );
+    place(conduits, 0, -1.45, 2.38, 7.75, 1, 1, 1, pipeQuaternion);
+    place(conduits, 1, 1.45, 2.38, 7.75, 1, 1, 1, pipeQuaternion);
+    conduits.instanceMatrix.needsUpdate = true;
+  }
+
+  /** Reflect reactor-casing modules in the two physical outer-port shutters. */
+  #syncReactorCouplings() {
+    if (!this.reactorCouplingWindows || !this.reactorCouplingShutters) return;
+    const closed = clamp(
+      CFG.trampler.reactorSlots - this.reactorSlotCount,
+      0,
+      this.reactorCouplingShutters.count,
+    );
+    if (closed === this.reactorCouplingState) return;
+    this.reactorCouplingState = closed;
+
+    const m = this.reactorCouplingMatrix;
+    const p = this.reactorCouplingPosition;
+    const s = this.reactorCouplingScale;
+    const q = this.reactorCouplingQuaternion;
+
+    for (let i = 0; i < this.reactorCouplingXs.length; i++) {
+      // One casing closes starboard; the second closes port. The central service
+      // point remains exposed, matching the gameplay minimum of one attacker.
+      const covered = i === 2 ? closed >= 1 : i === 0 ? closed >= 2 : false;
+      p.set(this.reactorCouplingXs[i], 0.47, 2.91);
+      s.setScalar(covered ? 0.001 : 1);
+      m.compose(p, q, s);
+      this.reactorCouplingWindows.setMatrixAt(i, m);
+    }
+    this.reactorCouplingWindows.instanceMatrix.needsUpdate = true;
+
+    const shutterPorts = [2, 0];
+    for (let i = 0; i < shutterPorts.length; i++) {
+      const shown = closed > i;
+      p.set(this.reactorCouplingXs[shutterPorts[i]], 0.47, 2.73);
+      s.set(shown ? 0.74 : 0.001, shown ? 0.74 : 0.001, shown ? 0.12 : 0.001);
+      m.compose(p, this.reactorShutterQuaternion, s);
+      this.reactorCouplingShutters.setMatrixAt(i, m);
+    }
+    this.reactorCouplingShutters.visible = closed > 0;
+    this.reactorCouplingShutters.instanceMatrix.needsUpdate = true;
+  }
+
+  /**
    * Non-colliding detail, and the single biggest reason the fortress reads as
    * enormous rather than as a grey box.
    *
@@ -447,6 +659,8 @@ export class Trampler {
       this.group.add(m);
       return m;
     };
+
+    this.#buildReactorDynamo(mastMat, trimMat);
 
     // Bolt strips and pipework over the hull flanks. Greebling: the model-maker's
     // trick of gluing kit parts to a smooth shape so the eye reads scale into it.
@@ -553,10 +767,10 @@ export class Trampler {
       this.group.add(cable);
     }
 
-    // The reactor's own light, and the only point light in the game. A glowing box
-    // that does not light anything around it reads as painted; this is what makes
-    // the core feel like a power source and doubles as the failure readout when it
-    // dims.
+    // The reactor's own light, and the only point light in the game. Emissive
+    // windows without local falloff read as painted; this makes the concentrated
+    // core glow feel like a power source and doubles as the failure readout when
+    // it dims.
     //
     // 14 rather than 26. Point-light intensity is in candela and falls off with the
     // square of distance, so 26 at a metre was washing out the deck plating around
@@ -1159,11 +1373,26 @@ export class Trampler {
   #animateMachinery(dt) {
     const drive = this.speedFactor();
     for (const fan of this.fans ?? []) fan.rotation.z += dt * (2 + drive * 14);
+
+    this.#syncReactorCouplings();
+    this.reactorPhase = (this.reactorPhase ?? 0) + dt;
+
+    const frac = clamp(this.reactorHp / this.maxReactorHp, 0, 1);
+    // Healthy machinery breathes gently; a failing dynamo drops beats instead of
+    // merely changing colour. Both waves are deterministic and visual-only.
+    const pulse = 0.92 + 0.08 * Math.sin(this.reactorPhase * (5 + frac * 2));
+    const failureWave = Math.sin(this.reactorPhase * 37)
+      + Math.sin(this.reactorPhase * 61) * 0.45;
+    const stutter = frac < 0.4 && failureWave < -0.35 ? 0.24 : 1;
+
+    if (this.reactorRotor && frac > 0) {
+      this.reactorRotor.rotation.z += dt * frac * (1.2 + frac * 4.8) * stutter;
+    }
+    if (this.reactorMat) {
+      this.reactorMat.emissiveIntensity = (0.18 + frac * 0.92) * pulse * stutter;
+    }
     if (this.reactorLight) {
-      const frac = this.reactorHp / this.maxReactorHp;
-      // Flicker harder as it fails. The light is the stakes.
-      const flicker = frac < 0.4 ? 0.6 + 0.4 * Math.sin(this.time * 40) : 1;
-      this.reactorLight.intensity = 14 * (0.25 + frac * 0.75) * flicker;
+      this.reactorLight.intensity = 14 * (0.12 + frac * 0.88) * pulse * stutter;
       this.reactorLight.color.setHSL(0.33 * frac, 0.85, 0.5);
     }
   }
