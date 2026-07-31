@@ -345,7 +345,21 @@ export class Weapon {
     // silent swap you cannot see is worse than a keypress that does nothing.
     if (input.pressed(CFG.combat.loadout.swapKey)) this.swap();
 
-    if (input.locked && input.mouseDown(0) && this.cooldown <= 0) {
+    // Repair is resolved earlier in the same simulation step, after movement has
+    // established where the operative actually ended. Gate on admitted work rather
+    // than raw E locally: being out of range, beside a full target, or refused because a
+    // crewmate owns the point must leave the trigger available. A browser commits that
+    // choice before sending, so an honest fallback command contains fire and no repair.
+    //
+    // The authority also refuses an uncommitted packet that retains BOTH bits. Otherwise a
+    // modified producer could recreate the surprise fallback shot this arbitration removed.
+    // This is carried-weapon-only: station fire returned above and remains the deck gun's job.
+    const uncommittedNetworkRepair = !!input.networked && input.down(CFG.repair.key);
+    if (input.locked
+        && input.mouseDown(0)
+        && !this.player.repairing
+        && !uncommittedNetworkRepair
+        && this.cooldown <= 0) {
       this.fire();
       this.cooldown = 1 / (this.profile.fireRate * this.fireRateScale);
     }

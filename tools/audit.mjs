@@ -663,9 +663,12 @@ console.log("\n9. The harness's frame order matches the game's");
   if (!frame || !stepFn) {
     report("could not isolate the frame loop or step()", "this check has gone stale");
   } else {
-    // Per-frame simulation calls, normalised to "object.method".
+    // Per-frame simulation calls, normalised to "object.method". Repair's admission and
+    // work phases are named separately because trigger ownership must precede Weapon while
+    // contested progress retains its post-gun timing; omitting either would make this check
+    // falsely green on the exact order it exists to protect.
     const grab = (body, strip) => new Set(
-      [...body.matchAll(/\b(\w+)\.(update|resolveStomps|handleInput|updateVisuals|endFrame)\(/g)]
+      [...body.matchAll(/\b(\w+)\.(update|resolveStomps|handleInput|updateVisuals|endFrame|admit|work)\(/g)]
         .map((m) => `${m[1].replace(strip, "")}.${m[2]}`),
     );
 
@@ -772,6 +775,66 @@ console.log("\n9. The harness's frame order matches the game's");
         );
       }
     }
+
+    // Membership alone cannot protect an ordering rule: a Set still contains all five
+    // calls if admission slips below Weapon, or if work moves above the station gun. Check
+    // the repair/hands subsequence explicitly in every frame loop that executes it. This is
+    // intentionally a semantic sequence rather than "all calls match": authority and client
+    // prediction each omit different server-owned work, while these five slots must agree.
+    const repairHandsOrder = [
+      "player.update",
+      "repair.admit",
+      "weapon.update",
+      "g.update",
+      "repair.work",
+    ];
+    const orderedLoops = [
+      [
+        "browser simStep()",
+        main.match(/function simStep\(dt\)\s*\{([\s\S]*?)\n {2}\}/),
+        /^$/,
+      ],
+      [
+        "harness step()",
+        verify.match(/function step\(sim, frames, hook, dt = DT\)\s*\{([\s\S]*?)\n\}/),
+        /^sim$/,
+      ],
+      [
+        "authority stepSession()",
+        session?.match(/export function stepSession\([^)]*\)\s*\{([\s\S]*?)\n\}/),
+        /^sim$/,
+      ],
+      [
+        "client stepSessionClient()",
+        session?.match(/export function stepSessionClient\([^)]*\)\s*\{([\s\S]*?)\n\}/),
+        /^sim$/,
+      ],
+    ];
+    let orderedMatches = 0;
+    for (const [label, match, strip] of orderedLoops) {
+      if (!match) {
+        report(`could not isolate ${label}`, "the repair/hands order check has gone stale");
+        continue;
+      }
+      // Strip comments and literals first: a prose mention of repair.admit() must not be
+      // capable of satisfying the check that protects the executable call's position.
+      const calls = [...code(match[1]).matchAll(
+        /\b(\w+)\.(update|resolveStomps|handleInput|updateVisuals|endFrame|admit|work)\(/g,
+      )].map((m) => `${m[1].replace(strip, "")}.${m[2]}`);
+      const actual = calls.filter((call) => repairHandsOrder.includes(call));
+      const matches = actual.length === repairHandsOrder.length
+        && actual.every((call, i) => call === repairHandsOrder[i]);
+      if (!matches) {
+        report(
+          `${label} repair/hands order differs`,
+          `expected ${repairHandsOrder.join(" -> ")}; found ${actual.join(" -> ") || "nothing"}`,
+        );
+      } else {
+        orderedMatches++;
+      }
+    }
+    console.log(`  repair/hands order matched in ${orderedMatches}/${orderedLoops.length} frame loops`);
+
     console.log(
       `  ${inHarness.size} simulation calls per frame, matched in both`
       + `${missing.length || extra.length ? " — MISMATCH" : ""}`,

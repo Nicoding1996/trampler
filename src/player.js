@@ -541,6 +541,10 @@ export class Player {
     // -- writing `station.mounted = false` from out here left the gun's own idea of its
     // occupant untouched, which is survivable with one operative and not with four.
     this.station?.dismount(this);
+    // Repair ownership is published on Player for the rest of the crew and for snapshots.
+    // Death can happen after this frame's Repair pass, so clear it at the teleport itself;
+    // waiting for the next frame would advertise a deck-spawned ghost welder for one packet.
+    this.repairing = null;
     this.trampler.deckSpawn(this.position);
     // Set the frame directly rather than going through attachTo: we want to be
     // at rest RELATIVE to the deck, not at rest in world space.

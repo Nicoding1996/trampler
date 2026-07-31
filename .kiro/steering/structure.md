@@ -443,9 +443,10 @@ run.update                 offers a pick then roads if held; advances nothing it
 handleStationInput         mount/dismount, so it takes effect the same frame
 grapple.handleInput        fire before the player, so a shot lands the frame it is pressed
 player.update              look, based movement, driven states, integrate, collide
-weapon.update              suppressed while manning a station
+repair.admit               claims carried hands from current range, health and ownership
+weapon.update              active repair suppresses firing, not cooldown or aim scanning
 gun.update                 aim visuals, fire, heat
-repair.update
+repair.work                samples remaining threats and applies progress in its old slot
 emitters.update
 items.update               conditionals built from the position this frame ENDED in
 handlePurchasing           pick, road, bay or refits — exactly one owns the keys
@@ -458,6 +459,37 @@ hud.update
 input.endFrame
 post.render
 ```
+
+Repair admission has to run after movement but before the personal weapon. Its `active`
+state includes the real range, target health and one-welder claim, so gating on
+`player.repairing` suppresses only work that actually happens — not raw E. Progress is a
+separate post-weapon call: threat sampling stays where repair lived before hands arbitration,
+so a carried or station shot that clears the final nearby hostile still earns full-rate work
+on that same frame. The same split in `main.js`, the harness and both session loops prevents
+a first-frame shot without changing contested timing.
+
+A browser predicts only its own operative, so its `Crew` cannot answer which point a
+remote welder owns. Operative snapshots therefore carry `repairTarget` as an exact key
+(`reactor` or `leg:n`), and `Repair` replaces its external claims from every newest
+snapshot. The same key becomes a temporary preference for the local operative: position
+stays predicted, but two overlapping points cannot remain disagreed merely because the
+position error is smaller than reconciliation's dead-zone. Range, damage and ownership are
+still revalidated locally, so the key grants no work. These are absolute snapshot facts, not
+events; teardown clears both remote claims and the local preference, and respawn clears the
+published player claim at the teleport itself.
+
+The input command is captured before prediction but committed afterwards: if repair was
+admitted it carries repair without carried fire; otherwise it carries fire without repair.
+On the first simultaneous request both clients may predict the weld and authority still
+chooses one, but the loser receives no surprise fallback shot; once the exact claim
+returns, that client can immediately choose to cover instead. The authority independently
+rejects carried fire from an untrusted on-foot packet that retains both bits, so bypassing
+client commitment cannot recreate that fallback shot.
+
+A manned station is the deliberate exception. Its trigger belongs to the deck gun, not the
+carried weapon, so admitted reactor repair preserves the fire bit while mounted. The
+personal `Weapon` returns before arbitration whenever a station is occupied; deck-gun
+behaviour and tuning are therefore unchanged.
 
 `trampler.resolveStomps(horde, player)` is called explicitly rather than from
 inside `update()`. The fortress does not get to hold references to the horde or

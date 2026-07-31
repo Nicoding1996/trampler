@@ -47,6 +47,7 @@ import { enemyCfg } from "./config.js";
 import {
   packHullBits, unpackHullBits, packPhaseBits, unpackPhaseBits,
   packEnemyBits, unpackEnemyBits, packOperativeBits, unpackOperativeBits,
+  packRepairTarget, unpackRepairTarget,
   packWeaponBits, unpackWeaponBits, packGrappleBits, HELD_BIT, EDGE_BIT,
   PURCHASE_OWNER_MASK, PURCHASE_OWNER_SHIFT,
   PURCHASE_CONTEXT_MASK, PURCHASE_CONTEXT_SHIFT,
@@ -128,6 +129,9 @@ export function netInput({
     starved: 0,
     dropped: 0,
     locked: true,
+    // Marks authority-replayed input. An honest client commits repair or carried fire before
+    // sending; this lets Weapon reject an untrusted packet that tries to retain both.
+    networked: true,
 
     push(cmd) {
       // A backlog means the client is sending faster than the server steps, or a burst
@@ -599,6 +603,8 @@ export function resetSession(sim, { advanceGeneration = true } = {}) {
     op.bayOpen = false;
     op.player.hp = op.player.maxHp;
     op.player.repairing = null;
+    op.repair.setExternalClaims?.([]);
+    op.repair.setAuthorityTarget?.(null);
     op.player.respawnOnDeck();
     op.items.reset();
     if (sim.networked) op.input.release?.();
@@ -676,9 +682,13 @@ export function stepSession(sim, dt, authorityTick = null) {
     handleStationInput(sim.guns, input, op.player);
     op.grapple.handleInput(input);
     op.player.update(dt, input);
+    // Current-frame admission owns the carried trigger on authority too. Work remains after
+    // both weapon paths so a shot clearing the last nearby hostile restores the same-frame
+    // uncontested rate that repair had before hands arbitration existed.
+    op.repair.admit(dt, input);
     op.weapon.update(dt, input);
     for (const g of sim.guns) g.update(dt, input, op.player, op.weapon, opIndex === 0);
-    op.repair.update(dt, input);
+    op.repair.work(dt);
     sim.emitters.update(dt, input, op.player, opIndex === 0);
     op.items.update(dt);
 
@@ -927,6 +937,7 @@ export function operativesOf(sim) {
       grappleY: grappleAnchor?.y ?? 0,
       grappleZ: grappleAnchor?.z ?? 0,
       grappleBits: packGrappleBits({ active: grappleActive, onHull: op.grapple?.onHull }),
+      repairTarget: packRepairTarget(p.repairing),
       bits: current.bits,
     });
   }
@@ -1404,7 +1415,37 @@ export function applySnapshot(sim, state, localSeat = 0) {
   // body's hull-local position is read out through it. Applied before the transform it would
   // place every boarder against the previous correction's fortress.
   if (state.entities) applyEntities(sim, state.entities);
-  if (state.operatives) applyOperatives(sim, state.operatives, localSeat);
+  if (state.operatives) {
+    applyOperatives(sim, state.operatives, localSeat);
+
+    // Browser prediction owns only its local operative, so its Crew cannot answer which exact
+    // point a remote welder has claimed. Replace that missing roster slice from the newest
+    // authority snapshot before the next predicted step.
+    //
+    // Generic repair input does not name a point, so authority also owns the local point's
+    // identity. Keep the predicted position, but prefer the exact authoritative key while it
+    // remains genuinely reachable and free. Otherwise two legs inside one overlap can diverge
+    // forever on a positional difference smaller than reconciliation's dead-zone.
+    if (localSeat > 0) {
+      const localOp = sim.operatives?.find((op) => op.seat === localSeat) ?? null;
+      const localRepair = localOp?.repair
+        ?? (sim.operatives?.length === 1 ? sim.repair : null);
+      const localWire = state.operatives.find((op) => op.seat === localSeat) ?? null;
+      const authorityTarget = unpackRepairTarget(localWire?.repairTarget);
+      localRepair?.setExternalClaims(state.operatives
+        .filter((op) => op.seat !== localSeat)
+        .map((op) => ({ seat: op.seat, key: unpackRepairTarget(op.repairTarget) })));
+      localRepair?.setAuthorityTarget(authorityTarget);
+
+      // Correct an active claim's identity immediately without resurrecting work prediction
+      // has already stopped. The next fixed step validates range, damage and ownership again.
+      const localPlayer = localOp?.player
+        ?? (sim.operatives?.length === 1 ? sim.player : null);
+      if (localPlayer && (!authorityTarget || localPlayer.repairing)) {
+        localPlayer.repairing = authorityTarget;
+      }
+    }
+  }
 }
 
 /**
@@ -1458,7 +1499,7 @@ export function applyOperatives(sim, wire, localSeat = 0) {
     }
     p.pitch = w.pitch;
     p.grounded = b.grounded;
-    if (!b.repairing) p.repairing = null;
+    p.repairing = unpackRepairTarget(w.repairTarget);
     // Zeroed rather than integrated. A remote operative's motion comes entirely from the next
     // snapshot, so a non-zero velocity here would be a second source of movement fighting the
     // first — and would drift between packets.
@@ -1502,9 +1543,12 @@ export function stepSessionClient(sim, dt) {
   handleStationInput(sim.guns, input, sim.player);
   sim.grapple.handleInput(input);
   sim.player.update(dt, input);
+  // Prediction must admit repair before reading the carried trigger, then apply work after
+  // both weapon paths in the same slots as authority and solo.
+  sim.repair.admit(dt, input);
   sim.weapon.update(dt, input);
   for (const g of sim.guns) g.update(dt, input, sim.player, sim.weapon);
-  sim.repair.update(dt, input);
+  sim.repair.work(dt);
   sim.emitters.updateClient(dt, sim.player);
   sim.items.update(dt);
 

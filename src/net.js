@@ -54,8 +54,8 @@ import { CFG } from "./config.js";
 import { Look, operativeGeometry } from "./look.js";
 import { clamp01, damp, lerp } from "./util.js";
 import {
-  decode, encodeInput, lerpSnapshot, SnapshotError,
-  unpackGrappleBits, unpackOperativeBits, unpackWeaponBits,
+  commitHandsInput, decode, encodeInput, lerpSnapshot, SnapshotError,
+  unpackGrappleBits, unpackOperativeBits, unpackRepairTarget, unpackWeaponBits,
 } from "./snapshot.js";
 import { applyEntities, applySnapshot, readInput, reconcile, resetSession } from "./session.js";
 
@@ -451,6 +451,8 @@ export class Net {
     this.sendAcc = 0;
     this.simReady = false;
     this.sim?.horde?.clearRenderCombatFrame?.();
+    this.sim?.repair?.setExternalClaims?.([]);
+    this.sim?.repair?.setAuthorityTarget?.(null);
     if (this.sim?.weapon) this.sim.weapon.arbitrated = false;
     const localOp = this.sim?.operatives?.find((op) => op.player === this.player);
     if (localOp) localOp.seat = 0;
@@ -844,7 +846,11 @@ export class Net {
     p.hurtCount = mine.hurtCount;
     p.deaths = mine.deaths;
     if (this.sim.weapon) this.sim.weapon.kills = mine.kills;
-    if (!unpackOperativeBits(mine.bits).repairing) p.repairing = null;
+    const authorityRepair = unpackRepairTarget(mine.repairTarget);
+    // Position remains predicted, but exact repair identity is authority-owned. Do not
+    // resurrect a locally stopped action from an older packet; only rename work still active,
+    // while an authoritative refusal always clears it.
+    if (!authorityRepair || p.repairing) p.repairing = authorityRepair;
     this.authorityDeaths = mine.deaths;
     this.authorityHurtCount = mine.hurtCount;
   }
@@ -1103,25 +1109,23 @@ export class Net {
   }
 
   /**
-   * Send one input command, for one simulation step.
+   * Capture one physical input command before its predicted simulation step.
    *
    * CALLED ONCE PER STEP, NOT ONCE PER RENDERED FRAME, and the distinction matters at both
-   * ends of the frame-rate range. A client at 144 fps runs zero steps on most frames, so
-   * sending per frame would flood the server's queue with commands it has no ticks for and
-   * the queue would drop them — losing edges. A client at 30 fps runs two steps per frame and
-   * would send half the input its own simulation consumed, so the server would starve and
-   * repeat held keys while the local prediction had moved twice.
+   * ends of the frame-rate range. A client at 144 fps runs zero steps on most frames, while a
+   * client at 30 fps runs two. The command is captured now so edges and mouse delta describe
+   * this exact step, but sent afterwards so repair admission can commit which action owns the
+   * operative's hands.
    *
    * `includeEdges` is true only for the FIRST step of a rendered frame. The local Input holds
    * one set of one-shot presses per frame, and `pressed()` consumes them, so exactly one step
-   * can legitimately claim them. Attaching them to every step of a multi-step frame would fire
-   * one keypress two or three times on the authority — a second grapple, a doubled purchase.
+   * can legitimately claim them.
    */
-  sendInput(input, includeEdges) {
+  prepareInput(input, includeEdges) {
     // No baseline, no prediction. Sending during world construction was counted and discarded
     // by the Worker while the browser moved locally, so the first snapshot looked like a
     // teleport back to spawn. Sequence zero remains the baseline until authority exists.
-    if (!this.authoritative || !this.connected || !this.seat) return false;
+    if (!this.authoritative || !this.connected || !this.seat) return null;
     this.inputSeq++;
     // This is the target frame visibly under the crosshair, not a second local counter. The
     // authority treats it only as an untrusted rewind request and clamps it to 250 ms; rounding
@@ -1149,8 +1153,22 @@ export class Net {
       purchaseContext: input.purchaseContext,
     });
     if (!includeEdges) cmd.edges = 0;
+    return cmd;
+  }
+
+  /** Send the action selected by the predicted step for a previously captured command. */
+  sendInput(cmd) {
+    if (!cmd || !this.connected || !this.seat) return false;
+    // E and fire may both be physically held, but the authority must receive the one action
+    // prediction actually performed. Otherwise a simultaneous remote claim can turn a locally
+    // suppressed shot into an authoritative fallback shot that appears only on correction.
+    const committed = commitHandsInput(
+      cmd,
+      !!this.sim?.player?.repairing,
+      !!this.sim?.player?.station,
+    );
     try {
-      this.socket.send(encodeInput(cmd).buffer);
+      this.socket.send(encodeInput(committed).buffer);
       this.inputsSent++;
       return true;
     } catch {

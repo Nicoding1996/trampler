@@ -41,7 +41,7 @@
 // refused it, because "could not connect" sends someone to check their network when the
 // actual problem is a stale browser tab holding last week's JavaScript. That specific
 // case is not hypothetical for a project with no build step and no cache busting.
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 
 // Message kinds. One byte, so there is room to add the horde and the operatives in later
 // slices without touching anything here.
@@ -105,6 +105,30 @@ export const EDGE_BIT = {
   swap: 16384,
   grapple: 32768,
 };
+
+/**
+ * Commit the one hands action local prediction selected for this command.
+ *
+ * Physical E and fire are captured before the predicted step. Afterwards `repairing` says
+ * whether that step admitted real work. If it did, carried-weapon fire is removed; if it did
+ * not, repair is removed and fire remains available. A mounted gun is the exception: the
+ * station owns that trigger, so repair and mounted fire may coexist exactly as before.
+ * Sending an ambiguous on-foot pair would let the authority reinterpret a simultaneously
+ * claimed point as a fallback shot the client never drew.
+ *
+ * The authority still verifies every repair condition. This only says what the operative
+ * chose after the world visible to that client was considered; it grants no outcome.
+ */
+export function commitHandsInput(cmd, repairing, stationOwnsFire = false) {
+  if (!cmd || (cmd.held & HELD_BIT.repair) === 0) return cmd;
+  if (repairing && stationOwnsFire) return cmd;
+  return {
+    ...cmd,
+    held: repairing
+      ? cmd.held & ~HELD_BIT.fire
+      : cmd.held & ~HELD_BIT.repair,
+  };
+}
 
 /** Thrown by decode() so the caller can name the cause instead of guessing. */
 export class SnapshotError extends Error {
@@ -474,6 +498,11 @@ const OPERATIVE = [
   ["grappleY", "metres"],
   ["grappleZ", "metres"],
   ["grappleBits", "bits"],
+
+  // Exact point claimed by this operative: 0 none, 1 reactor, 2..255 leg index + 2.
+  // The broad repairing bit below remains useful to presentation, but cannot arbitrate one
+  // welder per point: two simultaneous claims need the key, not merely the fact of welding.
+  ["repairTarget", "count"],
 
   // based | repairing | downed | station index (2 bits) | grounded | bay open.
   ["bits", "bits"],
@@ -853,6 +882,30 @@ export function unpackEnemyBits(bitsA, bitsB) {
 }
 
 // ------------------------------------------------------------------------ operative bits
+
+/**
+ * Exact repair-point ownership on the wire.
+ *
+ * Zero is deliberately "none", as it is for seats and stations. One names the reactor and
+ * every later value is a leg index plus two, leaving no table in session.js that can drift
+ * from this codec. The one-byte ceiling is explicit rather than wrapping onto another point.
+ */
+export function packRepairTarget(key) {
+  if (key == null) return 0;
+  if (key === "reactor") return 1;
+  const match = /^leg:(\d+)$/.exec(key);
+  const index = match ? Number(match[1]) : -1;
+  if (!Number.isSafeInteger(index) || index < 0 || index > 253) {
+    throw new RangeError(`repair target ${String(key)} does not fit the v${PROTOCOL_VERSION} wire`);
+  }
+  return index + 2;
+}
+
+export function unpackRepairTarget(code) {
+  const value = Number(code);
+  if (!Number.isInteger(value) || value <= 0 || value > 255) return null;
+  return value === 1 ? "reactor" : `leg:${value - 2}`;
+}
 
 // Two bits for the station, so 0 means "on foot" and 1..3 name a mount. Derived from the
 // mount count rather than hard-coded: `CFG.deckGun.mounts` has two today, and a third would

@@ -35,7 +35,7 @@ import {
   encode, decode, snapshotBytes, packHullBits, unpackHullBits, packPhaseBits,
   unpackPhaseBits, PROTOCOL_VERSION, toleranceOf, LAYOUT, WIRE_PHASES, WIRE_RUN_PHASES,
   ENTITY_BYTES, OPERATIVE_BYTES, HELD_BIT, EDGE_BIT, encodeInput, decodeInput, INPUT_BYTES,
-  lerpSnapshot,
+  commitHandsInput, packRepairTarget, unpackRepairTarget, lerpSnapshot,
 } from "./src/snapshot.js";
 import {
   createSession, stepSession, stepSessionClient, snapshotOf, applySnapshot, hullDivergence,
@@ -191,9 +191,12 @@ function step(sim, frames, hook, dt = DT) {
     handleStationInput(sim.guns, sim.input, sim.player);
     sim.grapple.handleInput(sim.input);
     sim.player.update(dt, sim.input);
+    // Admission claims the carried hands before its trigger is read; work stays after both
+    // weapon paths so threat sampling retains repair's established post-fire timing.
+    sim.repair.admit(dt, sim.input);
     sim.weapon.update(dt, sim.input);
     for (const g of sim.guns) g.update(dt, sim.input, sim.player, sim.weapon);
-    sim.repair.update(dt, sim.input);
+    sim.repair.work(dt);
     sim.emitters.update(dt, sim.input, sim.player);
     // Same slot as main.js: after repair and the player, before the horde, so the
     // conditional bonuses are built from the position this frame actually ended in.
@@ -5525,6 +5528,23 @@ console.log("\n83. The particle and viewmodel layer runs against the real sim");
     viewmodel.update(DT, ctx);
     ok("then comes back", viewmodel.group.visible);
 
+    // Repair can own the hands for several seconds. Hiding by early-return alone would freeze
+    // the last recoil pose for all of them and make the rifle jump back into view still kicked
+    // when E is released, so the invisible model must continue settling.
+    viewmodel.recoil = 1;
+    sim.player.repairing = "leg:0";
+    const repairRecoil = viewmodel.recoil;
+    for (let i = 0; i < 30; i++) viewmodel.update(DT, ctx);
+    ok("active repair hides the carried weapon", !viewmodel.group.visible);
+    ok("and hidden recoil keeps settling instead of freezing",
+      viewmodel.recoil < repairRecoil * 0.2,
+      `${repairRecoil.toFixed(2)} -> ${viewmodel.recoil.toFixed(3)}`);
+    sim.player.repairing = null;
+    viewmodel.update(DT, ctx);
+    ok("the settled weapon returns immediately when repair releases the hands",
+      viewmodel.group.visible && viewmodel.recoil < repairRecoil * 0.2,
+      `visible ${viewmodel.group.visible}, recoil ${viewmodel.recoil.toFixed(3)}`);
+
     // One model per carried weapon, exactly one drawn, and a swap changes WHICH one.
     //
     // This matters more than it looks. The silhouette in the player's hands is the
@@ -9711,6 +9731,66 @@ console.log("\n108. A repair point admits one welder, and repairs run in paralle
 
   const FRAMES = 30; // half a second: 55 hp at 110 hp/s, well inside a 120 hp leg
 
+  // ---- repair owns the carried weapon on the SAME frame work begins -------
+  //
+  // Drive the real Repair and Weapon in shipped order. Testing only the gate in Weapon would
+  // supply the state whose timing is the subject and miss the opening-shot leak this change
+  // exists to prevent.
+  {
+    const { sim, crew1, r1, in1 } = twoWelders();
+    sim.trampler.damageLeg(0, 1e6);
+    standAtLeg(sim, crew1, 0);
+    in1.keys.add(R.key);
+    in1.mouseHeld.add(0);
+
+    const handsFrame = () => {
+      r1.admit(DT, in1);
+      sim.weapon.update(DT, in1);
+      for (const gun of sim.guns) gun.update(DT, in1, crew1, sim.weapon);
+      r1.work(DT);
+    };
+
+    const before = sim.weapon.shots;
+    handsFrame();
+    ok("repair is genuinely admitted on the first held frame (test is not vacuous)",
+      r1.active && crew1.repairing === "leg:0",
+      `active ${r1.active}, claim ${crew1.repairing}`);
+    ok("that first repair frame suppresses the carried weapon without leaking a shot",
+      sim.weapon.shots === before, `${before} -> ${sim.weapon.shots} shots`);
+
+    sim.weapon.cooldown = 0.25;
+    const cooling = sim.weapon.cooldown;
+    handsFrame();
+    ok("weapon cooldown keeps ticking while repair owns the trigger",
+      sim.weapon.cooldown < cooling && sim.weapon.shots === before,
+      `${cooling.toFixed(3)} -> ${sim.weapon.cooldown.toFixed(3)} s, ${sim.weapon.shots} shots`);
+
+    in1.keys.delete(R.key);
+    sim.weapon.cooldown = 0;
+    handsFrame();
+    ok("releasing repair returns fire on that same frame",
+      !r1.active && crew1.repairing === null && sim.weapon.shots === before + 1,
+      `active ${r1.active}, ${before} -> ${sim.weapon.shots} shots`);
+
+    // Raw E is not the gate. With no damaged point genuinely in range, it must not swallow
+    // the trigger; otherwise a held interaction key becomes an invisible weapon lockout.
+    crew1.position.set(0, 1.2, -100);
+    in1.keys.add(R.key);
+    sim.weapon.cooldown = 0;
+    handsFrame();
+    ok("holding repair out of range leaves the carried weapon available",
+      !r1.active && sim.weapon.shots === before + 2,
+      `active ${r1.active}, ${sim.weapon.shots} shots`);
+
+    sim.trampler.legHp[0] = CFG.trampler.legHp;
+    standAtLeg(sim, crew1, 0);
+    sim.weapon.cooldown = 0;
+    handsFrame();
+    ok("and a full point does not steal the trigger either",
+      !r1.active && sim.weapon.shots === before + 3,
+      `active ${r1.active}, ${sim.weapon.shots} shots`);
+  }
+
   // ---- the geometry that makes the two-pass selection a real case rather than a
   // hypothetical one. Measured rather than assumed, and the assumption was WRONG: the
   // first draft of this rule reasoned that legs are 8.5 m apart against a 4.5 m reach and
@@ -11768,6 +11848,15 @@ console.log("\n117. The snapshot round-trips, and says so when it cannot");
   ok("every phase pairing round-trips, so neither list has outgrown its bits", phasesOk,
     `${WIRE_PHASES.length} director phases x ${WIRE_RUN_PHASES.length} run phases`);
 
+  const repairKeys = [null, "reactor", "leg:0", "leg:5", "leg:253"];
+  ok("exact repair-point ownership round-trips without confusing two legs",
+    repairKeys.every((key) => unpackRepairTarget(packRepairTarget(key)) === key),
+    repairKeys.map((key) => `${key ?? "none"}:${packRepairTarget(key)}`).join(", "));
+  let repairOverflowRefused = false;
+  try { packRepairTarget("leg:254"); } catch { repairOverflowRefused = true; }
+  ok("a repair point too large for its byte refuses instead of wrapping onto another point",
+    repairOverflowRefused, "leg:254 does not become none or reactor");
+
   // THE THREE REFUSALS, each named. A socket that says "bad packet" for a stale browser
   // tab sends someone to check their network, which is the refit terminal's lesson.
   const bad = (fn) => {
@@ -12553,6 +12642,253 @@ console.log("\n121. A keypress crosses the wire and the server decides what it d
     otherMoved < 0.02, `seat 1 within ${(otherMoved * 100).toFixed(2)} cm of the server`);
   ok("and it still learns its own acknowledged sequence, which reconciliation needs",
     client.operatives[1].ackSeq === frames, `ack ${client.operatives[1].ackSeq}`);
+
+  // ---- exact local repair identity is authority-owned --------------------
+  //
+  // Both legs are genuinely reachable and the local position makes leg 0 nearer. A snapshot
+  // naming leg 1 must therefore change the predicted choice, not merely clear a refusal; this
+  // is the centimetre-scale disagreement positional reconciliation can legitimately ignore.
+  {
+    const targetClient = createSession({ seats: [2] });
+    targetClient.trampler.walking = false;
+    targetClient.trampler.turning = false;
+    targetClient.trampler.damageLeg(0, 1e6);
+    targetClient.trampler.damageLeg(1, 1e6);
+    const targetInput = makeInput();
+    targetClient.input = targetInput;
+    targetClient.operatives[0].input = targetInput;
+
+    const leg0 = targetClient.trampler.legAttackWorld(0, new THREE.Vector3());
+    const leg1 = targetClient.trampler.legAttackWorld(1, new THREE.Vector3());
+    targetClient.player.position.copy(leg0).lerp(leg1, 0.48);
+    targetClient.player.position.y = 1.2;
+    targetClient.player.base = null;
+    targetClient.player.velocity.set(0, 0, 0);
+    const d0 = targetClient.player.position.distanceTo(leg0);
+    const d1 = targetClient.player.position.distanceTo(leg1);
+    ok("two exact local targets overlap and prediction would choose the other one (not vacuous)",
+      d0 < CFG.repair.range && d1 < CFG.repair.range && d0 < d1,
+      `leg 0 at ${d0.toFixed(2)} m, leg 1 at ${d1.toFixed(2)} m`);
+
+    const targetState = decode(encode(snapshotOf(targetClient, 1001)).buffer);
+    targetState.operatives[0].repairTarget = packRepairTarget("leg:1");
+    applySnapshot(targetClient, targetState, 2);
+    targetInput.keys.add(CFG.repair.key);
+    const hp0 = targetClient.trampler.legHp[0];
+    const hp1 = targetClient.trampler.legHp[1];
+    stepSessionClient(targetClient, DT);
+
+    ok("the exact local authority target becomes prediction's target on the next step",
+      targetClient.repair.authorityTarget === "leg:1"
+      && targetClient.repair.target?.key === "leg:1"
+      && targetClient.player.repairing === "leg:1",
+      `authority ${targetClient.repair.authorityTarget}, predicted ${targetClient.repair.target?.key}`);
+    ok("and work lands only on that authoritative point",
+      targetClient.trampler.legHp[0] === hp0 && targetClient.trampler.legHp[1] > hp1,
+      `leg 0 ${hp0.toFixed(1)} -> ${targetClient.trampler.legHp[0].toFixed(1)},`
+      + ` leg 1 ${hp1.toFixed(1)} -> ${targetClient.trampler.legHp[1].toFixed(1)}`);
+  }
+
+  // Death happens after repair in the authority frame. The teleport itself must clear the
+  // published claim or a snapshot on that tick tells every client a deck-spawned ghost still
+  // owns the point until the next packet.
+  {
+    const deathServer = createSession({ seats: 1, networked: true });
+    deathServer.trampler.walking = false;
+    deathServer.trampler.turning = false;
+    deathServer.trampler.damageLeg(0, 1e6);
+    const deathOp = deathServer.operatives[0];
+    const at = deathServer.trampler.legAttackWorld(0, new THREE.Vector3());
+    deathOp.player.position.set(at.x, 1.2, at.z);
+    deathOp.player.base = null;
+    deathOp.player.velocity.set(0, 0, 0);
+    deathOp.input.push({
+      seq: 1, clientTick: 1, held: HELD_BIT.repair, edges: 0, lookDx: 0, lookDy: 0,
+    });
+    stepSession(deathServer, DT);
+    ok("death setup owns a repair point before contact damage (not vacuous)",
+      deathOp.player.repairing === "leg:0" && deathOp.repair.active,
+      `claim ${deathOp.player.repairing}, active ${deathOp.repair.active}`);
+
+    deathOp.player.hurt(1e6);
+    const deathState = decode(encode(snapshotOf(deathServer, 1002)).buffer);
+    const deathWire = deathState.operatives[0];
+    ok("a death-tick snapshot clears the exact repair claim immediately",
+      deathOp.player.deaths === 1
+      && deathOp.player.repairing === null
+      && unpackRepairTarget(deathWire.repairTarget) === null,
+      `deaths ${deathOp.player.deaths}, local ${deathOp.player.repairing},`
+      + ` wire ${unpackRepairTarget(deathWire.repairTarget)}`);
+  }
+
+  // ---- simultaneous repair claims choose an action, not an authority fallback ----------
+  //
+  // This is the race a boolean `repairing` cannot solve. Before the first result returns, both
+  // clients can reasonably predict that the point is free. They therefore both commit repair
+  // and neither commits fire; authority may correct who got the weld, but must not invent a
+  // shot for the loser. The next exact snapshot lets the refused client choose cover.
+  {
+    const repairServer = createSession({ seats: 2, networked: true });
+    repairServer.trampler.walking = false;
+    repairServer.trampler.turning = false;
+    repairServer.trampler.damageLeg(0, 1e6);
+    const at = repairServer.trampler.legAttackWorld(0, new THREE.Vector3());
+    for (const op of repairServer.operatives) {
+      op.player.position.set(at.x, 1.2, at.z);
+      op.player.base = null;
+      op.player.velocity.set(0, 0, 0);
+    }
+
+    const physicalBoth = {
+      seq: 1, clientTick: 1, held: HELD_BIT.repair | HELD_BIT.fire,
+      edges: 0, lookDx: 0, lookDy: 0,
+    };
+    const choseRepair = commitHandsInput(physicalBoth, true);
+    ok("a predicted repair command carries repair but not a contradictory trigger",
+      (choseRepair.held & HELD_BIT.repair) !== 0
+      && (choseRepair.held & HELD_BIT.fire) === 0,
+      `held ${choseRepair.held.toString(2)}`);
+
+    for (const op of repairServer.operatives) op.input.push({ ...choseRepair });
+    const losingShotsBefore = repairServer.operatives[1].weapon.shots;
+    stepSession(repairServer, DT);
+    ok("authority admits exactly one simultaneous welder (test is not vacuous)",
+      repairServer.operatives[0].player.repairing === "leg:0"
+      && repairServer.operatives[1].player.repairing === null,
+      `seat 1 ${repairServer.operatives[0].player.repairing},`
+      + ` seat 2 ${repairServer.operatives[1].player.repairing}`);
+    ok("and refusal does not create a shot that the losing client suppressed",
+      repairServer.operatives[1].weapon.shots === losingShotsBefore,
+      `${losingShotsBefore} -> ${repairServer.operatives[1].weapon.shots} shots`);
+
+    const repairSnap = decode(encode(snapshotOf(repairServer, 2000)).buffer);
+    const claim1 = repairSnap.operatives.find((op) => op.seat === 1);
+    const claim2 = repairSnap.operatives.find((op) => op.seat === 2);
+    ok("the snapshot names the exact claimed point rather than only saying repairing",
+      unpackRepairTarget(claim1.repairTarget) === "leg:0"
+      && unpackRepairTarget(claim2.repairTarget) === null,
+      `seat 1 ${unpackRepairTarget(claim1.repairTarget)},`
+      + ` seat 2 ${unpackRepairTarget(claim2.repairTarget)}`);
+
+    // The browser removes the contradiction, but the authority is still a trust boundary. A
+    // modified producer may send both bits raw; on foot that is interpreted as repair intent,
+    // never as permission to invent a carried shot if the claim is refused.
+    repairServer.operatives[0].input.push({ ...choseRepair, seq: 2, clientTick: 2 });
+    repairServer.operatives[1].input.push({ ...physicalBoth, seq: 2, clientTick: 2 });
+    const rawPacketShots = repairServer.operatives[1].weapon.shots;
+    stepSession(repairServer, DT);
+    ok("authority rejects contradictory carried repair-plus-fire input",
+      repairServer.operatives[1].repair.takenBy === 1
+      && repairServer.operatives[1].weapon.shots === rawPacketShots,
+      `taken by ${repairServer.operatives[1].repair.takenBy},`
+      + ` ${rawPacketShots} -> ${repairServer.operatives[1].weapon.shots} shots`);
+
+    // A browser sim contains only its local operative. Applying the snapshot must therefore
+    // install seat 1's claim into Repair's external roster before prediction runs.
+    const claimClient = createSession({ seats: [2] });
+    const claimInput = makeInput();
+    claimClient.input = claimInput;
+    claimClient.operatives[0].input = claimInput;
+    applySnapshot(claimClient, repairSnap, 2);
+    const clientAt = claimClient.trampler.legAttackWorld(0, new THREE.Vector3());
+    claimClient.player.position.set(clientAt.x, 1.2, clientAt.z);
+    claimClient.player.base = null;
+    claimClient.player.velocity.set(0, 0, 0);
+    claimClient.weapon.arbitrated = true;
+    claimInput.keys.add(CFG.repair.key);
+    claimInput.mouseHeld.add(0);
+
+    const predictedShots = claimClient.weapon.shots;
+    stepSessionClient(claimClient, DT);
+    ok("client prediction refuses that exact remote point and names its owner",
+      !claimClient.repair.active && claimClient.repair.takenBy === 1,
+      `active ${claimClient.repair.active}, taken by seat ${claimClient.repair.takenBy}`);
+    ok("so the refused client predicts the carried shot instead of hiding it",
+      claimClient.weapon.shots === predictedShots + 1,
+      `${predictedShots} -> ${claimClient.weapon.shots} shots`);
+
+    const coverPhysical = readInput(claimInput, { seq: 3, clientTick: 3 });
+    const choseCover = commitHandsInput(coverPhysical, !!claimClient.player.repairing);
+    ok("its next command carries fire but no stale repair attempt",
+      (choseCover.held & HELD_BIT.fire) !== 0
+      && (choseCover.held & HELD_BIT.repair) === 0,
+      `held ${choseCover.held.toString(2)}`);
+
+    repairServer.operatives[0].input.push({ ...choseRepair, seq: 3, clientTick: 3 });
+    repairServer.operatives[1].input.push(choseCover);
+    const authorityShots = repairServer.operatives[1].weapon.shots;
+    stepSession(repairServer, DT);
+    ok("authority performs the same cover shot while the teammate keeps welding",
+      repairServer.operatives[0].player.repairing === "leg:0"
+      && repairServer.operatives[1].weapon.shots === authorityShots + 1,
+      `seat 1 ${repairServer.operatives[0].player.repairing},`
+      + ` seat 2 ${authorityShots} -> ${repairServer.operatives[1].weapon.shots} shots`);
+  }
+
+  // A station owns its own trigger. The carried weapon remains suppressed, but commitment
+  // must not strip fire from a deck gun merely because its operator can reach the reactor.
+  // Repair progress also stays in its old post-gun slot: killing the final nearby threat earns
+  // the uncontested rate on that same tick rather than changing mounted-repair tuning.
+  {
+    const stationServer = createSession({ seats: 1, networked: true });
+    stationServer.trampler.walking = false;
+    stationServer.trampler.turning = false;
+    const operator = stationServer.operatives[0];
+    const stern = stationServer.guns[1];
+    stern.mount(operator.player);
+    // Let the real station constraint place the operative before measuring the nearby target.
+    stepSession(stationServer, DT);
+    stationServer.trampler.damageReactor(120);
+
+    const threat = stationServer.horde.spawn(CLIMBER);
+    const threatAt = stationServer.trampler.localToWorld(new THREE.Vector3(0, 0.95, 13.0));
+    threat.x = threatAt.x;
+    threat.y = threatAt.y;
+    threat.z = threatAt.z;
+    threat.onHull = true;
+    threat.latched = false;
+    threat.hp = Math.min(threat.hp, CFG.deckGun.damage - 1);
+    const eye = operator.player.eyePosition(new THREE.Vector3());
+    operator.player.yaw = Math.atan2(
+      -(threatAt.x - operator.player.position.x),
+      -(threatAt.z - operator.player.position.z),
+    );
+    operator.player.pitch = Math.atan2(
+      threatAt.y - eye.y,
+      Math.hypot(threatAt.x - eye.x, threatAt.z - eye.z),
+    );
+    stationServer.scene.updateMatrixWorld(true);
+    const threatDistance = operator.player.position.distanceTo(threatAt);
+    ok("the mounted repair starts genuinely contested by a killable target (not vacuous)",
+      threat.alive && threatDistance < CFG.repair.threatRange
+      && threat.hp < CFG.deckGun.damage,
+      `${threat.hp.toFixed(0)} hp at ${threatDistance.toFixed(2)} m`);
+
+    const physicalMounted = {
+      seq: 1, clientTick: 1, held: HELD_BIT.repair | HELD_BIT.fire,
+      edges: 0, lookDx: 0, lookDy: 0,
+    };
+    const mountedChoice = commitHandsInput(physicalMounted, true, true);
+    ok("mounted commitment preserves both repair and the station-owned trigger",
+      (mountedChoice.held & HELD_BIT.repair) !== 0
+      && (mountedChoice.held & HELD_BIT.fire) !== 0,
+      `held ${mountedChoice.held.toString(2)}`);
+
+    operator.input.push(mountedChoice);
+    const reactorBefore = stationServer.trampler.reactorHp;
+    const mountedShots = stern.shots;
+    stepSession(stationServer, DT);
+    const reactorGain = stationServer.trampler.reactorHp - reactorBefore;
+    ok("the stern operator repairs while its shot clears the last nearby threat",
+      operator.player.repairing === "reactor"
+      && !threat.alive
+      && stern.shots === mountedShots + 1,
+      `threat alive ${threat.alive}, ${mountedShots} -> ${stern.shots} mounted shots`);
+    ok("and that same tick keeps the established uncontested repair rate",
+      Math.abs(reactorGain - CFG.repair.reactorRate * DT) < 1e-6
+      && !operator.repair.threatened,
+      `${reactorGain.toFixed(2)} hp, threatened ${operator.repair.threatened}`);
+  }
 }
 
 // ---------------------------------------------------------------------------

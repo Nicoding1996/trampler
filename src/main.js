@@ -516,9 +516,13 @@ function boot() {
     handleStationInput(guns, input, player);
     grapple.handleInput(input);
     player.update(dt, input);
+    // Resolve whether work genuinely owns the carried hands before its trigger is read.
+    // Progress stays after both weapon paths, preserving the established rule that clearing
+    // the final nearby hostile earns full-rate repair on this same frame.
+    repair.admit(dt, input);
     weapon.update(dt, input);
     for (const g of guns) g.update(dt, input, player, weapon);
-    repair.update(dt, input);
+    repair.work(dt);
     // A client updates placement readiness for its prompt, never the rack clocks, placement
     // list, targeting or damage. Those are shared state and advance once on the authority.
     if (authoritative) emitters.updateClient(dt, player);
@@ -638,24 +642,23 @@ function boot() {
       accumulator -= STEP_MS;
       // ONE COMMAND PER STEP, WITH THE EDGES ON THE FIRST ONE ONLY.
       //
-      // Per step rather than per frame because the two diverge at both ends of the refresh
-      // range: at 144 Hz most frames run no steps at all, and at 30 Hz a frame runs two. The
-      // server ticks 60 times a second regardless, so a client that sent per frame would
-      // either flood a queue with commands there are no ticks for or starve one it has already
-      // simulated past.
+      // Physical state is CAPTURED before the step, so its sequence, mouse delta and edges
+      // describe exactly what prediction consumes. It is SENT after the step, so repair's
+      // current-frame admission can commit either repair or fire when both keys are held.
+      // That split preserves immediate prediction without allowing authority to invent a
+      // fallback shot when a simultaneous remote claim rejects the repair.
       //
       // Edges only on the first step because the local Input holds one set of one-shot presses
       // per frame and `pressed()` consumes them — so exactly one step may legitimately claim
       // them. Repeating them across a multi-step frame would fire one keypress twice on the
       // authority, which is a second grapple or a doubled purchase.
-      //
-      // Sent BEFORE the step, so the command and the local prediction describe the same tick.
       const waitingForBaseline = net.awaitingAuthority;
-      const sent = waitingForBaseline ? false : net.sendInput(input, steps === 0);
+      const command = waitingForBaseline ? null : net.prepareInput(input, steps === 0);
       if (!waitingForBaseline) {
         cameraPresentation.beforeStep();
         simStep(STEP);
         cameraPresentation.afterStep();
+        const sent = net.sendInput(command);
         // AFTER the step, so what is recorded is the OUTCOME of that command rather than the
         // state before it. Solo steps have no command and therefore no prediction mark.
         if (sent) net.recordPrediction();

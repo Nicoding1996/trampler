@@ -48,6 +48,14 @@ export class Repair {
     // that question is arithmetically always "no", which is why this whole rule is
     // invisible solo and why the suite's output is unchanged by it.
     this.crew = crew;
+    // Browser prediction simulates only the local operative. Exact claims from the newest
+    // authoritative snapshot live here as key -> seat and are replaced wholesale each time;
+    // accumulating them would leave a disconnected welder owning a point forever.
+    this.externalClaims = new Map();
+    // The authority chooses the exact point for generic repair intent. Once a snapshot names
+    // this operative's point, prediction prefers that key while it remains a valid free target;
+    // otherwise two points inside one overlap can disagree forever inside position dead-zone.
+    this.authorityTarget = null;
 
     this.target = null;    // { kind: "leg" | "reactor", index?, label, key }
     this.progress = 0;     // 0..1 of the target's health
@@ -68,6 +76,26 @@ export class Repair {
     this.completions = 0;
 
     this.#buildMarkers();
+  }
+
+  /** Replace the remote point claims supplied by the newest authoritative snapshot. */
+  setExternalClaims(claims = []) {
+    this.externalClaims.clear();
+    for (const claim of claims) {
+      const seat = Number(claim?.seat);
+      const key = claim?.key;
+      if (!Number.isInteger(seat) || seat <= 0) continue;
+      if (key !== "reactor" && !/^leg:\d+$/.test(key ?? "")) continue;
+      const current = this.externalClaims.get(key);
+      // Duplicate ownership is an authority fault, but choosing the earlier seat keeps the
+      // client deterministic and matches the simulation's join-order tie break.
+      if (current === undefined || seat < current) this.externalClaims.set(key, seat);
+    }
+  }
+
+  /** Replace the exact point authority selected for this predicted operative. */
+  setAuthorityTarget(key = null) {
+    this.authorityTarget = key === "reactor" || /^leg:\d+$/.test(key ?? "") ? key : null;
   }
 
   /** A lit ring on the ground under each leg, shown only when it needs work. */
@@ -126,28 +154,27 @@ export class Repair {
   }
 
   /**
-   * The operative already working `key`, or null. Never this one.
+   * Seat of the operative already working `key`, or zero. Never this one.
    *
-   * Read off the other operatives rather than off a registry of Repair instances,
-   * because the crew is already the authority on who exists: an operative who leaves the
-   * crew stops being iterated, so their claim goes with them and there is no release
-   * path to forget. That is the same reason the reactor recounts its engagement slots
-   * from scratch every frame instead of keeping a running total -- a claim maintained
-   * across frames drifts, and a drifted claim fails silently.
+   * A full authority reads the live Crew. Browser prediction has only its local Player, so
+   * the newest snapshot supplies the same exact question through `externalClaims`. Both are
+   * absolute state: leaving the crew or disappearing from a snapshot releases the point
+   * without a second cleanup path that can drift.
    */
-  #claimant(key) {
-    // Deliberately NOT guarded against a missing crew. A `if (!this.crew) return null`
+  #claimantSeat(key) {
+    // Deliberately NOT guarded against a missing crew. A `if (!this.crew) return 0`
     // here would turn "somebody forgot to wire the roster" into "the one-welder rule
     // quietly stopped applying", which is unobservable solo and reads as a balance
     // problem in co-op. Let it throw on the first frame instead.
     for (const other of this.crew) {
       if (other === this.player) continue;
-      if (other.repairing === key) return other;
+      if (other.repairing === key) return this.crew.seatOf(other);
     }
-    return null;
+    return this.externalClaims.get(key) ?? 0;
   }
 
-  update(dt, input) {
+  /** Decide whether repair owns the carried hands from this frame's final position. */
+  admit(dt, input) {
     this.#updateMarkers();
 
     // Cleared here and rebuilt from this frame's conditions at the bottom, never
@@ -166,7 +193,10 @@ export class Repair {
     const t = this.trampler;
     const r = CFG.repair;
     const holding = input.down(r.key);
-    this.threatened = this.#underThreat();
+    // A snapshot preference reconciles one continuous hold. Releasing starts a new choice;
+    // retaining the old key across a release could pull the next press back to a point the
+    // operative deliberately left.
+    if (!holding) this.authorityTarget = null;
 
     // Every point in reach, rather than the single nearest, because the choice is now
     // two-pass: a free point beats a closer one somebody else is already welding. A
@@ -200,11 +230,18 @@ export class Repair {
     // Nearest free point; failing that, the nearest point at all, so a fully claimed
     // area still names what is happening instead of offering nothing. A refusal that
     // shows the player an empty prompt sends them to fix the wrong thing.
-    const free = found.find((c) => !this.#claimant(c.target.key));
+    // The newest exact authority result wins among still-valid free points. This is only a
+    // tie-break over targets prediction can genuinely reach; it cannot grant range, health or
+    // ownership. Without it, centimetre-scale position disagreement inside the correction
+    // dead-zone can leave client and authority repairing different legs indefinitely.
+    const authoritative = this.authorityTarget
+      ? found.find((c) => c.target.key === this.authorityTarget
+        && this.#claimantSeat(c.target.key) === 0)
+      : null;
+    const free = authoritative ?? found.find((c) => this.#claimantSeat(c.target.key) === 0);
     const pick = free ?? found[0] ?? null;
     const best = pick?.target ?? null;
-    const heldBy = best ? this.#claimant(best.key) : null;
-    this.takenBy = heldBy ? this.crew.seatOf(heldBy) : 0;
+    this.takenBy = best ? this.#claimantSeat(best.key) : 0;
 
     // Hold the interaction through short gaps, so jogging along under a moving
     // hull does not keep dropping it.
@@ -231,15 +268,27 @@ export class Repair {
     // through brief drift, never the progress.
     //
     // `takenBy` refuses outright rather than slowing, which is the opposite of the
-    // contested rule two lines down, and deliberately so: contested repair is a trade
+    // contested rule applied by `work`, and deliberately so: contested repair is a trade
     // the player can choose to make, while a second welder on one leg is not a trade at
     // all -- it is the same job done twice. The prompt says which of the two it is.
     this.active = holding && !!best && this.takenBy === 0;
-    if (!this.active) return;
 
     // Claimed only once the work is genuinely happening, so standing beside a leg
     // without pressing the key never locks a teammate out of it.
-    this.player.repairing = this.target.key;
+    if (this.active) this.player.repairing = this.target.key;
+  }
+
+  /** Apply admitted work after personal and station weapons have resolved this frame. */
+  work(dt) {
+    // This sample deliberately remains in repair's old post-weapon slot. A gun that clears
+    // the final nearby hostile earns full-rate repair on that same tick; moving the sample
+    // into admission would silently change contested timing and mounted-gun behaviour.
+    this.threatened = this.#underThreat();
+    if (!this.active || !this.target) return;
+
+    const t = this.trampler;
+    const r = CFG.repair;
+    const tgt = this.target;
 
     // Contested work is slowed, not stopped. Your own health is the real limit on
     // standing here, and a hard stop would break co-op: it measures hostiles near
@@ -255,5 +304,11 @@ export class Repair {
       t.repairReactor(r.reactorRate * rate * dt);
       if (!wasFull && t.reactorHp >= t.maxReactorHp) this.completions++;
     }
+  }
+
+  /** One-call form for focused callers that do not interleave weapon resolution. */
+  update(dt, input) {
+    this.admit(dt, input);
+    this.work(dt);
   }
 }

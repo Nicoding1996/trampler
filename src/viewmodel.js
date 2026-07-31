@@ -16,9 +16,9 @@ import { damp, makeRandom } from "./util.js";
 // traversed if the camera itself is in the graph.
 //
 // It is hidden whenever something else owns the player's hands -- manning a
-// station, mid-grapple, mid-mantle -- which is also a legibility win, because
-// those are exactly the states where the player has lost normal control and
-// should be able to see that.
+// station, mid-grapple, mid-mantle, or actively repairing -- which is also a
+// legibility win, because those are exactly the states where the player has lost
+// normal weapon control and should be able to see that.
 
 const HOME = new THREE.Vector3(0.23, -0.21, -0.44);
 
@@ -217,12 +217,18 @@ export class ViewModel {
     const { player, weapon, grapple, input } = ctx;
 
     // Hidden whenever something else owns the hands. Manning a gun, being reeled
-    // by the winch, and mid-climb are all states where the player is not in normal
-    // control, and seeing the rifle vanish is a clearer signal of that than any
-    // HUD row.
-    const hide = !!player.station || grapple.active || player.mantle.active;
+    // by the winch, mid-climb, and actively repairing are all states where the
+    // player is not in normal weapon control. Reading admitted repair state rather
+    // than raw E keeps the weapon visible when no work can actually happen.
+    const hide = !!player.station
+      || grapple.active
+      || player.mantle.active
+      || !!player.repairing;
     if (this.group.visible === hide) this.group.visible = !hide;
-    if (hide) return;
+    // Existing driven states are brief and retain their original frozen pose. Repair can last
+    // for seconds, so keep its hidden model ticking: recoil and sway must settle rather than
+    // reappearing exactly where they were when the welder came out.
+    if (hide && !player.repairing) return;
 
     // Show only the weapon actually in hand.
     //
