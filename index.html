@@ -583,95 +583,316 @@
   #help .note { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--panel-edge); opacity: 0.78; }
   #help .dismiss { margin-top: 14px; text-align: center; color: var(--ink-dim); letter-spacing: 0.14em; font-size: 11px; }
 
-  /* ---- click to play ---- */
+  /* ---- launch gate ---------------------------------------------------------
+     The scene is already rendering behind this layer, so the landing screen treats it as
+     the view through a darkened command shelter instead of replacing it with another image.
+     No downloaded title art, no extra GPU work, and no second visual language to maintain.
+
+     Content stays deliberately spare. The prototype must teach its deck/ground rhythm through
+     geometry, not explain the answer before the test begins; the gate names the machine, gets
+     the player in, preserves the one unlearnable grapple hint, and offers the optional crew link. */
   #gate {
-    position: fixed; inset: 0; display: grid; place-content: center; text-align: center;
+    position: fixed; inset: 0; z-index: 20; isolation: isolate;
+    display: grid;
+    grid-template-columns: minmax(360px, 620px) minmax(300px, 400px);
+    grid-template-rows: repeat(8, auto);
+    align-content: center; justify-content: center; align-items: center;
+    column-gap: clamp(48px, 8vw, 132px);
+    padding: clamp(34px, 5vw, 78px);
+    overflow: auto; cursor: pointer; text-align: left;
     background:
-      radial-gradient(ellipse at 50% 40%, rgba(60,40,20,0.35), rgba(6,6,8,0.94) 70%),
-      #06060a;
-    cursor: pointer; z-index: 20; gap: 4px;
+      repeating-linear-gradient(118deg,
+        rgba(255,255,255,0.018) 0 1px, transparent 1px 28px),
+      linear-gradient(90deg,
+        rgba(5,6,7,0.97) 0%, rgba(7,7,8,0.92) 38%,
+        rgba(7,7,8,0.58) 68%, rgba(5,6,7,0.82) 100%),
+      radial-gradient(ellipse at 72% 42%, rgba(150,82,36,0.18), transparent 52%);
   }
-  /* Loading owns the gate, not the lobby CTA: multiplayer still needs to say whether it is
-     waiting for a crewmate or a host while the renderer prepares. The status is supplied by a
-     data attribute so it cannot become another permanent HUD box after the gate closes. */
-  #gate.loading { cursor: wait; }
-  #gate.loading .cta { animation: none; opacity: 0.32; color: var(--ink-dim); }
-  #gate.loading::after {
-    content: attr(data-loading); position: absolute; left: 50%; bottom: 30px;
-    transform: translateX(-50%); white-space: nowrap;
-    color: var(--brass); font-size: 10px; letter-spacing: 0.18em;
+  /* One stamped perimeter and four corner braces. It frames the live scene without adding a
+     full-screen blur, which would be exactly the wrong cost to introduce during GPU warm-up. */
+  #gate::before {
+    content: ""; position: absolute; inset: 18px; z-index: 0; pointer-events: none;
+    border: 1px solid rgba(201,162,39,0.28);
+    clip-path: polygon(24px 0, 100% 0, 100% calc(100% - 24px),
+      calc(100% - 24px) 100%, 0 100%, 0 24px);
+    background:
+      linear-gradient(135deg, rgba(201,162,39,0.58) 0 2px, transparent 2px) top left / 78px 78px no-repeat,
+      linear-gradient(315deg, rgba(201,162,39,0.58) 0 2px, transparent 2px) bottom right / 78px 78px no-repeat;
+    box-shadow: inset 0 1px rgba(255,235,200,0.06), 0 0 80px rgba(0,0,0,0.36);
   }
-  #gate.hidden { display: none; }
-  /* Once play has begun, losing pointer lock pauses control ownership but does not reopen
-     session setup. Keep a dim click target so the browser can grant pointer lock again, and
-     hide every title/join child except the action and any real error. */
-  #gate.resume {
-    background: rgba(6,6,10,0.20);
-    backdrop-filter: blur(1px);
+  #gate > * { position: relative; z-index: 1; }
+
+  .gate-kicker {
+    grid-column: 1; grid-row: 1; width: min(100%, 560px);
+    display: flex; align-items: center; gap: 12px;
+    color: var(--brass); font-size: 10px; line-height: 1;
+    letter-spacing: 0.22em; text-transform: uppercase;
   }
-  #gate.resume > :not(.cta):not(.err) { display: none; }
-  #gate.resume .cta {
-    margin: 0; padding: 12px 18px;
-    background: rgba(12,12,14,0.86); border: 1px solid var(--brass);
-    box-shadow: 0 8px 26px rgba(0,0,0,0.55);
+  .gate-kicker::before {
+    content: ""; width: 22px; height: 7px; flex: 0 0 auto;
+    background: repeating-linear-gradient(90deg,
+      var(--warn) 0 3px, transparent 3px 6px);
+  }
+  .gate-kicker .code {
+    margin-left: auto; color: var(--ink-dim); letter-spacing: 0.16em;
   }
   #gate h1 {
-    margin: 0; font-size: 54px; letter-spacing: 0.36em; font-weight: 700;
-    color: var(--ink); text-shadow: 0 0 40px rgba(255,170,80,0.32);
+    grid-column: 1; grid-row: 2; margin: 18px 0 12px;
+    font-family: "Bahnschrift Condensed", "Arial Narrow", Impact, sans-serif;
+    font-size: clamp(72px, 7.4vw, 112px); font-weight: 800;
+    font-stretch: condensed; line-height: 0.78; letter-spacing: 0.12em;
+    color: #f1e6d3; text-transform: uppercase;
+    -webkit-text-stroke: 1px rgba(255,238,208,0.16);
+    text-shadow:
+      4px 4px 0 rgba(105,54,25,0.62),
+      0 0 48px rgba(255,158,69,0.20),
+      0 10px 34px rgba(0,0,0,0.76);
   }
+  /* The walking-fortress silhouette is an inline, zero-request schematic rather than title art.
+     Its six legs are the product identity in one glance, without explaining the test's answer. */
   #gate .rule {
-    height: 1px; margin: 10px auto 14px; width: 320px;
-    background: linear-gradient(90deg, transparent, var(--brass), transparent);
+    grid-column: 1; grid-row: 3; width: min(100%, 560px); height: 48px;
+    display: flex; align-items: center; gap: 16px; margin: 2px 0 8px;
   }
-  #gate p { margin: 0; color: var(--ink-dim); font-size: 13px; line-height: 1.7; }
+  #gate .rule::before, #gate .rule::after {
+    content: ""; height: 1px; flex: 1;
+    background: linear-gradient(90deg, transparent, rgba(201,162,39,0.72));
+  }
+  #gate .rule::after { background: linear-gradient(90deg, rgba(201,162,39,0.72), transparent); }
+  #gate .rule svg {
+    width: 132px; height: 48px; flex: 0 0 auto; overflow: visible;
+    color: var(--brass); filter: drop-shadow(0 0 8px rgba(201,162,39,0.20));
+  }
+  #gate .rule .hull { fill: rgba(201,162,39,0.10); stroke: currentColor; stroke-width: 1.4; }
+  #gate .rule .line { fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: square; }
+  #gate .rule .fine { fill: none; stroke: rgba(244,236,221,0.45); stroke-width: 0.8; }
+  .gate-class {
+    grid-column: 1; grid-row: 4; margin: 0;
+    color: rgba(244,236,221,0.68); font-size: 11px;
+    letter-spacing: 0.26em; text-transform: uppercase;
+  }
+  .gate-class span { color: var(--warn); }
 
-  /* ---- multiplayer, on the gate ----
-     No `position: fixed` anywhere in here on purpose. #gate is a grid and these are
-     flow children of it, which keeps them out of test 67's derived box set -- that
-     set is panels plus anything fixed the HUD writes into, and a join menu is
-     neither. Styled to match the gate rather than the HUD, because it belongs to the
-     moment before the run. */
-  #mp { margin-top: 18px; display: grid; gap: 7px; justify-items: center; }
-  .mp-row { display: flex; gap: 8px; align-items: center; }
-  #mp button {
-    font: inherit; font-size: 11px; letter-spacing: 0.18em;
-    padding: 7px 14px; cursor: pointer;
-    color: var(--ink); background: rgba(20,16,12,0.72);
-    border: 1px solid var(--brass);
+  #gate .cta {
+    grid-column: 1; grid-row: 5; justify-self: start;
+    width: min(340px, 100%); min-height: 48px; margin-top: 26px;
+    display: grid; place-items: center; padding: 13px 42px 13px 54px;
+    color: #ffd18b; background:
+      linear-gradient(180deg, rgba(80,49,27,0.76), rgba(24,19,16,0.92));
+    border: 1px solid rgba(255,179,71,0.78);
+    clip-path: polygon(12px 0, 100% 0, 100% calc(100% - 12px),
+      calc(100% - 12px) 100%, 0 100%, 0 12px);
+    box-shadow:
+      0 12px 30px rgba(0,0,0,0.50),
+      inset 0 1px rgba(255,228,184,0.18),
+      0 0 0 1px rgba(0,0,0,0.55);
+    font-size: 13px; line-height: 1.3; letter-spacing: 0.24em;
+    text-align: center; text-transform: uppercase;
+    animation: gateSignal 2.4s ease-in-out infinite;
   }
-  #mp button:hover { background: rgba(255,170,80,0.16); }
+  #gate .cta::before {
+    content: "▶"; position: absolute; left: 20px; top: 50%;
+    transform: translateY(-52%); color: var(--warn); font-size: 10px;
+  }
+  #gate .cta::after {
+    content: ""; position: absolute; left: 14px; right: 14px; bottom: 5px; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(255,179,71,0.72), transparent);
+  }
+  @keyframes gateSignal {
+    0%, 100% { border-color: rgba(255,179,71,0.52); color: #eabf7b; }
+    50% { border-color: rgba(255,196,112,0.98); color: #ffe1ad;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.50), inset 0 1px rgba(255,228,184,0.20),
+        0 0 18px rgba(255,153,55,0.12); }
+  }
+
+  #gate p { color: var(--ink-dim); font-size: 12px; line-height: 1.65; }
+  #gate .one { grid-column: 1; grid-row: 6; margin: 12px 0 0; }
+  #gate .keys { grid-column: 1; grid-row: 7; margin: 15px 0 0; }
+  #gate b { color: var(--accent); font-weight: 700; }
+
+  /* Loading owns the gate, not the lobby CTA: multiplayer still needs to say whether it is
+     waiting for a crewmate or a host while the renderer prepares. The data attribute remains
+     separate from CTA text, and the thin sweep says work is happening without inventing a
+     percentage the loaders cannot honestly provide. */
+  #gate.loading { cursor: wait; }
+  #gate.loading .cta { animation: none; opacity: 0.42; color: var(--ink-dim); filter: saturate(0.5); }
+  #gate.loading .cta::before { content: "◆"; }
+  #gate.loading .cta::after {
+    height: 2px; background: linear-gradient(90deg,
+      transparent 0%, var(--warn) 42%, #ffe0a3 50%, var(--warn) 58%, transparent 100%);
+    background-size: 220% 100%; animation: gateLoadSweep 1.6s linear infinite;
+  }
+  @keyframes gateLoadSweep { from { background-position: 120% 0; } to { background-position: -120% 0; } }
+  #gate.loading::after {
+    content: "// " attr(data-loading); position: absolute; z-index: 2;
+    left: 50%; bottom: 28px; transform: translateX(-50%); white-space: nowrap;
+    padding: 7px 12px 6px; color: var(--brass);
+    background: rgba(7,7,8,0.74); border-left: 2px solid rgba(201,162,39,0.66);
+    font-size: 10px; letter-spacing: 0.18em;
+  }
+  #gate.hidden { display: none; }
+
+  /* Once play has begun, pointer-lock loss is a resume target, not a second title screen.
+     All setup children remain direct gate children so this selector also protects future
+     decorative additions from leaking back over a live run. */
+  #gate.resume {
+    grid-template-columns: 1fr; grid-template-rows: 1fr auto 1fr;
+    place-content: stretch; place-items: center; padding: 0;
+    background: rgba(6,6,10,0.28); overflow: hidden;
+  }
+  #gate.resume::before { opacity: 0.38; }
+  #gate.resume::after { display: none; }
+  #gate.resume > :not(.cta):not(.err) { display: none; }
+  #gate.resume .cta {
+    grid-column: 1; grid-row: 2; justify-self: center; margin: 0;
+    width: min(340px, calc(100vw - 40px));
+  }
+  #gate.resume .err {
+    grid-column: 1; grid-row: 3; align-self: start; justify-self: center;
+  }
+
+  /* ---- multiplayer, on the gate ------------------------------------------
+     This is a crew manifest plate, not a second menu. It stays in gate flow rather than
+     becoming position:fixed, preserving the HUD-zone invariant and the event boundary Net
+     already owns: clicks inside #mp never bubble into the play gesture. */
+  #mp {
+    grid-column: 2; grid-row: 1 / span 7; align-self: center;
+    width: min(100%, 400px); margin: 0; padding: 24px 22px 22px;
+    display: grid; gap: 10px; justify-items: stretch; cursor: default;
+    color: var(--ink); background:
+      repeating-linear-gradient(135deg,
+        rgba(255,255,255,0.016) 0 1px, transparent 1px 12px),
+      linear-gradient(180deg, rgba(43,35,29,0.94), rgba(13,13,14,0.94));
+    border: 1px solid rgba(201,162,39,0.42);
+    clip-path: polygon(16px 0, 100% 0, 100% calc(100% - 16px),
+      calc(100% - 16px) 100%, 0 100%, 0 16px);
+    box-shadow: 0 22px 60px rgba(0,0,0,0.58), inset 0 1px rgba(255,235,200,0.10);
+  }
+  #mp::before {
+    content: ""; position: absolute; inset: 8px; z-index: 0; pointer-events: none;
+    border: 1px solid rgba(255,226,178,0.08);
+    clip-path: inherit;
+  }
+  #mp > * { position: relative; z-index: 1; }
+  .mp-head {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+    margin-bottom: 5px; padding-bottom: 10px;
+    border-bottom: 1px solid rgba(201,162,39,0.30);
+  }
+  .mp-head .label {
+    color: var(--brass); font-size: 12px; letter-spacing: 0.22em; text-transform: uppercase;
+  }
+  .mp-head .sub {
+    color: var(--ink-dim); font-size: 8px; letter-spacing: 0.14em; text-transform: uppercase;
+  }
+  .mp-row { display: flex; gap: 8px; align-items: center; justify-content: center; min-width: 0; }
+  .mp-connect { display: grid; grid-template-columns: auto minmax(96px, 1fr) auto; }
+  #mp button, #mp input { min-height: 40px; }
+  #mp button {
+    font: inherit; font-size: 10px; font-weight: 700; letter-spacing: 0.18em;
+    padding: 8px 14px; cursor: pointer; text-transform: uppercase;
+    color: var(--ink); background: linear-gradient(180deg, rgba(78,52,30,0.78), rgba(22,18,15,0.92));
+    border: 1px solid rgba(201,162,39,0.68);
+    clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
+  }
+  #mp button:hover { color: #ffe1ad; background: linear-gradient(180deg, rgba(108,66,32,0.88), rgba(29,21,16,0.96)); }
+  #mp button:focus-visible, #mp input:focus-visible {
+    /* The buttons are clip-pathed, so an outward outline is clipped away with the corners. */
+    outline: 2px solid var(--accent); outline-offset: -3px;
+  }
   #mp input {
-    font: inherit; font-size: 11px; letter-spacing: 0.30em; text-align: center;
-    text-transform: uppercase; width: 108px; padding: 7px 8px;
-    color: var(--ink); background: rgba(0,0,0,0.5);
-    border: 1px solid rgba(255,170,80,0.34);
+    width: 100%; min-width: 0; padding: 8px;
+    font: inherit; font-size: 12px; letter-spacing: 0.30em;
+    text-align: center; text-transform: uppercase;
+    color: var(--ink); background: rgba(0,0,0,0.54);
+    border: 1px solid rgba(255,170,80,0.34); border-radius: 0;
   }
   #mp input::placeholder { color: var(--ink-dim); letter-spacing: 0.18em; }
-  #mp-status { color: var(--ink-dim); font-size: 10px; letter-spacing: 0.16em; min-height: 12px; }
-  #mp-crew { color: var(--brass); font-size: 10px; letter-spacing: 0.16em; min-height: 12px; }
-  /* Smaller than HOST and JOIN: it is a convenience next to the code, not a third
-     thing to choose between. */
-  #mp-copy { font-size: 9px; padding: 4px 9px; letter-spacing: 0.14em; }
+  #mp-status, #mp-crew {
+    width: 100%; min-height: 18px; padding: 4px 0 3px 10px;
+    border-left: 2px solid rgba(201,162,39,0.44);
+    font-size: 9px; line-height: 1.45; letter-spacing: 0.13em; text-align: left;
+  }
+  #mp-status { color: var(--ink-dim); }
+  #mp-crew { color: var(--brass); overflow-wrap: anywhere; }
+  #mp .mp-roster { justify-content: flex-start; }
+  #mp-copy {
+    flex: 0 0 auto; min-height: 28px; padding: 4px 9px;
+    font-size: 8px; letter-spacing: 0.12em;
+  }
   #mp-copy[hidden] { display: none; }
-  /* Deliberately in the warning colour and deliberately NOT dimmed. This is the one
-     line on the gate that corrects an expectation the rest of it creates. */
   #mp-scope {
-    color: var(--warn); font-size: 10px; letter-spacing: 0.12em;
-    max-width: 340px; line-height: 1.5; text-align: center;
+    width: 100%; color: var(--warn); font-size: 9px; line-height: 1.55;
+    letter-spacing: 0.09em; text-align: left;
+    margin-top: 2px; padding: 9px 10px;
+    background: rgba(255,179,71,0.055); border: 1px solid rgba(255,179,71,0.17);
   }
   #mp-scope:empty { display: none; }
-  /* The hint is tucked under the call to action deliberately, so "how to start" and
-     "the one thing to know when you do" read as a single block rather than as two
-     competing lines. The controls key is pushed clear of both. */
-  #gate .one { margin-top: 12px; }
-  #gate .keys { margin-top: 22px; }
-  #gate b { color: var(--accent); }
-  #gate .cta {
-    margin-top: 22px; font-size: 13px; letter-spacing: 0.24em; color: var(--warn);
-    animation: breathe 2.4s ease-in-out infinite;
+
+  #gate .err {
+    grid-column: 1 / span 2; grid-row: 8; justify-self: center;
+    min-height: 18px; max-width: 680px; margin-top: 18px;
+    color: var(--bad); font-size: 11px; line-height: 1.5; text-align: center;
   }
-  @keyframes breathe { 0%,100% { opacity: 0.55; } 50% { opacity: 1; } }
-  #gate .err { margin-top: 18px; color: var(--bad); font-size: 12px; max-width: 520px; }
+
+  /* Stack into one launch card on narrower screens. Gate scroll is intentional: multiplayer
+     status can grow after connection, and clipping the refusal would be worse than scrolling. */
+  @media (max-width: 900px) {
+    #gate {
+      grid-template-columns: minmax(0, 560px); grid-template-rows: none;
+      align-content: start; justify-content: center;
+      padding: 52px 24px 78px; row-gap: 0;
+      text-align: center;
+      background:
+        repeating-linear-gradient(118deg, rgba(255,255,255,0.016) 0 1px, transparent 1px 24px),
+        linear-gradient(180deg, rgba(5,6,7,0.94), rgba(7,7,8,0.72) 66%, rgba(5,6,7,0.92));
+    }
+    #gate::before { inset: 10px; }
+    #gate > .gate-kicker, #gate > h1, #gate > .rule, #gate > .gate-class,
+    #gate > .cta, #gate > .one, #gate > .keys, #gate > #mp, #gate > .err {
+      grid-column: 1; grid-row: auto;
+    }
+    .gate-kicker { width: 100%; }
+    #gate h1 { font-size: clamp(62px, 14vw, 96px); margin-top: 24px; }
+    #gate .rule { margin-left: auto; margin-right: auto; }
+    .gate-class { text-align: center; }
+    #gate .cta { justify-self: center; margin-top: 24px; }
+    #gate .one, #gate .keys { text-align: center; }
+    #mp { justify-self: center; margin-top: 30px; }
+    #gate .err { grid-column: 1; }
+    #gate.resume { align-content: stretch; padding: 0; }
+    #gate.resume .cta { grid-row: 2; }
+    #gate.resume .err { grid-row: 3; }
+  }
+  @media (max-width: 480px) {
+    #gate { padding: 42px 17px 78px; }
+    #gate h1 { font-size: clamp(52px, 15vw, 72px); letter-spacing: 0.09em; }
+    .gate-kicker { font-size: 8px; letter-spacing: 0.15em; }
+    .gate-kicker .code { letter-spacing: 0.10em; }
+    #gate .rule { gap: 9px; }
+    #gate .rule svg { width: 112px; }
+    .gate-class { font-size: 9px; letter-spacing: 0.18em; }
+    #gate .cta { padding-left: 42px; padding-right: 28px; }
+    #mp { padding: 21px 14px 18px; }
+    .mp-connect { grid-template-columns: auto minmax(82px, 1fr) auto; gap: 5px; }
+    #mp button { padding: 8px 9px; letter-spacing: 0.10em; }
+    #mp input { padding: 8px 5px; letter-spacing: 0.20em; }
+    .mp-head .sub { display: none; }
+    #gate.loading::after { max-width: calc(100vw - 40px); white-space: normal; text-align: center; }
+  }
+  @media (min-width: 901px) and (max-height: 720px) {
+    #gate { padding: 26px 48px; column-gap: clamp(42px, 6vw, 92px); }
+    #gate h1 { font-size: clamp(64px, 7vw, 84px); margin: 13px 0 8px; }
+    #gate .rule { height: 38px; margin-bottom: 4px; }
+    #gate .rule svg { height: 38px; }
+    #gate .cta { margin-top: 16px; min-height: 44px; }
+    #gate .one { margin-top: 8px; }
+    #gate .keys { margin-top: 9px; }
+    #mp { padding: 18px 18px 16px; gap: 7px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #gate .cta, #gate.loading .cta::after { animation: none; }
+  }
 </style>
 <!--
   Served from vendor/ rather than node_modules/, because static hosts routinely
@@ -962,11 +1183,23 @@
        help panel already.
 
        The action is second now rather than last, and the hint sits under it so the two
-       read as one block. Its visual WEIGHT is a separate change and has not been made:
-       13px --warn breathing to 0.55 is still the faintest thing here. -->
+       read as one block. The prominent launch control carries the visual hierarchy;
+       loading only dims it and adds an honest activity sweep while Net retains ownership
+       of its lobby-specific text. -->
   <div id="gate">
+    <div class="gate-kicker" aria-hidden="true">
+      <span>Fortress system</span><span class="code">TRM-01 // field test</span>
+    </div>
     <h1>TRAMPLER</h1>
-    <div class="rule"></div>
+    <div class="rule" aria-hidden="true">
+      <svg viewBox="0 0 132 48" focusable="false">
+        <path class="hull" d="M12 19H111L121 24L111 30H21L10 25Z" />
+        <path class="line" d="M43 19V9H80V19M62 9V3M62 3H74M80 13H101L109 9" />
+        <path class="line" d="M24 29L20 43H14M39 30L36 44H30M54 30L52 44H46M79 30L82 44H88M95 30L99 44H105M108 29L114 43H121" />
+        <path class="fine" d="M18 23H115M49 13H75M29 26H103" />
+      </svg>
+    </div>
+    <p class="gate-class">Walking fortress <span>//</span> siege protocol</p>
     <div class="cta">CLICK TO PLAY</div>
     <p class="one"><b>RIGHT MOUSE</b> grapples you aboard &mdash; it is the only way up.</p>
     <p class="keys"><b>H</b> controls</p>
@@ -977,21 +1210,25 @@
          `inset: 0` so the zone check skips it as a full-bleed layer. A join menu is
          not a readout and should not be competing with the health bars for a corner.
 
-         Clicks and keystrokes inside here are stopped from bubbling by net.js -- the
-         gate's own click starts the game, and keydown is bound to window, so without
-         that, typing a code would fire game keys. -->
-    <div id="mp">
-      <div class="mp-row">
+         Clicks inside here are stopped from bubbling by net.js, because the gate's own
+         click starts the game. The code field keeps keyboard focus inside the crew plate;
+         Input independently rejects all gameplay keys until pointer lock is owned. -->
+    <div id="mp" role="group" aria-labelledby="mp-title">
+      <div class="mp-head">
+        <span class="label" id="mp-title">Crew link</span>
+        <span class="sub">optional multiplayer</span>
+      </div>
+      <div class="mp-row mp-connect">
         <button id="mp-host" type="button">HOST</button>
         <input id="mp-code" type="text" maxlength="7" placeholder="CODE"
                autocomplete="off" spellcheck="false" aria-label="Join code">
         <button id="mp-join" type="button">JOIN</button>
       </div>
-      <div id="mp-status"></div>
+      <div id="mp-status" aria-live="polite"></div>
       <!-- The crew line and a copy button, in one row: the code is the invite, so
            selecting six characters by hand was the friction between hosting and
            actually getting somebody in. Hidden until there is a code to copy. -->
-      <div class="mp-row">
+      <div class="mp-row mp-roster">
         <div id="mp-crew"></div>
         <button id="mp-copy" type="button" hidden>COPY LINK</button>
       </div>
@@ -1001,7 +1238,7 @@
       <div id="mp-scope"></div>
     </div>
 
-    <div class="err" id="gate-err"></div>
+    <div class="err" id="gate-err" role="alert"></div>
   </div>
 
   <script type="module" src="./src/main.js"></script>
