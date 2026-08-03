@@ -23,8 +23,11 @@ export class Input {
     // and join form on top of a run that never actually ended.
     this.hasLocked = false;
 
-    // Ignore browser key repeat so "just pressed" stays a single event.
+    // Ignore browser key repeat so "just pressed" stays a single event. Pointer lock is
+    // control ownership: keys pressed while the gate or another application owns the cursor
+    // must never become gameplay intent or survive into the first fixed step.
     addEventListener("keydown", (e) => {
+      if (!this.locked) return;
       if (e.code === "Tab") e.preventDefault();
       if (e.repeat) return;
       const purchase = this.purchaseOwnerResolver?.(e.code);
@@ -67,10 +70,15 @@ export class Input {
       this.mouse.dy += e.movementY;
     });
 
-    gate.addEventListener("click", () => canvas.requestPointerLock());
+    gate.addEventListener("click", () => {
+      if (this.ready) canvas.requestPointerLock();
+    });
     document.addEventListener("pointerlockchange", () => {
       this.locked = document.pointerLockElement === canvas;
       if (this.locked) {
+        // The ready-but-unlocked gate may have been open for an arbitrary time. Start every
+        // ownership period neutral instead of inheriting a key or edge from before the lock.
+        this.clear();
         this.hasLocked = true;
         gate.classList.remove("resume");
         gate.classList.add("hidden");
@@ -84,6 +92,20 @@ export class Input {
         if (this.cta) this.cta.textContent = "CLICK TO RESUME";
       }
     });
+  }
+
+  /** The first pointer-lock gesture is accepted only after assets and shaders are ready. */
+  get ready() {
+    return !this.gate.classList.contains("loading");
+  }
+
+  setReady() {
+    // Loading can finish after keys were pressed against the page but before this version's
+    // unlocked-key guard ran (for example across a hot reload). Readiness always begins neutral.
+    this.clear();
+    this.gate.classList.remove("loading");
+    this.gate.removeAttribute("aria-busy");
+    delete this.gate.dataset.loading;
   }
 
   /** Resolve the number-key owner at DOM-event time; undefined means this key is unrelated. */

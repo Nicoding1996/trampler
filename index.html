@@ -591,6 +591,16 @@
       #06060a;
     cursor: pointer; z-index: 20; gap: 4px;
   }
+  /* Loading owns the gate, not the lobby CTA: multiplayer still needs to say whether it is
+     waiting for a crewmate or a host while the renderer prepares. The status is supplied by a
+     data attribute so it cannot become another permanent HUD box after the gate closes. */
+  #gate.loading { cursor: wait; }
+  #gate.loading .cta { animation: none; opacity: 0.32; color: var(--ink-dim); }
+  #gate.loading::after {
+    content: attr(data-loading); position: absolute; left: 50%; bottom: 30px;
+    transform: translateX(-50%); white-space: nowrap;
+    color: var(--brass); font-size: 10px; letter-spacing: 0.18em;
+  }
   #gate.hidden { display: none; }
   /* Once play has begun, losing pointer lock pauses control ownership but does not reopen
      session setup. Keep a dim click target so the browser can grant pointer lock again, and

@@ -203,6 +203,12 @@ export class Net {
     this.protocolError = "";
     this.simReady = false;
 
+    // Lobby admission waits for local art upload and shader preparation. A connected seat is
+    // eligible for an authoritative start, so joining earlier would let another browser start
+    // the run while this one is still behind a mandatory local gate.
+    this.graphicsReady = false;
+    this.pendingAdmission = null;
+
     // Multiplayer is a latched session mode, not a synonym for an open socket. Once a
     // client has chosen a lobby, losing the transport pauses at the last authority instead
     // of silently forking the same world into a new solo simulation.
@@ -260,7 +266,27 @@ export class Net {
 
   // ---- session --------------------------------------------------------------
 
+  /** Open any invite, join, or host request that arrived while graphics were warming. */
+  setGraphicsReady() {
+    if (this.graphicsReady) return;
+    this.graphicsReady = true;
+
+    const pending = this.pendingAdmission;
+    this.pendingAdmission = null;
+    if (!pending) return;
+
+    if (pending.kind === "host") void this.host();
+    else void this.join(pending.code);
+  }
+
   async host() {
+    if (!this.graphicsReady) {
+      // Latest explicit choice wins over an invite that may have queued at construction.
+      this.pendingAdmission = { kind: "host" };
+      this.#say("PREPARING GRAPHICS BEFORE HOSTING…");
+      return false;
+    }
+
     this.#say("MINTING…");
     try {
       const res = await fetch(`${this.base}/lobby/new`, { method: "POST" });
@@ -275,6 +301,11 @@ export class Net {
   async join(rawCode) {
     const code = (rawCode ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
     if (code.length !== 6) return this.#fail("a code is six characters");
+    if (!this.graphicsReady) {
+      this.pendingAdmission = { kind: "join", code };
+      this.#say(`PREPARING GRAPHICS BEFORE JOINING ${code}…`);
+      return false;
+    }
 
     this.leave();
     this.#say(`JOINING ${code}…`);
@@ -338,6 +369,10 @@ export class Net {
    * least two operatives are present.
    */
   start() {
+    if (!this.graphicsReady) {
+      this.#say("PREPARING GRAPHICS…");
+      return false;
+    }
     if (!this.sessionActive || this.phase === "running" || this.phase === "starting") return false;
     if (!this.isHost) {
       this.#say(`WAITING FOR HOST SEAT ${this.hostSeat || "—"}`);
@@ -354,7 +389,7 @@ export class Net {
   }
 
   #tryStart() {
-    if (!this.startRequested || !this.connected || !this.isHost) return;
+    if (!this.graphicsReady || !this.startRequested || !this.connected || !this.isHost) return;
     if (this.phase !== "lobby" || this.crew.length < this.crewMin) return;
     try {
       this.socket.send(JSON.stringify({ t: "start" }));
@@ -414,6 +449,7 @@ export class Net {
   }
 
   leave() {
+    this.pendingAdmission = null;
     const socket = this.socket;
     this.socket = null;
     this.sessionActive = false;
@@ -1832,10 +1868,9 @@ export class Net {
     // starts the game. Without this, reaching for the join button starts a solo run.
     this.ui.panel.addEventListener("click", (e) => e.stopPropagation());
 
-    // Input.js binds keydown on WINDOW, and main.js runs toggles() whether or not
-    // the pointer is locked -- so typing a code would fire game keys, and a code
-    // containing K would restart the run mid-type. Stopping propagation here keeps
-    // the keystrokes in the field.
+    // Keep code entry local to the field. Input currently rejects every unlocked gameplay
+    // key, and stopping propagation here also prevents a future gate-level shortcut from
+    // claiming characters that belong to a join code.
     for (const type of ["keydown", "keyup"]) {
       this.ui.input.addEventListener(type, (e) => e.stopPropagation());
     }

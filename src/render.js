@@ -200,6 +200,15 @@ export class Post {
     this.#syncFxaaResolution();
   }
 
+  /** Discard one-time startup stalls before adaptive resolution begins measuring play. */
+  resetAdaptiveSamples() {
+    this.frameAccum = 0;
+    this.frameCount = 0;
+    this.sinceAdjust = 0;
+    this.lastMs = 0;
+    this.refreshMs = 0;
+  }
+
   #syncFxaaResolution() {
     if (!this.fxaa) return;
     const ratio = this.renderer.getPixelRatio();

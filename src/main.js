@@ -159,15 +159,130 @@ function boot() {
     };
   });
 
-  // Art is loaded asynchronously and applied to materials that already exist, so
-  // the first frames draw in flat colours and then dress themselves. A missing
-  // assets/ directory is a visual downgrade and nothing more.
-  Look.load(renderer, scene);
+  // Art remains optional, but play now waits until every available map is decoded, uploaded
+  // and represented in a compiled shader. Rendering continues behind the gate, so the page is
+  // responsive and the post chain warms while this runs; only control ownership is withheld.
+  gate.classList.add("loading");
+  gate.dataset.loading = "LOADING ART...";
+  gate.setAttribute("aria-busy", "true");
+  const artLoad = Look.load(renderer, scene);
+
+  // A failed optional warm-up already falls back to lazy rendering. Give a promise that never
+  // settles the same escape route: vendored local art should never consume this thirty-second
+  // backstop, but a suspended rAF or wedged driver must not make the play gate permanent.
+  const graphicsReadyBy = performance.now() + 30_000;
+  const adaptiveWasEnabled = post.adaptive;
+  post.adaptive = false;
+
+  function beforeGraphicsDeadline(stage, work) {
+    const remaining = graphicsReadyBy - performance.now();
+    if (remaining <= 0) {
+      return Promise.reject(new Error(`graphics warm-up timed out during ${stage}`));
+    }
+
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`graphics warm-up timed out during ${stage}`));
+      }, remaining);
+    });
+    return Promise.race([Promise.resolve().then(work), timeout])
+      .finally(() => clearTimeout(timer));
+  }
+
+  const nextPaint = (stage) => beforeGraphicsDeadline(
+    stage,
+    () => new Promise((resolve) => requestAnimationFrame(resolve)),
+  );
+
+  async function prepareGraphics() {
+    try {
+      await beforeGraphicsDeadline("art loading", () => artLoad);
+
+      // A TextureLoader callback means the image is decoded, not that WebGL has uploaded it.
+      // Force that last step under the gate instead of charging whichever gameplay frame first
+      // sees the material. The HDR background and PMREM are included defensively; PMREM normally
+      // initializes both while building the environment, and initTexture is idempotent.
+      const textures = new Set();
+      for (const set of Look.textures.values()) {
+        for (const texture of Object.values(set)) {
+          if (texture?.isTexture) textures.add(texture);
+        }
+      }
+      if (scene.background?.isTexture) textures.add(scene.background);
+      if (Look.env?.isTexture) textures.add(Look.env);
+
+      if (textures.size > 0) {
+        let uploaded = 0;
+        gate.dataset.loading = `PREPARING TEXTURES ${uploaded}/${textures.size}`;
+        await nextPaint("texture preparation");
+        for (const texture of textures) {
+          renderer.initTexture(texture);
+          uploaded++;
+          // One PBR set per paint. This keeps the loading indicator alive on a slow GPU
+          // without spreading uploads into interactive play.
+          if (uploaded % 3 === 0 || uploaded === textures.size) {
+            gate.dataset.loading = `PREPARING TEXTURES ${uploaded}/${textures.size}`;
+            await nextPaint("texture preparation");
+          }
+        }
+      }
+
+      // compileAsync traverses hidden meshes too, so this prepares tracers, impacts and the
+      // grapple as well as what the start camera can see. Compile twice because the muzzle light
+      // changes the active point-light count on a shot, which selects a different standard-
+      // material program. Fx would normally hide an expired flash each frame, so hold its timer
+      // open while the four-light variant finishes compiling.
+      gate.dataset.loading = "PREPARING SHADERS 1/2";
+      await nextPaint("shader preparation");
+      await beforeGraphicsDeadline(
+        "the first shader pass",
+        () => renderer.compileAsync(scene, camera),
+      );
+
+      const lightVisible = fx.muzzleLight.visible;
+      const lightIntensity = fx.muzzleLight.intensity;
+      const lightTimer = fx.muzzleTimer;
+      fx.muzzleLight.visible = true;
+      fx.muzzleLight.intensity = 0;
+      fx.muzzleTimer = Infinity;
+      gate.dataset.loading = "PREPARING SHADERS 2/2";
+      try {
+        await nextPaint("shader preparation");
+        await beforeGraphicsDeadline(
+          "the muzzle-light shader pass",
+          () => renderer.compileAsync(scene, camera),
+        );
+      } finally {
+        fx.muzzleLight.visible = lightVisible;
+        fx.muzzleLight.intensity = lightIntensity;
+        fx.muzzleTimer = lightTimer;
+      }
+    } catch (err) {
+      // Warm-up is a performance feature, never a startup requirement. The renderer's ordinary
+      // lazy path remains a working fallback just as flat materials remain one for missing art.
+      console.warn(`[startup] graphics warm-up unavailable: ${err.message}`);
+    } finally {
+      // Upload and compile stalls describe startup, not sustainable frame cost. Start the
+      // adaptive scaler with a clean history, then let queued lobby admission and pointer lock
+      // become available from the same readiness transition.
+      post.resetAdaptiveSamples();
+      post.adaptive = adaptiveWasEnabled;
+      input.setReady();
+      net.setGraphicsReady();
+    }
+  }
+  prepareGraphics();
 
   // Sound needs a real user gesture before a browser will allow an AudioContext,
-  // and the click-to-play gate is exactly that.
-  canvas.addEventListener("pointerdown", () => audio.start());
-  gate.addEventListener("click", () => audio.start());
+  // and the click-to-play gate is exactly that. A loading click is not that gesture:
+  // it neither owns control nor starts work the player cannot yet hear.
+  canvas.addEventListener("pointerdown", () => {
+    if (input.ready) audio.start();
+  });
+  gate.addEventListener("click", () => {
+    if (input.ready) audio.start();
+  });
 
   // AND TELL THE SERVER TO BEGIN, which is the message that makes anything shared at all.
   //
@@ -179,8 +294,12 @@ function boot() {
   // Bound to the same gesture as the mixer, and for the same reason: clicking the gate is the
   // one unambiguous "I am ready to play". The explicit current host alone may start, and
   // `net.start()` also holds the gesture until at least one crewmate is present.
-  gate.addEventListener("click", () => net.start());
-  canvas.addEventListener("pointerdown", () => net.start());
+  gate.addEventListener("click", () => {
+    if (input.ready) net.start();
+  });
+  canvas.addEventListener("pointerdown", () => {
+    if (input.ready) net.start();
+  });
 
   // Raycasting needs current world matrices. The renderer only refreshes them
   // at draw time, which is after the frame's grapple cast, so seed them once
@@ -614,7 +733,7 @@ function boot() {
       fpsFrames = 0;
     }
 
-    toggles();
+    if (!controlsSuspended) toggles();
 
     // THE SERVER'S CORRECTION GOES IN HERE, BEFORE ANY STEP, AND THE ORDER IS THE POINT.
     //
@@ -636,7 +755,7 @@ function boot() {
     net.applyPending(renderDt, frameMs / 1000);
     cameraPresentation.rebase(renderDt);
 
-    accumulator += absorbMs;
+    if (!controlsSuspended) accumulator += absorbMs;
     let steps = 0;
     while (accumulator >= STEP_MS) {
       accumulator -= STEP_MS;
