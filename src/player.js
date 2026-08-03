@@ -150,9 +150,25 @@ export class Player {
 
   // -------------------------------------------------------------------- frame
 
-  update(dt, input) {
+  /**
+   * Apply the pose changes that position-dependent actions need this step.
+   *
+   * The hull moves before operatives act. A player based on it therefore has to be
+   * carried into the new hull frame, and this command's look delta has to be applied,
+   * before a grapple or station interaction reads their position and facing. `update()`
+   * calls this too for standalone simulation callers; the guard keeps the explicit
+   * frame-loop call and that fallback from applying either change twice.
+   */
+  prepareStep(input) {
+    if (this.stepPrepared) return;
     this.#look(input);
     this.#applyBasedMovement();
+    this.stepPrepared = true;
+  }
+
+  update(dt, input) {
+    this.prepareStep(input);
+    this.stepPrepared = false;
 
     // Manning a station: it owns position and clamps the aim arc. No movement,
     // no jumping, no grapple, no mantle -- being stuck in place is the price of

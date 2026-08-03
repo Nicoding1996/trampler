@@ -440,9 +440,10 @@ trampler.update            hull moves first, so everything aboard inherits this 
 trampler.resolveStomps     footfalls resolve against where things actually are
 director.update            waves
 run.update                 offers a pick then roads if held; advances nothing itself
+player.prepareStep         apply look + hull carry before any action reads the pose
 handleStationInput         mount/dismount, so it takes effect the same frame
-grapple.handleInput        fire before the player, so a shot lands the frame it is pressed
-player.update              look, based movement, driven states, integrate, collide
+grapple.handleInput        fire before the player's driven movement
+player.update              driven states, integrate, collide, camera
 repair.admit               claims carried hands from current range, health and ownership
 weapon.update              active repair suppresses firing, not cooldown or aim scanning
 gun.update                 aim visuals, fire, heat

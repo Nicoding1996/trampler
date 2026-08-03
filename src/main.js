@@ -632,6 +632,9 @@ function boot() {
       }
     }
 
+    // Look and hull carry must be current before an action ray or range check reads them.
+    // Player.update calls this too as a guarded fallback for standalone simulation callers.
+    player.prepareStep(input);
     handleStationInput(guns, input, player);
     grapple.handleInput(input);
     player.update(dt, input);

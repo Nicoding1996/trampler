@@ -188,6 +188,8 @@ function step(sim, frames, hook, dt = DT) {
       sim.director.update(dt);
       sim.run.update();
     }
+    // Action rays and station range use this tick's look and hull-carried position.
+    sim.player.prepareStep(sim.input);
     handleStationInput(sim.guns, sim.input, sim.player);
     sim.grapple.handleInput(sim.input);
     sim.player.update(dt, sim.input);

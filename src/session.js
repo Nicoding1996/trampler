@@ -699,6 +699,10 @@ export function stepSession(sim, dt, authorityTick = null) {
     // untrusted and Horde clamps it into its bounded ring; shooter pose and geometry remain
     // current. Setting this per seat is essential because four clients can render four ticks.
     sim.horde.combatTick = Number.isFinite(input.clientTick) ? input.clientTick : null;
+    // Position-dependent actions must see both the hull's current transform and this
+    // command's look delta. In particular, a successful grapple detaches immediately;
+    // preparing afterwards would then skip the based carry and cast from the old pose.
+    op.player.prepareStep(input);
     handleStationInput(sim.guns, input, op.player);
     op.grapple.handleInput(input);
     op.player.update(dt, input);
@@ -1560,6 +1564,8 @@ export function stepSessionClient(sim, dt) {
     ?? sim.operatives[0];
 
   sim.trampler.update(dt);
+  // Mirror authority: actions use the current command's look and current hull-carried pose.
+  sim.player.prepareStep(input);
   handleStationInput(sim.guns, input, sim.player);
   sim.grapple.handleInput(input);
   sim.player.update(dt, input);
