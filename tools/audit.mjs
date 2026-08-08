@@ -581,7 +581,7 @@ console.log("\n7. Config knobs that nothing reads");
       if (value && typeof value === "object" && !Array.isArray(value)) {
         // Enemy type objects are read generically through enemyCfg(), so their
         // fields are looked up by name rather than by path.
-        const generic = /^enemies\.(chewer|climber|bulwark|burrower|sapper|titan)$/.test(here);
+        const generic = /^enemies\.(chewer|climber|bulwark|burrower|sapper|titan|spiker)$/.test(here);
         if (!generic) walk(value, here);
         continue;
       }

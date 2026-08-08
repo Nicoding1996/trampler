@@ -54,7 +54,7 @@ import { CFG } from "./config.js";
 import { Look, operativeGeometry } from "./look.js";
 import { clamp01, damp, lerp } from "./util.js";
 import {
-  commitHandsInput, decode, encodeInput, lerpSnapshot, SnapshotError,
+  commitHandsInput, decode, encodeInput, lerpSnapshot, PROTOCOL_VERSION, SnapshotError,
   unpackGrappleBits, unpackOperativeBits, unpackRepairTarget, unpackWeaponBits,
 } from "./snapshot.js";
 import { applyEntities, applySnapshot, readInput, reconcile, resetSession } from "./session.js";
@@ -314,7 +314,9 @@ export class Net {
       ? this.base.replace(/^http/, "ws")
       : `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}`;
 
-    const socket = new WebSocket(`${wsBase}/lobby/${code}`);
+    const socket = new WebSocket(
+      `${wsBase}/lobby/${code}?protocol=${PROTOCOL_VERSION}`,
+    );
     // BEFORE ANY LISTENER, AND NOT OPTIONAL.
     //
     // A browser WebSocket delivers binary frames as a `Blob` by default, and reading a Blob
@@ -504,6 +506,20 @@ export class Net {
     this.sim?.horde?.clearRenderCombatFrame?.();
     this.sim?.repair?.setExternalClaims?.([]);
     this.sim?.repair?.setAuthorityTarget?.(null);
+    if (this.sim) this.sim.recoveryTargets = [];
+    if (this.player) {
+      // Recovery targets and ownership are snapshot facts too. Keeping them after
+      // leave/transport loss makes a solo frame count stale avatars as crew and can
+      // leave this operative channeling a body that no longer exists.
+      this.player.recovering = false;
+      this.player.recoveryTarget = null;
+      this.player.recoveryTargetProgress = 0;
+      this.player.recoveryHeld = false;
+      this.player.recoveryProgress = 0;
+      this.player.rescuerSeat = 0;
+      this.player.recoveryHasCrew = false;
+      this.player.autoMedevac = false;
+    }
     if (this.sim?.weapon) this.sim.weapon.arbitrated = false;
     const localOp = this.sim?.operatives?.find((op) => op.player === this.player);
     if (localOp) localOp.seat = 0;
@@ -523,6 +539,17 @@ export class Net {
 
     switch (msg.t) {
       case "hello":
+        // Compatibility is decided before accepting any seat state. An old Worker omits
+        // this field; treating that as a mismatch keeps a newly deployed client from
+        // entering a run whose binary layout it cannot safely decode.
+        if (msg.protocol !== PROTOCOL_VERSION) {
+          this.#fail(
+            `lobby protocol ${msg.protocol ?? "missing"}, this build speaks ${PROTOCOL_VERSION}`
+            + " — reload the page",
+          );
+          this.socket?.close(4003, "protocol mismatch - reload the page");
+          return;
+        }
         this.seat = msg.seat;
         this.code = msg.code;
         this.phase = msg.phase;
@@ -826,6 +853,10 @@ export class Net {
           applySnapshot(this.sim, newest, this.seat);
           this.lastReconciledTick = newest.tick;
           this.#reconcileLocal(newest, generationChanged);
+          // Damage and local health are newest-authority facts, so ingest the release that
+          // explains them at the same boundary — never from the 120 ms-delayed interpolant.
+          // Horde keeps the events pending until main.js has applied delayed body poses.
+          this.sim.horde.ingestSpikerShots?.(newest.spikerShots ?? [], newest.resetId);
           this.snapshotsApplied++;
           // The gate may still say CONNECTING from the preceding `sim` message. The first
           // applied packet is the moment this client actually becomes authoritative, so
@@ -896,6 +927,12 @@ export class Net {
     p.hp = mine.hp;
     p.hurtCount = mine.hurtCount;
     p.deaths = mine.deaths;
+    const operative = unpackOperativeBits(mine.bits);
+    p.downed = operative.downed;
+    p.medevacRemaining = mine.medevacRemaining;
+    p.recoveryProgress = mine.recoveryProgress;
+    p.rescuerSeat = mine.rescuerSeat;
+    p.autoMedevac = false;
     if (this.sim.weapon) this.sim.weapon.kills = mine.kills;
     const authorityRepair = unpackRepairTarget(mine.repairTarget);
     // Position remains predicted, but exact repair identity is authority-owned. Do not
@@ -967,6 +1004,11 @@ export class Net {
       p.yaw = mine.yaw;
     }
     p.pitch = mine.pitch;
+    p.downed = b.downed;
+    if (p.downed) {
+      p.downedYaw = p.yaw;
+      p.downedPitch = mine.pitch;
+    }
     p.velocity.set(mine.vx, mine.vy, mine.vz);
     p.grounded = b.grounded;
 
@@ -979,7 +1021,7 @@ export class Net {
     // A hard authority change may land between fixed steps; refresh the camera now rather
     // than rendering one stale frame before Player.update gets its next turn.
     p.eyePosition(p.camera.position);
-    p.camera.rotation.set(p.pitch, p.yaw, 0, "YXZ");
+    p.camera.rotation.set(p.viewPitch, p.viewYaw, 0, "YXZ");
 
     this.history.length = 0;
     this.correction.set(0, 0, 0);
@@ -1028,6 +1070,7 @@ export class Net {
     const localBased = p.base === this.trampler;
     const localStation = p.station ? (this.sim.guns?.indexOf(p.station) ?? -1) + 1 : 0;
     const deathChanged = this.authorityDeaths !== null && mine.deaths !== this.authorityDeaths;
+    const downedChanged = current.downed !== p.downed;
     const firstBaseline = this.authorityResetId === null;
     // Current authority and the live client are only comparable after every local prediction
     // has been acknowledged. Before then the client may already have jumped or mounted while
@@ -1036,7 +1079,7 @@ export class Net {
     const authorityCaughtUp = mine.ackSeq >= this.inputSeq;
     const currentFrameMismatch = current.based !== localBased
       || current.station !== localStation;
-    const incompatible = generationChanged || firstBaseline || deathChanged
+    const incompatible = generationChanged || firstBaseline || deathChanged || downedChanged
       || (authorityCaughtUp && currentFrameMismatch);
 
     this.#syncLocalMetadata(mine, firstBaseline || generationChanged);
@@ -1288,10 +1331,13 @@ export class Net {
     // E and fire may both be physically held, but the authority must receive the one action
     // prediction actually performed. Otherwise a simultaneous remote claim can turn a locally
     // suppressed shot into an authoritative fallback shot that appears only on correction.
+    const player = this.sim?.player;
+    const recoveryOwnsHands = !!player?.recovering
+      || !!(player?.recoveryHeld && player?.recoveryTarget);
     const committed = commitHandsInput(
       cmd,
-      !!this.sim?.player?.repairing,
-      !!this.sim?.player?.station,
+      !!player?.repairing || recoveryOwnsHands,
+      !!player?.station,
     );
     try {
       this.socket.send(encodeInput(committed).buffer);
@@ -1436,10 +1482,19 @@ export class Net {
       // world. Read through the exported unpacker rather than by masking the bit here, for the
       // reason `isSubmerged` is exported: a bit index written out by hand in a second place is
       // a wrong answer rather than an error.
-      _pose.based = unpackOperativeBits(w.bits).based;
+      const operative = unpackOperativeBits(w.bits);
+      _pose.based = operative.based;
 
       r.lastAt = performance.now();
-      this.#animate(r, _pose, dt);
+      if (operative.downed) {
+        r.speed = 0;
+        r.legL.rotation.x = 0;
+        r.legR.rotation.x = 0;
+        r.rig.rotation.set(0, 0, Math.PI / 2);
+      } else {
+        this.#animate(r, _pose, dt);
+      }
+      r.marker.visible = operative.downed;
       this.#place(r.avatar, _pose);
       this.#drawRemoteGrapple(r, w);
       this.#drawRemoteShot(r, w, dt);
@@ -1579,7 +1634,7 @@ export class Net {
   /** Draw the delayed observer cue for an authoritative grapple pull. */
   #drawRemoteGrapple(r, wire) {
     const grapple = unpackGrappleBits(wire.grappleBits);
-    if (!grapple.active) {
+    if (unpackOperativeBits(wire.bits).downed || !grapple.active) {
       r.rope.visible = false;
       r.hook.visible = false;
       return;
@@ -1604,6 +1659,15 @@ export class Net {
   /** Draw one observer-only cue when the authoritative rolling shot sequence advances. */
   #drawRemoteShot(r, wire, dt) {
     const { shots } = unpackWeaponBits(wire.weaponBits);
+    if (unpackOperativeBits(wire.bits).downed) {
+      // Consume the sequence while hidden so recovery cannot replay a shot fired
+      // before incapacitation as though it happened on standing up.
+      r.lastWeaponShots = shots;
+      r.shotLife = 0;
+      r.tracer.visible = false;
+      r.muzzle.visible = false;
+      return;
+    }
 
     // A crewmate may enter view after firing. Baseline rather than replaying their last shot as
     // a historical flash; only a sequence change observed while this avatar exists is an event.
@@ -1748,6 +1812,20 @@ export class Net {
     legL.position.set(-parts.hip.x, parts.hip.y, 0);
     legR.position.set(parts.hip.x, parts.hip.y, 0);
 
+    // A seat-coloured emissive ring remains upright while the body rig lies down.
+    // It is a state marker, not a light, so it adds no scene-light cost.
+    const marker = new THREE.Mesh(
+      new THREE.TorusGeometry(c.avatarRadius * 1.25, c.avatarRadius * 0.15, 6, 16),
+      signalMat,
+    );
+    marker.name = `crew-${seat}-downed-marker`;
+    marker.position.y = c.avatarHeight * 0.75;
+    marker.rotation.x = Math.PI / 2;
+    marker.visible = false;
+    marker.castShadow = false;
+    marker.receiveShadow = false;
+    avatar.add(marker);
+
     // World-space observer effects. They cannot be children of the avatar because a hull-local
     // avatar may connect to world geometry, and a fired tracer is the frozen world-space ray
     // the authority actually drew. Keeping both ends in one frame makes that choice explicit.
@@ -1792,7 +1870,7 @@ export class Net {
     this.scene.add(effects);
     avatar.visible = false;
     this.scene.add(avatar);
-    return { avatar, rig, legL, legR, effects, rope, hook, tracer, muzzle };
+    return { avatar, rig, legL, legR, marker, effects, rope, hook, tracer, muzzle };
   }
 
   #dropRemote(seat) {

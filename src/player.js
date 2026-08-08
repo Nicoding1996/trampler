@@ -34,6 +34,18 @@ const _mv3 = new THREE.Vector3();
 const _mv4 = new THREE.Vector3();
 const _mv5 = new THREE.Vector3();
 
+// Player.update remains safe even when a caller forgets to route recovery's
+// post-arbitration input. Look is applied separately in prepareStep; this object
+// owns only movement and action levels.
+const NO_ACTION_INPUT = Object.freeze({
+  locked: false,
+  down: () => false,
+  pressed: () => false,
+  mouseDown: () => false,
+  mousePressed: () => false,
+  mouse: Object.freeze({ dx: 0, dy: 0 }),
+});
+
 export class Player {
   constructor(camera, world, trampler) {
     this.camera = camera;
@@ -75,6 +87,24 @@ export class Player {
     this.timeSinceHurt = 99;
     this.spawnGrace = 0;
     this.deaths = 0;
+
+    // Incapacitation belongs to the operative; arbitration between operatives lives
+    // in recovery.js. `deaths` counts the moment an operative goes down, while the
+    // body remains exactly where that happened until recovery or medevac resolves it.
+    this.downed = false;
+    this.recoveryDelay = CFG.combat.recovery.soloMedevac;
+    this.recoveryHasCrew = false;
+    this.medevacRemaining = 0;
+    this.recoveryProgress = 0;
+    this.rescuerSeat = 0;
+    this.recovering = false;
+    this.recoveryTarget = null;
+    this.recoveryTargetProgress = 0;
+    this.recoveryHeld = false;
+    this.autoMedevac = false;
+    this.downedYaw = 0;
+    this.downedPitch = CFG.combat.recovery.cameraPitch;
+
     // Monotonic pose-discontinuity signal for pure presentation readers. Polling a counter
     // keeps respawn/drop lifecycle knowledge out of CameraPresentation without coupling this
     // simulation module to the renderer.
@@ -144,6 +174,7 @@ export class Player {
       // The view and the relative velocity both live in world axes, so they
       // have to be spun by however much the hull turned this frame.
       this.yaw += t.yawDelta;
+      if (this.downed) this.downedYaw += t.yawDelta;
       this.velocity.applyAxisAngle(UP, t.yawDelta);
     }
   }
@@ -170,6 +201,25 @@ export class Player {
     this.prepareStep(input);
     this.stepPrepared = false;
 
+    // A downed body still settles onto the surface it fell on and still rides a
+    // moving deck, but it supplies no movement, mantle, jump or winch intent. Keeping
+    // gravity here avoids a body freezing in mid-air when the final hit lands during
+    // a jump; recovery.js owns only the clock and the teammate interaction.
+    if (this.downed) {
+      this.jumpQueued = 0;
+      this.jumpLock = 0;
+      this.mantleLock = Math.max(0, this.mantleLock - dt);
+      this.#move(dt, NO_ACTION_INPUT);
+      this.#integrate(dt);
+      this.#updateBase(dt);
+      this.#updateHealth(dt);
+      this.dip = damp(this.dip, 0, CFG.player.landDipRecover, dt);
+      this.#updateCamera();
+      return;
+    }
+
+    const controls = this.recovering ? NO_ACTION_INPUT : input;
+
     // Manning a station: it owns position and clamps the aim arc. No movement,
     // no jumping, no grapple, no mantle -- being stuck in place is the price of
     // the firepower.
@@ -185,7 +235,7 @@ export class Player {
     // Space is consumed once, then routed: mid-reel it cuts the rope, otherwise
     // it queues a jump. Reading it twice would let the jump buffer eat the input
     // before the grapple ever saw it.
-    const jumpPressed = input.pressed("Space");
+    const jumpPressed = controls.pressed("Space");
     this.jumpLock = Math.max(0, this.jumpLock - dt);
 
     if (this.grapple?.active) {
@@ -208,7 +258,7 @@ export class Player {
       this.grapple.drive(dt);
       this.#integrate(dt);
     } else {
-      this.#move(dt, input);
+      this.#move(dt, controls);
       this.#tryJump();
       if (!this.#tryStartMantle()) this.#integrate(dt);
     }
@@ -223,7 +273,7 @@ export class Player {
   }
 
   #look(input) {
-    if (!input.locked) return;
+    if (!input.locked || this.downed) return;
     this.yaw -= input.mouse.dx * CFG.player.lookSensitivity;
     this.pitch -= input.mouse.dy * CFG.player.lookSensitivity;
     this.pitch = clamp(this.pitch, -CFG.player.pitchLimit, CFG.player.pitchLimit);
@@ -489,9 +539,17 @@ export class Player {
     this.attachTo(this.grapple?.active ? null : base);
   }
 
+  get viewYaw() {
+    return this.downed ? this.downedYaw : this.yaw;
+  }
+
+  get viewPitch() {
+    return this.downed ? this.downedPitch : this.pitch;
+  }
+
   #updateCamera() {
     this.eyePosition(this.camera.position);
-    this.camera.rotation.set(this.pitch, this.yaw, 0, "YXZ");
+    this.camera.rotation.set(this.viewPitch, this.viewYaw, 0, "YXZ");
   }
 
   // ------------------------------------------------------------------ helpers
@@ -507,7 +565,7 @@ export class Player {
   }
 
   hurt(amount) {
-    if (this.hp <= 0 || this.spawnGrace > 0) return;
+    if (this.downed || this.hp <= 0 || this.spawnGrace > 0) return;
     const taken = amount * this.damageScale;
     this.hp -= taken;
     this.timeSinceHurt = 0;
@@ -516,18 +574,91 @@ export class Player {
     this.lastHurt = taken;
 
     if (this.hp <= 0) {
-      // Instant respawn on the deck, deliberately cheap for a feel test. A real
-      // death needs a delay and a cost; this only needs to interrupt you.
-      // The grace window stops boarders standing on the spawn from killing you
-      // again on the very next frame.
+      // Going down is the death event. Recovery only decides where and when this
+      // operative returns; it must not increment the counter a second time.
       this.deaths++;
-      this.hp = this.maxHp;
-      this.respawnOnDeck();
-      this.spawnGrace = CFG.combat.spawnGrace;
+      this.hp = 0;
+      this.resetRecovery();
+      this.downed = true;
+      this.medevacRemaining = this.recoveryDelay;
+      this.stabilizeDownedView();
+
+      // Incapacitation releases every driven state and every published hand. In
+      // particular, dismount through the station so its occupant agrees, and clear
+      // repair immediately rather than advertising a ghost welder for one snapshot.
+      this.station?.dismount(this);
+      this.repairing = null;
+      this.grapple?.cancel();
+      this.cancelMantle();
+      this.jumpQueued = 0;
+      this.jumpLock = 0;
     }
   }
 
+  /** Freeze the body camera at the orientation held when incapacitated. */
+  stabilizeDownedView() {
+    this.downedYaw = this.yaw;
+    this.downedPitch = CFG.combat.recovery.cameraPitch;
+  }
+
+  /** Clear persistent and per-frame recovery ownership without changing position. */
+  resetRecovery() {
+    // If this operative was the active rescuer, release that body now. Waiting for
+    // the next arbitration step would leave a stale owner after damage or teardown.
+    const claimed = this.recovering ? this.recoveryTarget?.player : null;
+    if (claimed?.downed) {
+      claimed.rescuerSeat = 0;
+      claimed.recoveryProgress = 0;
+    }
+
+    this.downed = false;
+    this.medevacRemaining = 0;
+    this.recoveryProgress = 0;
+    this.rescuerSeat = 0;
+    this.recovering = false;
+    this.recoveryTarget = null;
+    this.recoveryTargetProgress = 0;
+    this.recoveryHeld = false;
+    this.autoMedevac = false;
+  }
+
+  /** Return where the body fell after a teammate completes the channel. */
+  recoverInPlace() {
+    if (!this.downed) return false;
+    this.yaw = this.downedYaw;
+    this.pitch = 0;
+    this.resetRecovery();
+    this.hp = this.maxHp * CFG.combat.recovery.returnHealth;
+    this.timeSinceHurt = 0;
+    this.spawnGrace = CFG.combat.spawnGrace;
+    this.velocity.set(0, 0, 0);
+    this.dip = 0;
+    return true;
+  }
+
+  /** Guaranteed fallback: return the operative to the deck at partial health. */
+  medevac() {
+    if (!this.downed) return false;
+    this.yaw = this.downedYaw;
+    this.pitch = 0;
+    this.resetRecovery();
+    this.hp = this.maxHp * CFG.combat.recovery.returnHealth;
+    this.timeSinceHurt = 0;
+    this.spawnGrace = CFG.combat.spawnGrace;
+    this.respawnOnDeck();
+    this.autoMedevac = true;
+    return true;
+  }
+
   eyePosition(out = new THREE.Vector3()) {
+    if (this.downed) {
+      const r = CFG.combat.recovery;
+      return out.set(
+        this.position.x + Math.sin(this.downedYaw) * r.cameraBack,
+        this.position.y - this.half.y + r.cameraHeight,
+        this.position.z + Math.cos(this.downedYaw) * r.cameraBack,
+      );
+    }
     return out.set(
       this.position.x,
       this.position.y - this.half.y + CFG.player.eyeHeight - this.dip,
@@ -537,11 +668,13 @@ export class Player {
 
   /** Forward vector matching the YXZ camera basis, without touching the camera. */
   lookDirection(out = new THREE.Vector3()) {
-    const cp = Math.cos(this.pitch);
+    const yaw = this.viewYaw;
+    const pitch = this.viewPitch;
+    const cp = Math.cos(pitch);
     return out.set(
-      -Math.sin(this.yaw) * cp,
-      Math.sin(this.pitch),
-      -Math.cos(this.yaw) * cp,
+      -Math.sin(yaw) * cp,
+      Math.sin(pitch),
+      -Math.cos(yaw) * cp,
     );
   }
 
@@ -557,14 +690,10 @@ export class Player {
   }
 
   respawnOnDeck() {
-    // Dying throws you off the gun. Through the mount, so the seat learns it is empty
-    // -- writing `station.mounted = false` from out here left the gun's own idea of its
-    // occupant untouched, which is survivable with one operative and not with four.
+    // Relocation throws you off the gun. Go through the mount so the seat learns it
+    // is empty -- writing its flag here leaves the gun's occupant disagreeing.
     this.relocationCount++;
     this.station?.dismount(this);
-    // Repair ownership is published on Player for the rest of the crew and for snapshots.
-    // Death can happen after this frame's Repair pass, so clear it at the teleport itself;
-    // waiting for the next frame would advertise a deck-spawned ghost welder for one packet.
     this.repairing = null;
     this.trampler.deckSpawn(this.position);
     // Set the frame directly rather than going through attachTo: we want to be

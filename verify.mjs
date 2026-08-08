@@ -18,8 +18,8 @@ import { Player } from "./src/player.js";
 import { Crew } from "./src/crew.js";
 import { Grapple } from "./src/grapple.js";
 import {
-  Horde, CHEWER, CLIMBER, BULWARK, BURROWER, SAPPER, TITAN, ENEMY_STATE, isSubmerged,
-  causedBy,
+  Horde, CHEWER, CLIMBER, BULWARK, BURROWER, SAPPER, TITAN, SPIKER, ENEMY_STATE,
+  isSubmerged, causedBy,
 } from "./src/enemies.js";
 import { Director, PHASE } from "./src/waves.js";
 import { Weapon } from "./src/weapon.js";
@@ -34,13 +34,15 @@ import { Run, RUN, describeRoad } from "./src/run.js";
 import {
   encode, decode, snapshotBytes, packHullBits, unpackHullBits, packPhaseBits,
   unpackPhaseBits, PROTOCOL_VERSION, toleranceOf, LAYOUT, WIRE_PHASES, WIRE_RUN_PHASES,
-  ENTITY_BYTES, OPERATIVE_BYTES, HELD_BIT, EDGE_BIT, encodeInput, decodeInput, INPUT_BYTES,
+  ENTITY_BYTES, SPIKER_SHOT_BYTES, OPERATIVE_BYTES, HELD_BIT, EDGE_BIT,
+  encodeInput, decodeInput, INPUT_BYTES,
   commitHandsInput, packRepairTarget, unpackRepairTarget, lerpSnapshot,
 } from "./src/snapshot.js";
 import {
   createSession, stepSession, stepSessionClient, snapshotOf, applySnapshot, hullDivergence,
-  netInput, readInput, reconcile,
+  netInput, readInput, reconcile, removeOperative,
 } from "./src/session.js";
+import { configureRecovery, recoveryInputFor, stepRecovery } from "./src/recovery.js";
 
 const DT = 1 / 60;
 
@@ -151,11 +153,16 @@ function makeSim() {
 
   scene.updateMatrixWorld(true);
 
+  const input = makeInput();
   return {
     scene, camera, world, trampler, player, crew, grapple,
     horde, director, weapon, repair, guns, gun: guns[0], emitters, economy,
-    modules, run, events, items,
-    input: makeInput(),
+    modules, run, events, items, input,
+    // Recovery is crew-wide policy even in the single-operative harness. Keep the
+    // same roster shape as main.js/session.js so fallback timing and action routing
+    // are exercised by every scenario rather than by recovery-only test scaffolding.
+    operatives: [{ seat: 1, player, input }],
+    recoveryTargets: [],
     waves: false, // opt in per test, so random spawns cannot pollute a scenario
     bayOpen: false, // opt in to take the refit bay's side of the key-routing fork
   };
@@ -179,6 +186,9 @@ function overlapsCollider(local, half, boxes) {
 function step(sim, frames, hook, dt = DT) {
   for (let i = 0; i < frames; i++) {
     hook?.(i);
+    // Fix the fallback duration before a stomp or contact hit can incapacitate the
+    // operative. This is the same pre-damage slot used by solo and authority frames.
+    configureRecovery(sim.operatives, sim.recoveryTargets);
     sim.trampler.update(dt);
     // Immediately after the hull moves, so a foot that came down this frame
     // resolves against where things actually are. Explicit rather than hidden
@@ -188,18 +198,21 @@ function step(sim, frames, hook, dt = DT) {
       sim.director.update(dt);
       sim.run.update();
     }
-    // Action rays and station range use this tick's look and hull-carried position.
+    // Recovery reads current look, hull carry and physical E before any gameplay
+    // consumer. The routed input owns actions; the raw input survives to endFrame.
     sim.player.prepareStep(sim.input);
-    handleStationInput(sim.guns, sim.input, sim.player);
-    sim.grapple.handleInput(sim.input);
-    sim.player.update(dt, sim.input);
+    stepRecovery(sim.operatives, dt, { targets: sim.recoveryTargets });
+    const actionInput = recoveryInputFor(sim.player, sim.input);
+    handleStationInput(sim.guns, actionInput, sim.player);
+    sim.grapple.handleInput(actionInput);
+    sim.player.update(dt, actionInput);
     // Admission claims the carried hands before its trigger is read; work stays after both
     // weapon paths so threat sampling retains repair's established post-fire timing.
-    sim.repair.admit(dt, sim.input);
-    sim.weapon.update(dt, sim.input);
-    for (const g of sim.guns) g.update(dt, sim.input, sim.player, sim.weapon);
+    sim.repair.admit(dt, actionInput);
+    sim.weapon.update(dt, actionInput);
+    for (const g of sim.guns) g.update(dt, actionInput, sim.player, sim.weapon);
     sim.repair.work(dt);
-    sim.emitters.update(dt, sim.input, sim.player);
+    sim.emitters.update(dt, actionInput, sim.player);
     // Same slot as main.js: after repair and the player, before the horde, so the
     // conditional bonuses are built from the position this frame actually ended in.
     sim.items.update(dt);
@@ -212,7 +225,7 @@ function step(sim, frames, hook, dt = DT) {
       economy: sim.economy,
       run: sim.run,
       bayOpen: !!sim.bayOpen,
-      input: sim.input,
+      input: actionInput,
       dt,
     });
     sim.horde.update(dt, sim.crew);
@@ -901,24 +914,405 @@ console.log("\n18. Spawn and teleport points are clear of geometry");
 }
 
 // ---------------------------------------------------------------------------
-console.log("\n19. Death cannot loop on a boarder standing at the spawn");
+console.log("\n19. Incapacitation recovers on a clock without becoming a death loop");
 {
+  // ---- solo: the body stays where it fell for four seconds, then returns to deck.
   const sim = makeSim();
   const { player } = sim;
-  step(sim, 30);
+  sim.trampler.walking = false;
+  sim.trampler.turning = false;
+  placeOnGroundAt(sim, 20, 0);
+  player.yaw = 0.73;
+  player.pitch = 0.31;
+  const fallenAt = player.position.clone();
+  const facingAtFall = player.yaw;
 
   player.hurt(1000);
-  ok("first hit killed and respawned", player.deaths === 1 && player.hp === player.maxHp);
-  ok("grace window opened", player.spawnGrace > 0);
+  ok("a lethal hit incapacitates in place instead of teleporting immediately",
+    player.deaths === 1 && player.downed && player.hp === 0 && player.base === null,
+    `${player.deaths} death, ${player.medevacRemaining.toFixed(2)} s remaining`);
+  near("the solo emergency-recovery clock starts at four seconds",
+    player.medevacRemaining, CFG.combat.recovery.soloMedevac, 1e-9);
+  ok("incapacitation fixes the body camera at the fall facing and configured pitch",
+    player.viewYaw === facingAtFall
+      && player.viewPitch === CFG.combat.recovery.cameraPitch,
+    `yaw ${player.viewYaw.toFixed(2)}, pitch ${player.viewPitch.toFixed(2)}`);
+
+  // A downed body ignores further damage, so an attacker standing over it cannot
+  // increment the death counter every frame while the fallback is counting down.
+  player.hurt(1000);
+  player.hurt(1000);
+  ok("further hits while downed are ignored", player.deaths === 1,
+    `${player.deaths} death`);
+
+  // Drive the real look path with an extreme delta. Accessors alone would only prove
+  // that the stored fall angle exists, not that mouse input cannot turn it into free
+  // reconnaissance while the operative waits.
+  sim.input.mouse.dx = 900;
+  sim.input.mouse.dy = -900;
+  let soloFrames = 0;
+  step(sim, 1);
+  soloFrames++;
+  const fixedEye = player.eyePosition(new THREE.Vector3());
+  ok("mouse look cannot move the fixed downed camera",
+    player.viewYaw === facingAtFall
+      && player.viewPitch === CFG.combat.recovery.cameraPitch
+      && sim.camera.position.distanceTo(fixedEye) < 1e-9
+      && Math.abs(sim.camera.rotation.y - facingAtFall) < 1e-9
+      && Math.abs(sim.camera.rotation.x - CFG.combat.recovery.cameraPitch) < 1e-9,
+    `yaw ${player.viewYaw.toFixed(2)}, pitch ${player.viewPitch.toFixed(2)}, `
+    + `eye error ${(sim.camera.position.distanceTo(fixedEye) * 100).toFixed(3)} cm`);
+
+  let downedDrift = 0;
+  while (player.downed && soloFrames < 60 * 6) {
+    step(sim, 1);
+    soloFrames++;
+    if (player.downed) {
+      downedDrift = Math.max(downedDrift,
+        Math.hypot(player.position.x - fallenAt.x, player.position.z - fallenAt.z));
+    }
+  }
+  ok("solo stays down for the configured four-second consequence",
+    Math.abs(soloFrames * DT - CFG.combat.recovery.soloMedevac) <= DT * 2,
+    `${(soloFrames * DT).toFixed(3)} s`);
+  ok("the body did not become fast travel while the clock ran",
+    downedDrift < 0.02, `${(downedDrift * 100).toFixed(2)} cm horizontal drift`);
+  ok("the fallback medevacs to the deck at forty percent health",
+    !player.downed && player.base === sim.trampler && player.autoMedevac
+      && Math.abs(player.hp - player.maxHp * CFG.combat.recovery.returnHealth) < 1e-9,
+    `${player.hp.toFixed(0)}/${player.maxHp} hp, ${player.base ? "aboard" : "ground"}`);
+  ok("the configured post-return immunity opened",
+    player.spawnGrace > CFG.combat.spawnGrace - DT * 2,
+    `${player.spawnGrace.toFixed(3)} of ${CFG.combat.spawnGrace.toFixed(2)} s`);
 
   player.hurt(1000);
+  ok("damage during return immunity cannot start another incapacitation",
+    player.deaths === 1 && !player.downed, `${player.deaths} death`);
+  step(sim, Math.ceil(CFG.combat.spawnGrace / DT) + 1);
+  ok("return immunity expires", player.spawnGrace === 0);
   player.hurt(1000);
-  ok("further hits during grace are ignored", player.deaths === 1, `${player.deaths} deaths`);
+  ok("and lethal damage lands again afterwards",
+    player.deaths === 2 && player.downed, `${player.deaths} deaths`);
 
-  step(sim, 90); // 1.5 s, past the 1.2 s grace
-  ok("grace expired", player.spawnGrace === 0);
-  player.hurt(1000);
-  ok("and damage lands again afterwards", player.deaths === 2, `${player.deaths} deaths`);
+  // A real authority with mutable physical inputs. Bodies are arranged outside the
+  // hull so collision cannot decide a recovery test; all three settle on the sand.
+  const recoveryAuthority = (seats) => {
+    const authority = createSession({ seats });
+    authority.trampler.walking = false;
+    authority.trampler.turning = false;
+    const at = authority.trampler.localToWorld(new THREE.Vector3(20, 0, 0));
+    for (let i = 0; i < authority.operatives.length; i++) {
+      const op = authority.operatives[i];
+      op.input = makeInput();
+      op.player.position.set(at.x + i * 0.35, 1.2, at.z);
+      op.player.base = null;
+      op.player.velocity.set(0, 0, 0);
+    }
+    for (let i = 0; i < 20; i++) stepSession(authority, DT);
+    return authority;
+  };
+
+  // ---- arbitration and cancellation.
+  const crew = recoveryAuthority(3);
+  const [low, high, body] = crew.operatives;
+  body.player.hurt(1e6);
+  near("multiplayer starts the longer eight-second fallback",
+    body.player.medevacRemaining, CFG.combat.recovery.multiplayerMedevac, 1e-9);
+
+  low.input.keys.add(CFG.repair.key);
+  high.input.keys.add(CFG.repair.key);
+  low.input.keys.add("KeyW");
+  high.input.keys.add("KeyW");
+  low.input.mouseHeld.add(0);
+  high.input.mouseHeld.add(0);
+  const lowAt = low.player.position.clone();
+  const lowShots = low.weapon.shots;
+  const highAt = high.player.position.clone();
+  const highShots = high.weapon.shots;
+  stepSession(crew, DT);
+
+  ok("the lower numeric seat wins a simultaneous recovery claim",
+    body.player.rescuerSeat === low.seat && low.player.recovering && !high.player.recovering,
+    `seat ${body.player.rescuerSeat} owns the body`);
+  ok("an active rescuer cannot move or fire",
+    Math.hypot(low.player.position.x - lowAt.x, low.player.position.z - lowAt.z) < 1e-9
+      && low.weapon.shots === lowShots,
+    `${low.weapon.shots - lowShots} shots, `
+    + `${Math.hypot(low.player.position.x - lowAt.x, low.player.position.z - lowAt.z).toFixed(3)} m`);
+  ok("a losing contender keeps their feet but cannot repair or fire",
+    Math.hypot(high.player.velocity.x, high.player.velocity.z) > 0.01
+      && high.player.position.distanceTo(highAt) > 0
+      && high.weapon.shots === highShots
+      && high.player.repairing === null,
+    `${high.player.position.distanceTo(highAt).toFixed(3)} m, `
+    + `${high.weapon.shots - highShots} shots, repair ${high.player.repairing ?? "none"}`);
+  ok("the winning hold actually advances the channel (not vacuous)",
+    body.player.recoveryProgress > 0, `${body.player.recoveryProgress.toFixed(3)} s`);
+
+  low.input.keys.delete(CFG.repair.key);
+  high.input.keys.delete(CFG.repair.key);
+  low.input.keys.delete("KeyW");
+  high.input.keys.delete("KeyW");
+  low.input.mouseHeld.clear();
+  high.input.mouseHeld.clear();
+  stepSession(crew, DT);
+  ok("releasing E cancels ownership and resets progress",
+    body.player.rescuerSeat === 0 && body.player.recoveryProgress === 0,
+    `seat ${body.player.rescuerSeat}, ${body.player.recoveryProgress.toFixed(3)} s`);
+
+  low.player.position.copy(body.player.position).add(new THREE.Vector3(0.5, 0, 0));
+  low.input.keys.add(CFG.repair.key);
+  for (let i = 0; i < 12; i++) stepSession(crew, DT);
+  ok("a fresh in-range hold builds progress before range cancellation (not vacuous)",
+    body.player.recoveryProgress > 0.15, `${body.player.recoveryProgress.toFixed(3)} s`);
+  low.player.position.x += CFG.combat.recovery.range + 1;
+  stepSession(crew, DT);
+  ok("leaving the 1.5 m recovery radius resets the channel",
+    body.player.rescuerSeat === 0 && body.player.recoveryProgress === 0,
+    `seat ${body.player.rescuerSeat}, ${body.player.recoveryProgress.toFixed(3)} s`);
+
+  low.player.position.copy(body.player.position).add(new THREE.Vector3(0.5, 0, 0));
+  for (let i = 0; i < 12; i++) stepSession(crew, DT);
+  ok("the owner reclaimed before the downed-cancellation check (not vacuous)",
+    body.player.rescuerSeat === low.seat && body.player.recoveryProgress > 0.15,
+    `seat ${body.player.rescuerSeat}, ${body.player.recoveryProgress.toFixed(3)} s`);
+  low.player.hurt(1e6);
+  ok("an incapacitated rescuer releases the body immediately and loses its progress",
+    low.player.downed && body.player.rescuerSeat === 0 && body.player.recoveryProgress === 0,
+    `rescuer down ${low.player.downed}, seat ${body.player.rescuerSeat}`);
+
+  const disconnect = recoveryAuthority(3);
+  const [bystander, departing, stranded] = disconnect.operatives;
+  bystander.player.position.x += CFG.combat.recovery.range + 5;
+  stranded.player.hurt(1e6);
+  departing.input.keys.add(CFG.repair.key);
+  for (let i = 0; i < 12; i++) stepSession(disconnect, DT);
+  ok("the departing seat owns a live channel before teardown (not vacuous)",
+    stranded.player.rescuerSeat === departing.seat && stranded.player.recoveryProgress > 0.15,
+    `seat ${stranded.player.rescuerSeat}, ${stranded.player.recoveryProgress.toFixed(3)} s`);
+  removeOperative(disconnect, departing.seat);
+  ok("disconnect clears its claim and progress synchronously",
+    stranded.player.rescuerSeat === 0 && stranded.player.recoveryProgress === 0,
+    `seat ${stranded.player.rescuerSeat}, ${stranded.player.recoveryProgress.toFixed(3)} s`);
+
+  // A valid prior owner wins before new claims are considered. Give seat 2 an
+  // uncontested head start, then let lower seat 1 arrive: numeric order breaks only
+  // simultaneous ties and must never steal work already in progress.
+  const continuity = recoveryAuthority(3);
+  const [challenger, incumbent, continuityBody] = continuity.operatives;
+  challenger.player.position.x += CFG.combat.recovery.range + 4;
+  continuityBody.player.hurt(1e6);
+  incumbent.input.keys.add(CFG.repair.key);
+  for (let i = 0; i < 12; i++) stepSession(continuity, DT);
+  const incumbentProgress = continuityBody.player.recoveryProgress;
+  ok("the higher-seat prior owner establishes a real channel before contention",
+    continuityBody.player.rescuerSeat === incumbent.seat && incumbentProgress > 0.15,
+    `seat ${continuityBody.player.rescuerSeat}, ${incumbentProgress.toFixed(3)} s`);
+
+  challenger.player.position.copy(continuityBody.player.position)
+    .add(new THREE.Vector3(-0.45, 0, 0));
+  challenger.player.velocity.set(0, 0, 0);
+  challenger.input.keys.add(CFG.repair.key);
+  stepSession(continuity, DT);
+  ok("a valid prior owner keeps the body when a lower seat later competes",
+    continuityBody.player.rescuerSeat === incumbent.seat
+      && incumbent.player.recovering
+      && !challenger.player.recovering
+      && continuityBody.player.recoveryProgress > incumbentProgress,
+    `seat ${continuityBody.player.rescuerSeat}, `
+    + `${incumbentProgress.toFixed(3)} -> ${continuityBody.player.recoveryProgress.toFixed(3)} s`);
+
+  // Damage is not one of the named cancellation causes. Prove it actually lands,
+  // then prove the same owner and accumulated work survive the following frame.
+  incumbent.player.spawnGrace = 0;
+  const incumbentHp = incumbent.player.hp;
+  const beforeDamageProgress = continuityBody.player.recoveryProgress;
+  incumbent.player.hurt(7);
+  const damagedHp = incumbent.player.hp;
+  stepSession(continuity, DT);
+  ok("ordinary damage really lands on the active rescuer (test is not vacuous)",
+    damagedHp < incumbentHp && !incumbent.player.downed,
+    `${incumbentHp.toFixed(1)} -> ${damagedHp.toFixed(1)} hp`);
+  ok("nonlethal damage does not interrupt or reset teammate recovery",
+    continuityBody.player.rescuerSeat === incumbent.seat
+      && incumbent.player.recovering
+      && continuityBody.player.recoveryProgress > beforeDamageProgress,
+    `seat ${continuityBody.player.rescuerSeat}, `
+    + `${beforeDamageProgress.toFixed(3)} -> ${continuityBody.player.recoveryProgress.toFixed(3)} s`);
+
+  // E has two nearby meanings under the hull. Put a body directly beside a damaged
+  // leg and assert the real frame routes the hold to the body before Repair.admit.
+  const priority = recoveryAuthority(2);
+  const [medic, repairBody] = priority.operatives;
+  const repairPoint = priority.trampler.legAttackWorld(0, new THREE.Vector3());
+  medic.player.position.set(repairPoint.x - 0.3, 1.2, repairPoint.z);
+  repairBody.player.position.set(repairPoint.x + 0.3, 1.2, repairPoint.z);
+  for (const op of priority.operatives) {
+    op.player.base = null;
+    op.player.velocity.set(0, 0, 0);
+  }
+  for (let i = 0; i < 20; i++) stepSession(priority, DT);
+  priority.trampler.damageLeg(0, 120);
+  const damagedLeg = priority.trampler.legHp[0];
+  repairBody.player.hurt(1e6);
+  medic.input.keys.add(CFG.repair.key);
+  for (let i = 0; i < 12; i++) stepSession(priority, DT);
+  ok("recovery takes E priority over a nearby damaged fortress point",
+    repairBody.player.recoveryProgress > 0.15
+      && repairBody.player.rescuerSeat === medic.seat
+      && medic.player.repairing === null
+      && !medic.repair.active
+      && priority.trampler.legHp[0] === damagedLeg,
+    `${repairBody.player.recoveryProgress.toFixed(2)} s body, `
+    + `leg ${priority.trampler.legHp[0].toFixed(1)}, repair ${medic.player.repairing ?? "none"}`);
+
+  // Prediction may make bars and clocks responsive, but only an authority may call
+  // either lifecycle transition. Exercise both thresholds through the real client frame.
+  const predicted = recoveryAuthority(2);
+  const [predictedOwner, predictedBody] = predicted.operatives;
+  predicted.input = predictedOwner.input;
+  predictedBody.player.hurt(1e6);
+  predictedBody.player.medevacRemaining = 6;
+  predictedBody.player.recoveryProgress = CFG.combat.recovery.recoverTime - DT / 2;
+  predictedOwner.input.keys.add(CFG.repair.key);
+  stepSessionClient(predicted, DT);
+  ok("client prediction may reach the channel threshold but cannot recover the body",
+    predictedBody.player.downed
+      && predictedBody.player.hp === 0
+      && predictedBody.player.recoveryProgress === CFG.combat.recovery.recoverTime,
+    `${predictedBody.player.recoveryProgress.toFixed(3)} s, down ${predictedBody.player.downed}`);
+
+  predictedOwner.input.keys.delete(CFG.repair.key);
+  predictedOwner.player.position.x += CFG.combat.recovery.range + 3;
+  predictedBody.player.rescuerSeat = 0;
+  predictedBody.player.recoveryProgress = 0;
+  predictedBody.player.medevacRemaining = DT / 2;
+  stepSessionClient(predicted, DT);
+  ok("client prediction may expire the fallback clock but cannot medevac the body",
+    predictedBody.player.downed
+      && predictedBody.player.hp === 0
+      && predictedBody.player.medevacRemaining === 0
+      && !predictedBody.player.autoMedevac,
+    `${predictedBody.player.medevacRemaining.toFixed(3)} s, down ${predictedBody.player.downed}`);
+
+  // Contact exclusion must be tested at the call site, not through Player.hurt's own
+  // downed guard. Count actual calls and pair the body with a living control at the
+  // same coordinates so an out-of-range setup cannot pass vacuously.
+  const contactCalls = (downed) => {
+    const contact = makeSim();
+    const p = contact.player;
+    const cfg = CFG.enemies.chewer;
+    p.position.set(300, cfg.height / 2, 300);
+    p.base = null;
+    p.spawnGrace = 0;
+    if (downed) p.hurt(1e6);
+    const hurt = p.hurt.bind(p);
+    let calls = 0;
+    p.hurt = (amount) => { calls++; return hurt(amount); };
+    const chewer = contact.horde.spawn(CHEWER);
+    chewer.x = p.position.x;
+    chewer.y = p.position.y;
+    chewer.z = p.position.z;
+    chewer.state = ENEMY_STATE.HUNT_LEG;
+    chewer.atkCd = 0;
+    contact.horde.update(DT, [p]);
+    return { calls, cooldown: chewer.atkCd };
+  };
+  const liveContact = contactCalls(false);
+  const downedContact = contactCalls(true);
+  ok("the contact setup hits a living operative (test is not vacuous)",
+    liveContact.calls === 1 && liveContact.cooldown > 0,
+    `${liveContact.calls} call, cooldown ${liveContact.cooldown.toFixed(2)} s`);
+  ok("contact targeting skips a downed body before calling hurt or spending cooldown",
+    downedContact.calls === 0 && downedContact.cooldown === 0,
+    `${downedContact.calls} calls, cooldown ${downedContact.cooldown.toFixed(2)} s`);
+
+  // The Spiker has two separate body loops: acquisition and interception. A downed
+  // operative is the nearer body on the same open ray, while a living teammate beyond
+  // it proves both loops continue to a valid target rather than merely finding none.
+  const ranged = createSession({ seats: 2 });
+  ranged.trampler.walking = false;
+  ranged.trampler.turning = false;
+  const [liveEntry, downEntry] = ranged.operatives;
+  const liveTarget = liveEntry.player;
+  const downTarget = downEntry.player;
+  liveTarget.position.set(310, 1.2, 300);
+  liveTarget.base = null;
+  liveTarget.spawnGrace = 0;
+  downTarget.position.set(305, 1.2, 300);
+  downTarget.base = null;
+  downTarget.spawnGrace = 0;
+  downTarget.hurt(1e6);
+
+  const rangedCfg = CFG.enemies.spiker;
+  const spiker = ranged.horde.spawn(SPIKER);
+  spiker.x = 300;
+  spiker.y = rangedCfg.height / 2;
+  spiker.z = 300;
+  spiker.state = ENEMY_STATE.CHARGING;
+  spiker.chargeT = rangedCfg.chargeTime;
+  spiker.shotLocked = false;
+  spiker.shotTarget = null;
+  ranged.horde.update(DT, [downTarget, liveTarget]);
+  ok("Spiker acquisition skips the nearer downed body for a living operative",
+    spiker.shotTarget === liveTarget && spiker.shotLeg === -1,
+    spiker.shotTarget === liveTarget ? "living target acquired" : "wrong target");
+
+  const downHurt = downTarget.hurt.bind(downTarget);
+  let downedInterceptCalls = 0;
+  downTarget.hurt = (amount) => { downedInterceptCalls++; return downHurt(amount); };
+  const liveHp = liveTarget.hp;
+  const locked = liveTarget.eyePosition(new THREE.Vector3());
+  spiker.lockX = locked.x;
+  spiker.lockY = locked.y;
+  spiker.lockZ = locked.z;
+  spiker.shotTarget = liveTarget;
+  spiker.shotLeg = -1;
+  spiker.shotLocked = true;
+  spiker.chargeT = 0;
+  ranged.horde.update(DT, [downTarget, liveTarget]);
+  ok("a downed body cannot intercept a Spiker ray meant for a living teammate",
+    downedInterceptCalls === 0
+      && liveTarget.hp < liveHp
+      && spiker.state === ENEMY_STATE.FIRING,
+    `${downedInterceptCalls} downed calls, living hp ${liveHp.toFixed(0)} -> `
+    + `${liveTarget.hp.toFixed(0)}, state ${spiker.state}`);
+
+  // ---- completion. Start close to the fallback deadline so the test proves an
+  // uninterrupted channel receives grace rather than losing a 1.9 s recovery to the clock.
+  const finish = recoveryAuthority(2);
+  const [rescuer, casualty] = finish.operatives;
+  casualty.player.hurt(1e6);
+  casualty.player.medevacRemaining = 0.5;
+  const casualtyAt = casualty.player.position.clone();
+  rescuer.input.keys.add(CFG.repair.key);
+
+  const pastDeadlineFrames = Math.ceil(0.75 / DT);
+  for (let i = 0; i < pastDeadlineFrames; i++) stepSession(finish, DT);
+  ok("an active channel survives the medevac deadline",
+    casualty.player.downed && casualty.player.medevacRemaining === 0
+      && casualty.player.recoveryProgress >= 0.7,
+    `${casualty.player.recoveryProgress.toFixed(2)} s recovered at `
+    + `${casualty.player.medevacRemaining.toFixed(2)} s fallback`);
+
+  let recoveryFrames = pastDeadlineFrames;
+  while (casualty.player.downed && recoveryFrames < 60 * 4) {
+    stepSession(finish, DT);
+    recoveryFrames++;
+  }
+  ok("holding E recovers a teammate in the configured two seconds",
+    Math.abs(recoveryFrames * DT - CFG.combat.recovery.recoverTime) <= DT * 2,
+    `${(recoveryFrames * DT).toFixed(3)} s`);
+  ok("teammate recovery returns in place at forty percent rather than medevacing",
+    !casualty.player.downed && casualty.player.base === null && !casualty.player.autoMedevac
+      && casualty.player.position.distanceTo(casualtyAt) < 0.03
+      && Math.abs(casualty.player.hp
+        - casualty.player.maxHp * CFG.combat.recovery.returnHealth) < 1e-9,
+    `${casualty.player.hp.toFixed(0)}/${casualty.player.maxHp} hp, `
+    + `${(casualty.player.position.distanceTo(casualtyAt) * 100).toFixed(2)} cm from body`);
+  ok("teammate recovery grants the same post-return immunity",
+    casualty.player.spawnGrace > CFG.combat.spawnGrace - DT * 2,
+    `${casualty.player.spawnGrace.toFixed(3)} s`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2921,6 +3315,14 @@ console.log("\n61. Kills pay into two separate purses");
     economy.salvage === e.salvage + CFG.economy.climber.salvage,
     `${economy.salvage} salvage`);
 
+  const beforeSpiker = { salvage: economy.salvage, scrap: economy.scrap };
+  const spiker = horde.spawn(SPIKER);
+  horde.damage(spiker, 1e6, sim.player);
+  ok("the ranged roster entry has an explicit payout rather than the chewer fallback",
+    economy.salvage === beforeSpiker.salvage + CFG.economy.spiker.salvage
+      && economy.scrap === beforeSpiker.scrap + CFG.economy.spiker.scrap,
+    `${CFG.economy.spiker.salvage} salvage, ${CFG.economy.spiker.scrap} scrap`);
+
   // Every damage source funnels through Horde.damage, so nothing can pay nothing.
   // EVERY KILL STILL PAYS, BUT NOT EVERY KILL PAYS A PERSON.
   //
@@ -3732,8 +4134,10 @@ console.log("\n67. The HUD is wired to markup that exists, and panels do not pil
 console.log("\n68. Every enemy type is fully specified");
 {
   const fields = Object.keys(CFG.enemies.chewer);
-  ok("there are more than the original two types", ENEMY_TYPE_KEYS.length >= 6,
+  ok("there are more than the original two types", ENEMY_TYPE_KEYS.length >= 7,
     ENEMY_TYPE_KEYS.join(", "));
+  ok("the roster still fits the wire's three-bit type field",
+    ENEMY_TYPE_KEYS.length <= 8, `${ENEMY_TYPE_KEYS.length} / 8 numeric type ids`);
 
   const missing = [];
   for (const key of ENEMY_TYPE_KEYS) {
@@ -3754,11 +4158,31 @@ console.log("\n68. Every enemy type is fully specified");
   ok("no type has a zero where a zero would make it harmless", harmless.length === 0,
     harmless.length ? `SUSPECT: ${harmless.join(", ")}` : "all positive");
 
-  // Damage is the one field allowed to be zero, and exactly one type does it.
-  const zeroDamage = ENEMY_TYPE_KEYS.filter((k) => CFG.enemies[k].damage === 0);
-  ok("only the sapper deals no contact damage, and it has a fuse instead",
-    zeroDamage.length === 1 && zeroDamage[0] === "sapper" && CFG.enemies.sapper.fuse > 0,
-    `zero-damage types: ${zeroDamage.join(", ") || "none"}`);
+  const brokenRanged = ENEMY_TYPE_KEYS.filter((key) => {
+    const c = CFG.enemies[key];
+    return c.fireRadius > 0 && (!(c.fireArc > 0) || !(c.fireRange > c.fireRadius)
+      || !(c.chargeTime > c.lockTime) || !(c.lockTime > 0)
+      || !(c.repositionArc > 0) || !(c.legDamageScale > 0)
+      || !(c.shotFlash > 0));
+  });
+  ok("every ranged type can reach, lock, hurt a leg, reposition, and show its release",
+    brokenRanged.length === 0,
+    brokenRanged.length ? `BROKEN RANGED CONFIG: ${brokenRanged.join(", ")}` : "usable ranged cycle");
+
+  // Contact damage may be disabled only when the type has a separate live attack.
+  // Test the actual contact expression rather than `damage === 0`: the Spiker keeps
+  // non-zero damage for its shot and opts out through `contactScale`.
+  const noContact = ENEMY_TYPE_KEYS.filter((key) => {
+    const c = CFG.enemies[key];
+    return c.damage * c.contactScale === 0;
+  });
+  ok("only the sapper and Spiker skip contact, and each has an attack instead",
+    noContact.length === 2
+      && noContact.includes("sapper")
+      && noContact.includes("spiker")
+      && CFG.enemies.sapper.fuse > 0
+      && CFG.enemies.spiker.fireRadius > 0,
+    `no-contact types: ${noContact.join(", ") || "none"}`);
 
   // The structural half of the guarantee: every type has the SAME key set, not
   // merely a superset. A type with an extra field is the other direction of the
@@ -4168,6 +4592,31 @@ console.log("\n72. A foot crushes the player but settles nothing");
   });
   ok("but the player standing under a foot is crushed", hurtCount > 0,
     `hurt ${hurtCount} times`);
+
+  // Once incapacitated the same body must stop being an invulnerable stomp target.
+  // Drive one valid footfall directly so the assertion measures the exclusion rather
+  // than waiting for gait timing to coincide with a body position.
+  const sim4 = makeSim();
+  const p4 = sim4.player;
+  const t4 = sim4.trampler;
+  const footLocal = t4.legs[0].userData.footLocal;
+  t4.localToWorld(_fw.copy(footLocal));
+  p4.position.set(_fw.x, _fw.y + 1.2, _fw.z);
+  p4.base = null;
+  p4.spawnGrace = 0;
+  p4.hurt(1e6);
+  const downedHurt = p4.hurt.bind(p4);
+  let downedStompCalls = 0;
+  p4.hurt = (amount) => { downedStompCalls++; return downedHurt(amount); };
+  t4.footfalls = [{ leg: 0, local: footLocal }];
+  t4.resolveStomps(null, [p4]);
+  ok("a real footfall was placed over the downed body (test is not vacuous)",
+    Math.hypot(p4.position.x - _fw.x, p4.position.z - _fw.z)
+      < CFG.trampler.stomp.radius,
+    `${Math.hypot(p4.position.x - _fw.x, p4.position.z - _fw.z).toFixed(2)} m from foot`);
+  ok("stomp resolution skips a downed body before calling hurt",
+    downedStompCalls === 0 && !t4.playerStomped,
+    `${downedStompCalls} calls, playerStomped ${t4.playerStomped}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -5112,6 +5561,9 @@ console.log("\n81. Waves gain new types on schedule without changing size");
   ok("bulwarks arrive on schedule",
     !w2.bulwark && (w3.bulwark ?? 0) > 0,
     `wave ${c.bulwarkFromWave} configured; w2 ${w2.bulwark ?? 0}, w3 ${w3.bulwark}`);
+  ok("the ranged type arrives as a singleton after the two teaching waves",
+    !w2.spiker && (w3.spiker ?? 0) === 1,
+    `wave ${c.spikerFromWave} configured; w2 ${w2.spiker ?? 0}, w3 ${w3.spiker ?? 0}`);
   ok("sappers arrive on schedule",
     !w3.sapper && (counts(director.buildWave(4)).sapper ?? 0) > 0,
     `wave ${c.sapperFromWave} configured`);
@@ -5230,21 +5682,27 @@ console.log("\n81. Waves gain new types on schedule without changing size");
   // And the tail of the priority list must not be starved. Measured: a single-pass
   // allocation in priority order let the bulwark ramp take the remaining room at
   // landmark 3, and the SAPPER disappeared from the wave — the one enemy that is a
-  // timer rather than a damage race, and the reason to go under the hull right now.
-  // Escalating the roster and having it eat itself is worse than not escalating it.
+  // timer rather than a damage race. The seventh type makes checking only that one
+  // historical victim insufficient, so every scheduled special is derived here.
   const starved = [];
-  for (let leg = 2; leg <= 3; leg++) {
-    for (let wave = 2; wave <= CFG.waves.siegeLength; wave++) {
+  const dueTypes = [
+    ["burrower", c.burrowerFromWave],
+    ["bulwark", c.bulwarkFromWave],
+    ["sapper", c.sapperFromWave],
+    ["spiker", c.spikerFromWave],
+  ];
+  for (let leg = 1; leg <= 3; leg++) {
+    for (let wave = 1; wave <= CFG.waves.siegeLength; wave++) {
       const t = waveAt(leg, wave);
-      const tier = leg === 2 ? wave + 2 : wave + 4;
-      if (tier >= CFG.enemies.composition.sapperFromWave && !t.sapper) {
-        starved.push(`leg ${leg} wave ${wave} (tier ${tier})`);
+      const tier = wave + (leg - 1) * c.tierPerLeg;
+      for (const [key, from] of dueTypes) {
+        if (tier >= from && !t[key]) starved.push(`${key} at leg ${leg} wave ${wave} (tier ${tier})`);
       }
     }
   }
   ok("once a type is due it always appears, so the roster cannot eat its own tail",
     starved.length === 0,
-    starved.length ? `SAPPER STARVED at ${starved.join(", ")}` : "every due type is present");
+    starved.length ? `STARVED: ${starved.join(", ")}` : "every due type is present");
 }
 
 // ---------------------------------------------------------------------------
@@ -5431,8 +5889,9 @@ console.log("\n83. The particle and viewmodel layer runs against the real sim");
   if (Fx && ViewModel) {
     const sim = makeSim();
     const fx = new Fx(sim.scene, sim.camera);
-    const viewmodel = new ViewModel(sim.camera);
-    ok("both constructed against a real scene and camera", !!fx.points && !!viewmodel.group);
+    const viewmodel = new ViewModel(sim.camera, sim.scene);
+    ok("both constructed against a real scene and camera",
+      !!fx.points && !!viewmodel.group && !!viewmodel.body);
 
     // A renderer stub, because fx.js now reads the drawing buffer's height every
     // frame to bound how much of the screen one sprite may own. Only
@@ -5572,6 +6031,37 @@ console.log("\n83. The particle and viewmodel layer runs against the real sim");
       typeof sim.weapon.weaponName === "string" && sim.weapon.weaponName.length > 0
       && typeof sim.weapon.profile.detail === "string",
       `"${sim.weapon.weaponName}" — ${sim.weapon.profile.detail}`);
+
+    // The fixed downed camera is third person, so the local operative needs a body
+    // in the world while the carried model disappears. Use the real scene-backed
+    // constructor and a ground fall, where the correct parent is the scene itself.
+    if (sim.player.downed) sim.player.recoverInPlace();
+    sim.player.position.set(40, 1.2, 40);
+    sim.player.base = null;
+    sim.player.velocity.set(0, 0, 0);
+    sim.player.hp = sim.player.maxHp;
+    sim.player.spawnGrace = 0;
+    sim.player.yaw = 0.61;
+    sim.player.hurt(1e6);
+    viewmodel.update(DT, ctx);
+    ok("the scene-backed viewmodel draws the incapacitated body at the fall pose",
+      viewmodel.body.group.visible
+      && viewmodel.body.group.parent === sim.scene
+      && viewmodel.body.group.position.distanceTo(sim.player.position) < 1e-9
+      && Math.abs(viewmodel.body.group.rotation.y - sim.player.viewYaw) < 1e-9
+      && Math.abs(viewmodel.body.rig.rotation.z - Math.PI / 2) < 1e-9,
+      `visible ${viewmodel.body.group.visible}, parent `
+      + `${viewmodel.body.group.parent === sim.scene ? "scene" : "other"}, `
+      + `yaw ${viewmodel.body.group.rotation.y.toFixed(2)}`);
+    ok("incapacitation hides the carried weapon while that body is visible",
+      !viewmodel.group.visible && viewmodel.body.group.visible,
+      `weapon ${viewmodel.group.visible}, body ${viewmodel.body.group.visible}`);
+
+    sim.player.recoverInPlace();
+    viewmodel.update(DT, ctx);
+    ok("the body disappears and the carried weapon returns after recovery",
+      !viewmodel.body.group.visible && viewmodel.group.visible,
+      `weapon ${viewmodel.group.visible}, body ${viewmodel.body.group.visible}`);
   }
 
   delete globalThis.document;
@@ -7563,13 +8053,11 @@ console.log("\n93. Conditional items pay only under their condition");
     `${dealt.toFixed(1)} dealt vs ${plain.toFixed(1)} unbuffed`
     + ` (+${Math.round(weapon.damageBonus * 100)}% live, [${items.reasons.join(", ")}])`);
 
-  // ---- dying on the ground must NOT pay the boarding buff.
+  // ---- an emergency medevac from the ground must NOT pay the boarding buff.
   //
-  // `hurt()` respawns you on the deck, which is a ground->aboard move as far as
-  // `player.base` can tell, and the transition items read exactly that. Paying for it
-  // would be paying the player for failing — the same objection that stops an on-kill
-  // item rewarding a sapper's charge going off, and it is worth a test because nothing
-  // about it looks wrong: you die, and your next three seconds of shots hit harder.
+  // The death and the ground->deck move are now separated by four seconds, so a
+  // death-counter check cannot distinguish an earned grapple from the fallback.
+  // Items consumes any base transition whose current or prior frame was downed.
   const deathSim = makeSim();
   deathSim.economy.stacks.spurs = 1;
   deathSim.economy.stacks.dropHarness = 1;
@@ -7577,9 +8065,9 @@ console.log("\n93. Conditional items pay only under their condition");
   deathSim.trampler.walking = false;
   deathSim.trampler.turning = false;
   placeOnGroundAt(deathSim, 0, -30);
-  // Let the drop bonus from placeOnGroundAt expire, so what is measured is the death.
+  // Let the drop bonus from placeOnGroundAt expire, so what is measured is the medevac.
   step(deathSim, Math.ceil(60 * (CFG.items.dropHarness.seconds + 0.5)));
-  ok("nothing is live before the death (test is not vacuous)",
+  ok("nothing is live before incapacitation (test is not vacuous)",
     deathSim.items.bonus === 0 && deathSim.player.base === null,
     `bonus ${deathSim.items.bonus}, base ${deathSim.player.base ? "deck" : "ground"}`);
 
@@ -7587,14 +8075,25 @@ console.log("\n93. Conditional items pay only under their condition");
   const deathsBefore = deathSim.player.deaths;
   deathSim.player.hurt(1e6);
   step(deathSim, 1);
-  ok("the death actually happened and put the player back on the deck",
-    deathSim.player.deaths === deathsBefore + 1 && !!deathSim.player.base,
-    `${deathSim.player.deaths} deaths, base ${deathSim.player.base ? "deck" : "ground"}`);
-  ok("but dying pays no boarding bonus, because that would reward failing",
+  ok("the lethal hit happened but left its body on the ground",
+    deathSim.player.deaths === deathsBefore + 1
+      && deathSim.player.downed && deathSim.player.base === null,
+    `${deathSim.player.deaths} deaths, down ${deathSim.player.downed}, `
+    + `base ${deathSim.player.base ? "deck" : "ground"}`);
+
+  let medevacFrames = 1;
+  while (deathSim.player.downed && medevacFrames < 60 * 6) {
+    step(deathSim, 1);
+    medevacFrames++;
+  }
+  ok("the emergency recovery actually moved the player to deck (not vacuous)",
+    !deathSim.player.downed && deathSim.player.autoMedevac && !!deathSim.player.base,
+    `${(medevacFrames * DT).toFixed(2)} s, base ${deathSim.player.base ? "deck" : "ground"}`);
+  ok("but medevac pays no boarding bonus, because that would reward failing",
     deathSim.items.bonus === 0 && !deathSim.items.reasons.includes("BOARDED"),
     `+${Math.round(deathSim.items.bonus * 100)}% [${deathSim.items.reasons.join(", ")}]`);
 
-  // And the transition must be CONSUMED rather than deferred: if the death only
+  // The transition must be CONSUMED rather than deferred: if the downed gate only
   // skipped the payout for one frame, the buff would simply arrive on the next.
   step(deathSim, 30);
   ok("and it does not arrive a frame later either",
@@ -11643,24 +12142,25 @@ console.log("\n116. The horde's walk cycle moves limbs without leaving the hit b
 
   ok("every type carries both the rig and the per-instance gait attribute",
     missingAttrs === 0, `${missingAttrs} missing`);
-  // Three, and the three WITHOUT limbs are each deliberate: a chewer's only appendages
+  // Four, and the three WITHOUT limbs are each deliberate: a chewer's only appendages
   // are mandibles, a burrower is a segmented worm, and a climber's forelimbs point
   // forward, so the hang-driven swing is the wrong rule for all three. There is no
   // headroom in this bound on purpose -- if a silhouette loses its legs, that is a thing
   // to be told about rather than absorbed.
   ok("limbs were actually classified on the types that have them (not vacuous)",
-    typesWithLimbs >= 3,
-    `${typesWithLimbs} of ${ENEMY_TYPE_KEYS.length} types — the bulwark, sapper and`
-    + ` titan walk on legs; the chewer, burrower and climber have none to swing`);
+    typesWithLimbs === 4,
+    `${typesWithLimbs} of ${ENEMY_TYPE_KEYS.length} types — the bulwark, sapper, titan and`
+    + ` spiker walk on legs; the chewer, burrower and climber have none to swing`);
   ok("left and right carry the same vertex count, so nothing limps",
     unbalanced === 0, `${unbalanced} unbalanced`);
   ok("and every limb hangs BELOW its pivot, or the swing multiplies by zero",
     deadPivots === 0, `${deadPivots} limbs with a dead pivot`);
 
   // The bound is 0.15 m and it is chosen by the failure it catches, not by taste: the
-  // measured worst across all six types is 0.099 m, and the climber mistake this is
-  // guarding against measured 0.182 m. Anything between leaves room for a silhouette
-  // tweak without leaving room for classifying a forward-pointing arm as a leg.
+  // measured worst across all seven types is still 0.099 m at the titan in x, and the
+  // climber mistake this is guarding against measured 0.182 m. Anything between leaves
+  // room for a silhouette tweak without leaving room for classifying a forward-pointing
+  // arm as a leg.
   ok("no type's silhouette is pulled far off its hit box by the animation",
     worstAdded < 0.15,
     `worst ${worstAdded.toFixed(3)} m at ${worstWhere}, against a measured 0.099 m`
@@ -12127,6 +12627,20 @@ console.log("\n119. The horde crosses the wire, and carried bodies stay carried"
   server.director.callEarly();
   for (let i = 0; i < 60 * 30; i++) stepSession(server, DT);
 
+  // Preserve the real-wave coverage above, then fill only the numeric ids it did not
+  // happen to produce. The old assertion said "all six" while merely comparing the
+  // types present in that first wave, so it could pass without exercising most of the
+  // type field. The Spiker also owns the maximum three-bit state value; force that exact
+  // value onto a real pooled body so state 7 cannot be truncated unnoticed.
+  const represented = new Set(
+    server.horde.pool.filter((e) => e.alive).map((e) => e.type),
+  );
+  for (let type = 0; type < ENEMY_TYPE_KEYS.length; type++) {
+    if (!represented.has(type)) server.horde.spawn(type);
+  }
+  const wireSpiker = server.horde.pool.find((e) => e.alive && e.type === SPIKER);
+  wireSpiker.state = ENEMY_STATE.FIRING;
+
   const live = server.horde.liveCount;
   let carried = 0;
   let aboard = 0;
@@ -12149,8 +12663,10 @@ console.log("\n119. The horde crosses the wire, and carried bodies stay carried"
   // ---- BANDWIDTH, asserted so it cannot creep ------------------------------
   const bytes = buffer.byteLength;
   const perBody = ENTITY_BYTES;
-  ok("one body costs fourteen bytes, including its spawn generation",
-    perBody === 14, `${perBody} B each`);
+  const perSpikerShot = SPIKER_SHOT_BYTES;
+  ok("one body remains fourteen bytes and one sparse Spiker release costs sixteen",
+    perBody === 14 && perSpikerShot === 16,
+    `${perBody} B per body, ${perSpikerShot} B per release`);
   ok("the snapshot is the size the format predicts", bytes === snapshotBytes(liveState),
     `${bytes} B for ${live} bodies and ${server.operatives.length} operative(s)`);
   // The realistic peak: wave five at a four-crew scale is 30 x 2.5 = 75 bodies, with the four
@@ -12185,6 +12701,8 @@ console.log("\n119. The horde crosses the wire, and carried bodies stay carried"
   let matched = 0;
   let typesOk = true;
   let statesOk = true;
+  const typesSeen = new Set();
+  let sawMaxState = false;
   for (let i = 0; i < server.horde.pool.length; i++) {
     const s = server.horde.pool[i];
     const c = client.horde.pool[i];
@@ -12196,6 +12714,8 @@ console.log("\n119. The horde crosses the wire, and carried bodies stay carried"
       continue;
     }
     matched++;
+    typesSeen.add(s.type);
+    if (s.state === ENEMY_STATE.FIRING) sawMaxState = true;
     if (c.type !== s.type) typesOk = false;
     if (c.state !== s.state) statesOk = false;
     const d = Math.hypot(c.x - s.x, c.y - s.y, c.z - s.z);
@@ -12208,8 +12728,12 @@ console.log("\n119. The horde crosses the wire, and carried bodies stay carried"
 
   ok("every live body was matched by pool index (test is not vacuous)", matched === live,
     `${matched} of ${live}`);
-  ok("types survive the wire", typesOk, "all six types round-trip");
-  ok("states survive, and nothing is alive on one side only", statesOk, worstBody || "clean");
+  ok("types survive the wire, including every numeric roster id",
+    typesOk && typesSeen.size === ENEMY_TYPE_KEYS.length,
+    `${typesSeen.size} of ${ENEMY_TYPE_KEYS.length} types round-trip`);
+  ok("states survive through the maximum three-bit value, and nothing is alive on one side only",
+    statesOk && sawMaxState,
+    !sawMaxState ? "FIRING state 7 was not represented" : (worstBody || "state 7 round-tripped"));
 
   // ONE CENTIMETRE, which is the quantisation and nothing else. This is the assertion that
   // the frame conversion is right in BOTH directions: a carried body is encoded into hull
@@ -12365,6 +12889,10 @@ console.log("\n120. Seating a crew on the server makes the co-op rules reachable
   const solo = createSession({ seats: 1 });
   const four = createSession({ seats: 4 });
 
+  ok("persistent Spiker releases use protocol v12 without growing Recovery records",
+    PROTOCOL_VERSION === 12, `protocol v${PROTOCOL_VERSION}`);
+  ok("the three recovery fields cost exactly three bytes per operative",
+    OPERATIVE_BYTES === 79, `${OPERATIVE_BYTES} B = 76 B prior record + 3 B recovery`);
   ok("a four-seat session really seats four operatives (test is not vacuous)",
     four.crew.size === 4 && four.operatives.length === 4,
     `crew ${four.crew.size}, ${four.operatives.length} kits`);
@@ -12508,6 +13036,36 @@ console.log("\n120. Seating a crew on the server makes the co-op rules reachable
   }
   ok("and every operative lands within a centimetre of where the server has them",
     worstOp < 0.02, `worst ${(worstOp * 100).toFixed(2)} cm`);
+
+  // Incapacitation metadata is authority state. Distinctive tenths and a non-zero
+  // owner make an offset/order mistake visible instead of letting three zeroes pass.
+  const sourceDown = four.operatives[2].player;
+  sourceDown.spawnGrace = 0;
+  sourceDown.hurt(1e6);
+  sourceDown.medevacRemaining = 6.3;
+  sourceDown.recoveryProgress = 1.2;
+  sourceDown.rescuerSeat = 2;
+  const recoveryState = decode(encode(snapshotOf(four, 121)).buffer);
+  const recoveryWire = recoveryState.operatives.find((op) => op.seat === 3);
+  applySnapshot(client, recoveryState);
+  const recoveryClient = client.operatives[2].player;
+
+  ok("the recovery snapshot scenario is genuinely downed (not vacuous)",
+    sourceDown.downed && sourceDown.hp === 0,
+    `down ${sourceDown.downed}, ${sourceDown.hp} hp`);
+  ok("the wire round-trips fallback, channel progress and rescuer seat",
+    Math.abs(recoveryWire.medevacRemaining - 6.3) <= 0.05
+      && Math.abs(recoveryWire.recoveryProgress - 1.2) <= 0.05
+      && recoveryWire.rescuerSeat === 2,
+    `${recoveryWire.medevacRemaining.toFixed(1)} s fallback, `
+    + `${recoveryWire.recoveryProgress.toFixed(1)} s channel, seat ${recoveryWire.rescuerSeat}`);
+  ok("applying that snapshot restores the downed lifecycle metadata",
+    recoveryClient.downed
+      && Math.abs(recoveryClient.medevacRemaining - 6.3) <= 0.05
+      && Math.abs(recoveryClient.recoveryProgress - 1.2) <= 0.05
+      && recoveryClient.rescuerSeat === 2,
+    `down ${recoveryClient.downed}, ${recoveryClient.medevacRemaining.toFixed(1)} s, `
+    + `${recoveryClient.recoveryProgress.toFixed(1)} s, seat ${recoveryClient.rescuerSeat}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -12691,9 +13249,9 @@ console.log("\n121. A keypress crosses the wire and the server decides what it d
       + ` leg 1 ${hp1.toFixed(1)} -> ${targetClient.trampler.legHp[1].toFixed(1)}`);
   }
 
-  // Death happens after repair in the authority frame. The teleport itself must clear the
-  // published claim or a snapshot on that tick tells every client a deck-spawned ghost still
-  // owns the point until the next packet.
+  // Incapacitation happens after repair in the authority frame. The body stays at
+  // the point until recovery, but the down event itself must clear the published
+  // claim or a snapshot on that tick advertises an invulnerable ghost welder.
   {
     const deathServer = createSession({ seats: 1, networked: true });
     deathServer.trampler.walking = false;
@@ -12715,12 +13273,14 @@ console.log("\n121. A keypress crosses the wire and the server decides what it d
     deathOp.player.hurt(1e6);
     const deathState = decode(encode(snapshotOf(deathServer, 1002)).buffer);
     const deathWire = deathState.operatives[0];
-    ok("a death-tick snapshot clears the exact repair claim immediately",
+    ok("an incapacitation-tick snapshot clears the exact repair claim immediately",
       deathOp.player.deaths === 1
+      && deathOp.player.downed
       && deathOp.player.repairing === null
+      && deathWire.medevacRemaining > 0
       && unpackRepairTarget(deathWire.repairTarget) === null,
-      `deaths ${deathOp.player.deaths}, local ${deathOp.player.repairing},`
-      + ` wire ${unpackRepairTarget(deathWire.repairTarget)}`);
+      `deaths ${deathOp.player.deaths}, down ${deathOp.player.downed},`
+      + ` local ${deathOp.player.repairing}, wire ${unpackRepairTarget(deathWire.repairTarget)}`);
   }
 
   // ---- simultaneous repair claims choose an action, not an authority fallback ----------

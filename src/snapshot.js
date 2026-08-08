@@ -41,7 +41,7 @@
 // refused it, because "could not connect" sends someone to check their network when the
 // actual problem is a stale browser tab holding last week's JavaScript. That specific
 // case is not hypothetical for a project with no build step and no cache busting.
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 12;
 
 // Message kinds. One byte, so there is room to add the horde and the operatives in later
 // slices without touching anything here.
@@ -416,8 +416,8 @@ const ENTITY = [
   ["x", "metres"],
   ["y", "metres"],
   ["z", "metres"],
-  // A sapper's fuse is the one enemy timer the HUD must read. A tenth of a second is
-  // finer than its displayed precision and keeps the per-body growth to one byte.
+  // One mutually-exclusive enemy cue timer: a sapper fuse or a Spiker charge. A tenth of a
+  // second is finer than either displayed cue and keeps the per-body growth to one byte.
   ["fuseT", "shortSeconds"],
   // 8 bits, not 16, and the asymmetry with the hull's yaw is deliberate. The hull's rotation
   // is applied to every attached body, so its angular error multiplies by distance from the
@@ -427,7 +427,27 @@ const ENTITY = [
 ];
 
 /**
- * ONE OPERATIVE. Appended after the entities, prefixed by a count.
+ * ONE SPIKER RELEASE, SIXTEEN BYTES. Appended after entities, prefixed by a 16-bit count.
+ *
+ * Releases are sparse and discrete, so charging every live body for an endpoint would make
+ * the hot 14-byte entity record carry mostly zeroes. The reset-scoped sequence deduplicates
+ * the repeated recent journal; exact world-space endpoints preserve what stopped the shot
+ * even after the shooter dies, its pool slot is reused, or bodies are rendered 120 ms late.
+ */
+const SPIKER_SHOT = [
+  // A reset-scoped monotonic sequence. The u32 `millis` codec is the honest width even
+  // though this value is an index rather than a clock.
+  ["seq", "millis"],
+  ["startX", "metres"],
+  ["startY", "metres"],
+  ["startZ", "metres"],
+  ["endX", "metres"],
+  ["endY", "metres"],
+  ["endZ", "metres"],
+];
+
+/**
+ * ONE OPERATIVE. Appended after the sparse Spiker releases, prefixed by a count.
  *
  * The frame bit is here for the same reason it is on an enemy and on a relayed pose: a
  * crewmate standing on the deck is sent in hull-local space, because the receiver already
@@ -504,6 +524,13 @@ const OPERATIVE = [
   // welder per point: two simultaneous claims need the key, not merely the fact of welding.
   ["repairTarget", "count"],
 
+  // Incapacitation is authority state, not a duration reconstructed from packet arrival.
+  // Tenths are ample for both the eight-second fallback and two-second recovery channel;
+  // the owner is a stable numeric seat, with zero meaning no active rescuer.
+  ["medevacRemaining", "shortSeconds"],
+  ["recoveryProgress", "shortSeconds"],
+  ["rescuerSeat", "count"],
+
   // based | repairing | downed | station index (2 bits) | grounded | bay open.
   ["bits", "bits"],
 ];
@@ -535,6 +562,10 @@ export function snapshotBytes(counts = {}) {
   // be, which reads as enemies vanishing under load rather than as an overflow.
   n += 2;
   n += ENTITY_BYTES * lengthOf(counts.entities);
+  // Sparse Spiker releases: a 16-bit count plus exact world-space segments. Kept outside
+  // ENTITY so a quiet 420-body horde pays only these two bytes.
+  n += 2;
+  n += SPIKER_SHOT_BYTES * lengthOf(counts.spikerShots);
   // Operatives: a count byte plus the crew. One byte is ample where CREW_MAX is 4, and the
   // asymmetry with the entity count is deliberate rather than sloppy — the crew cap is a
   // design decision justified by the fortress's geometry, not a number that grows.
@@ -547,6 +578,13 @@ export function snapshotBytes(counts = {}) {
 export const ENTITY_BYTES = (() => {
   let n = 0;
   for (const [, kind] of ENTITY) n += CODECS[KINDS[kind].codec].bytes;
+  return n;
+})();
+
+/** Bytes one sparse Spiker release occupies. */
+export const SPIKER_SHOT_BYTES = (() => {
+  let n = 0;
+  for (const [, kind] of SPIKER_SHOT) n += CODECS[KINDS[kind].codec].bytes;
   return n;
 })();
 
@@ -643,6 +681,12 @@ export function encode(state) {
   put("tally", entities.length);
   for (const e of entities) {
     for (const [key, kind] of ENTITY) put(kind, e[key]);
+  }
+
+  const spikerShots = state.spikerShots ?? [];
+  put("tally", spikerShots.length);
+  for (const shot of spikerShots) {
+    for (const [key, kind] of SPIKER_SHOT) put(kind, shot[key]);
   }
 
   const ops = state.operatives ?? [];
@@ -764,6 +808,23 @@ export function decode(buffer) {
   }
   state.entities = entities;
 
+  const shotCount = take("tally");
+  const shotRemaining = total - o;
+  if (shotCount * SPIKER_SHOT_BYTES > shotRemaining) {
+    throw new SnapshotError(
+      `snapshot claims ${shotCount} Spiker shots (${shotCount * SPIKER_SHOT_BYTES} bytes)`
+      + ` with only ${shotRemaining} left in the buffer`,
+      { cause: "truncated", claimed: shotCount, remaining: shotRemaining },
+    );
+  }
+  const spikerShots = new Array(shotCount);
+  for (let i = 0; i < shotCount; i++) {
+    const shot = {};
+    for (const [key, k] of SPIKER_SHOT) shot[key] = take(k);
+    spikerShots[i] = shot;
+  }
+  state.spikerShots = spikerShots;
+
   const opCount = take("count");
   const operatives = new Array(opCount);
   for (let i = 0; i < opCount; i++) {
@@ -848,10 +909,10 @@ export function unpackPhaseBits(bits) {
 const HP_STEPS = 127;
 
 export function packEnemyBits(e) {
-  // type 0-5 in 3 bits, state 0-4 in 3 bits, then the two booleans that change how a body is
-  // DRAWN rather than what it is. Exactly 8 bits, with nothing spare — a seventh enemy type
-  // would still fit (3 bits reaches 7) but an eighth would not, and that is worth knowing
-  // before someone adds one: `ENEMY_TYPE_KEYS.length` is the number to check.
+  // type 0-6 in 3 bits, state 0-7 in 3 bits, then the two booleans that change how a body is
+  // DRAWN rather than what it is. Exactly 8 bits, with nothing spare — all eight numeric
+  // type values fit, but a ninth would not, and that is worth knowing before someone adds
+  // one: `ENEMY_TYPE_KEYS.length` is the number to check.
   const a = (e.type & 0x07)
     | ((e.state & 0x07) << 3)
     | (e.carried ? 64 : 0)
@@ -928,8 +989,6 @@ export function unpackOperativeBits(bits) {
   return {
     based: (bits & 1) !== 0,
     repairing: (bits & 2) !== 0,
-    // Reserved for a delayed downed state. Carried now because adding a field later costs a
-    // protocol bump and a bit in a byte that already has room costs nothing.
     downed: (bits & 4) !== 0,
     // 0 is on foot; 1..3 is a mount index plus one. The offset is what makes 0 mean "nobody
     // is at a gun" rather than "everybody is at gun zero", which is the same reason
@@ -1115,7 +1174,9 @@ export function toleranceOf(kind, value = 1) {
 }
 
 /** The layout, for tests and for anything that wants to report on the format. */
-export const LAYOUT = { HEADER, BODY, REPEATED, ENTITY, OPERATIVE, INPUT, KINDS, CODECS };
+export const LAYOUT = {
+  HEADER, BODY, REPEATED, ENTITY, SPIKER_SHOT, OPERATIVE, INPUT, KINDS, CODECS,
+};
 
 // --------------------------------------------------------------------------- interpolation
 
@@ -1161,6 +1222,11 @@ export function lerpSnapshot(a, b, t) {
   const f = t <= 0 ? 0 : t >= 1 ? 1 : t;
 
   const out = { ...b };
+
+  // Release events are discrete newest-authority facts, never interpolated. Net consumes
+  // them from the newest packet rather than this delayed render frame; retaining b's array
+  // here makes the pure interpolator's contract explicit for any other caller.
+  out.spikerShots = b.spikerShots ?? [];
 
   // Entities, matched by pool id AND spawn generation. A body present in `b` but not `a`,
   // or a slot whose occupant changed between them, has no history to blend from and appears

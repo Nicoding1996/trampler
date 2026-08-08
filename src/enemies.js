@@ -10,7 +10,7 @@ import { Look, enemyGeometry, animateHorde } from "./look.js";
 // Risk of Rain power curve is that late waves put a screen full of things in
 // front of you to delete.
 //
-// SIX types now, and they exist to attack the pillar from six different angles:
+// SEVEN types now, and they exist to attack the pillar from seven different angles:
 //
 //   Chewers plant themselves INBOARD of the legs, underneath the hull slab.
 //   The deck blocks line of sight straight down, so they cannot be shot from
@@ -30,6 +30,9 @@ import { Look, enemyGeometry, animateHorde } from "./look.js";
 //   Sappers deal no contact damage at all. They plant a charge worth exactly one
 //   leg and light a fuse. They are the reason to go down there RIGHT NOW.
 //
+//   Spikers brace outside the hull and fire at exposed operatives, preferring a
+//   manned station. They are the reason the deck gun is powerful rather than safe.
+//
 //   The titan is 5.2 m tall against 4.5 m of hull clearance, so it cannot get
 //   underneath and has to work from outboard, in the open, where both guns can
 //   see it. It is the one fight that inverts the pillar.
@@ -44,6 +47,7 @@ export const BULWARK = 2;
 export const BURROWER = 3;
 export const SAPPER = 4;
 export const TITAN = 5;
+export const SPIKER = 6;
 
 const S = {
   HUNT_LEG: 0,
@@ -53,6 +57,12 @@ const S = {
   // Underground: driven toward the leg, untouchable, and not counted as pressure
   // because there is nothing the crew can do about it yet.
   BURROWED: 4,
+  TO_FIRE_RING: 5,
+  CHARGING: 6,
+  // The state still owns the stationary release beat and cooldown boundary. Shot
+  // presentation is carried separately by a persistent release event, so neither a
+  // catch-up batch nor snapshot interpolation can consume the visual before rendering.
+  FIRING: 7,
 };
 
 export { S as ENEMY_STATE };
@@ -119,6 +129,16 @@ const _yAxis = new THREE.Vector3(0, 1, 0);
 // Combat history stores carried bodies in hull-local space, exactly like snapshots. One
 // scratch conversion per body avoids allocating vectors in the 60 Hz recording/query loops.
 const _combatLocal = new THREE.Vector3();
+// Ranged-shot scratch. Separate from `_v`/`_local`: target acquisition raycasts once
+// per operative and the instance writer also needs the last resolved segment, so sharing
+// either of the state-machine vectors would make the result depend on call order.
+const _shotStart = new THREE.Vector3();
+const _shotEnd = new THREE.Vector3();
+const _shotDir = new THREE.Vector3();
+const _shotMid = new THREE.Vector3();
+const _shotQ = new THREE.Quaternion();
+const _shotScale = new THREE.Vector3();
+const _shotMatrix = new THREE.Matrix4();
 
 const COMBAT_PRESENT = 1;
 const COMBAT_CARRIED = 2;
@@ -242,6 +262,33 @@ export class Horde {
     this.cursor = 0;
     this.grid = new Grid(CFG.enemies.separation * 2);
 
+    // Spiker sight and shot clipping uses the fortress half of the same bullet-solid
+    // policy as Weapon. Railings stop bodies, not rounds; the hull slab and furniture
+    // remain real cover. Kept here rather than adding World to the Horde signature.
+    this.spikerRay = new THREE.Raycaster();
+    this.spikerRay.near = 0.03;
+    this.spikerHits = [];
+    this.spikerOccluders = trampler.grappleables
+      .filter((m) => m.userData.tag !== "rail");
+
+    // A release is consequence AND presentation, but the two have different clocks.
+    // Damage resolves immediately in #fireSpiker; this reset-scoped sequence and bounded
+    // journal preserve the exact world-space segment until a rendered frame or snapshot can
+    // consume it. Keeping it out of the enemy state is what lets FIRING retain its existing
+    // movement/cooldown meaning without asking a 140 ms flag to survive 250 ms of catch-up.
+    this.spikerShotSeq = 0;
+    this.spikerShotJournal = [];
+
+    // Presentation owns a separate queue. Network events are queued from newest authority
+    // and drawn only after delayed body transforms have been applied; solo events are read
+    // from the journal at that same once-per-render boundary.
+    this.spikerShotPending = [];
+    this.spikerShotActive = [];
+    this.spikerShotSeenSeq = 0;
+    // Null names the local journal. A numeric resetId names an authority generation and
+    // causes the first snapshot of that generation to establish a baseline without replay.
+    this.spikerShotResetId = null;
+
     // How boarders get to the reactor past the deck's furniture. Built once, here,
     // because the deck is static in HULL space -- which is the same property that lets
     // everything else aboard be stored in hull-local coordinates. Lives in the Horde
@@ -314,6 +361,22 @@ export class Horde {
         // Seconds left underground, and seconds left on a planted charge.
         burrowT: 0,
         fuseT: 0,
+        // Ranged lifecycle. The target reference exists only on authority; the frozen
+        // endpoint and segment are plain scalars so pool reuse stays allocation-free.
+        fireAngle: 0,
+        fireDir: 1,
+        chargeT: 0,
+        shotT: 0,
+        shotLocked: false,
+        shotTarget: null,
+        shotLeg: -1,
+        lockX: 0,
+        lockY: 0,
+        lockZ: 0,
+        shotDx: 0,
+        shotDy: 0,
+        shotDz: -1,
+        shotRange: 0,
         // Decaying knock-aside velocity from a foot coming down. Stored as
         // velocity rather than applied as a displacement, because anything that
         // moves a body instantly reads as a teleport -- see invariant 20.
@@ -371,6 +434,7 @@ export class Horde {
       burrower: { color: 0x6d5a45, emissive: 0x1a1005 },
       sapper: { color: 0x2f6a5c, emissive: 0x00301f },
       titan: { color: 0x4a2b34, emissive: 0x3a0a04, metalness: 0.35, roughness: 0.55 },
+      spiker: { color: 0x704b78, emissive: 0x32113d, roughness: 0.68 },
     };
 
     this.meshes = ENEMY_TYPE_KEYS.map((key) => {
@@ -450,6 +514,20 @@ export class Horde {
     this.mounds.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.mounds.receiveShadow = true;
     scene.add(this.mounds);
+
+    // Persistent Spiker release segments are drawn from a once-per-render event queue.
+    // One instanced mesh covers every simultaneous streak without an Object3D per shot;
+    // the queue carries exact world-space endpoints on both authority and snapshot clients.
+    this.spikeShots = new THREE.InstancedMesh(
+      new THREE.CylinderGeometry(1, 1, 1, 6),
+      new THREE.MeshBasicMaterial({ color: 0xffb45a }),
+      CFG.enemies.max,
+    );
+    this.spikeShots.name = "horde_spiker_shots";
+    this.spikeShots.frustumCulled = false;
+    this.spikeShots.count = 0;
+    this.spikeShots.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    scene.add(this.spikeShots);
   }
 
   // ------------------------------------------------------------------- spawn
@@ -523,14 +601,40 @@ export class Horde {
     e.onHull = false;
     e.latched = false; // pooled objects are reused, so every field must be reset
     e.yaw = 0;
+    e.flash = 0;
     e.fuseT = 0;
     e.burrowT = 0;
     e.reactorSlot = false;
     e.shoveVx = 0;
     e.shoveVz = 0;
+    e.chargeT = 0;
+    e.shotT = 0;
+    e.shotLocked = false;
+    e.shotTarget = null;
+    e.shotLeg = -1;
+    e.lockX = 0;
+    e.lockY = 0;
+    e.lockZ = 0;
+    e.shotDx = 0;
+    e.shotDy = 0;
+    e.shotDz = -1;
+    e.shotRange = 0;
 
-
-    if (cfg.goal === "reactor") {
+    if (cfg.fireRadius > 0) {
+      // The goal is held in hull-local polar coordinates and rebuilt every frame.
+      // The enemy itself remains in world space: it has to run to keep its firing
+      // position as the fortress walks, rather than being carried by its target.
+      _local.set(e.x, e.y, e.z);
+      t.worldToLocal(_local);
+      e.fireAngle = clamp(
+        Math.atan2(_local.x, -_local.z),
+        -cfg.fireArc,
+        cfg.fireArc,
+      );
+      e.fireDir = e.fireAngle >= 0 ? -1 : 1;
+      e.state = S.TO_FIRE_RING;
+      e.legIndex = 0;
+    } else if (cfg.goal === "reactor") {
       e.state = S.TO_CLIMB;
       e.routeIndex = (this.random() * t.climbRoutes.length) | 0;
     } else if (cfg.burrowTime > 0) {
@@ -567,6 +671,15 @@ export class Horde {
     this.fuseWarning = 0;
     this.fusesLit = 0;
 
+    this.spikerShotSeq = 0;
+    this.spikerShotJournal.length = 0;
+    this.spikerShotPending.length = 0;
+    this.spikerShotActive.length = 0;
+    this.spikerShotSeenSeq = 0;
+    this.spikerShotResetId = null;
+    this.spikeShots.count = 0;
+    this.spikeShots.instanceMatrix.needsUpdate = true;
+
     // Re-seed, so a restarted encounter is the SAME fight. Seeding exists to make
     // two attempts comparable; carrying the stream across a reset would hand the
     // player a different wave pattern and quietly defeat the whole point.
@@ -574,9 +687,139 @@ export class Horde {
     this.clearRenderCombatFrame();
   }
 
+  /**
+   * Queue discrete release events from the newest authority snapshot.
+   *
+   * The first snapshot of a connection or reset establishes a sequence baseline instead of
+   * replaying whatever recent history it carries. Later snapshots repeat the bounded journal
+   * deliberately, so the sequence cursor makes ingestion exactly-once across packet overlap.
+   */
+  ingestSpikerShots(events = [], resetId = 0) {
+    const generation = Number.isFinite(resetId) ? resetId : 0;
+    let highest = 0;
+    for (const event of events) {
+      const seq = Math.trunc(event?.seq ?? 0);
+      if (Number.isSafeInteger(seq) && seq > highest) highest = seq;
+    }
+
+    if (this.spikerShotResetId !== generation) {
+      this.spikerShotResetId = generation;
+      this.spikerShotSeenSeq = highest;
+      this.spikerShotPending.length = 0;
+      this.spikerShotActive.length = 0;
+      this.spikeShots.count = 0;
+      this.spikeShots.instanceMatrix.needsUpdate = true;
+      return 0;
+    }
+
+    let queued = 0;
+    // Authority appends in sequence order. Advance the cursor even if a malformed event is
+    // unusable, so one bad record cannot be retried by every overlapping snapshot forever.
+    for (const event of events) {
+      const seq = Math.trunc(event?.seq ?? 0);
+      if (!Number.isSafeInteger(seq) || seq <= this.spikerShotSeenSeq) continue;
+      if (this.#queueSpikerShot(event)) queued++;
+      this.spikerShotSeenSeq = seq;
+    }
+    return queued;
+  }
+
+  /**
+   * Advance and draw release events once per browser frame.
+   *
+   * Existing streaks age first and newly queued ones are activated second. Therefore a fresh
+   * release is drawn for at least one frame even when this frame's dt exceeds shotFlash — the
+   * exact case produced by a 250 ms solo catch-up or delayed multiplayer presentation.
+   */
+  presentSpikerShots(dt = 0) {
+    const elapsed = Number.isFinite(dt) ? Math.max(0, dt) : 0;
+    let write = 0;
+    for (const event of this.spikerShotActive) {
+      event.life -= elapsed;
+      if (event.life > 0) this.spikerShotActive[write++] = event;
+    }
+    this.spikerShotActive.length = write;
+
+    // A null namespace is the solo/authority-render path. Snapshot clients switch to a
+    // numeric resetId in ingestSpikerShots and consume only the network queue thereafter.
+    if (this.spikerShotResetId === null) {
+      for (const event of this.spikerShotJournal) {
+        if (event.seq <= this.spikerShotSeenSeq) continue;
+        if (this.#queueSpikerShot(event)) this.spikerShotSeenSeq = event.seq;
+      }
+    }
+
+    const lifetime = enemyCfg(SPIKER).shotFlash;
+    for (const event of this.spikerShotPending) {
+      if (this.spikerShotActive.length >= CFG.enemies.max) {
+        this.spikerShotActive.shift();
+      }
+      this.spikerShotActive.push({ ...event, life: lifetime });
+    }
+    this.spikerShotPending.length = 0;
+
+    let shotCount = 0;
+    for (const event of this.spikerShotActive) {
+      if (shotCount >= CFG.enemies.max) break;
+      _shotStart.set(event.startX, event.startY, event.startZ);
+      _shotEnd.set(event.endX, event.endY, event.endZ);
+      _shotDir.subVectors(_shotEnd, _shotStart);
+      const length = _shotDir.length();
+      if (!Number.isFinite(length) || length < 1e-4) continue;
+      _shotDir.multiplyScalar(1 / length);
+      _shotMid.addVectors(_shotStart, _shotEnd).multiplyScalar(0.5);
+      _shotQ.setFromUnitVectors(_yAxis, _shotDir);
+      _shotScale.set(0.045, length, 0.045);
+      _shotMatrix.compose(_shotMid, _shotQ, _shotScale);
+      this.spikeShots.setMatrixAt(shotCount++, _shotMatrix);
+    }
+    this.spikeShots.count = shotCount;
+    this.spikeShots.instanceMatrix.needsUpdate = true;
+    return shotCount;
+  }
+
+  #queueSpikerShot(event) {
+    const seq = Math.trunc(event?.seq ?? 0);
+    if (!Number.isSafeInteger(seq) || seq <= 0) return false;
+    const startX = event.startX;
+    const startY = event.startY;
+    const startZ = event.startZ;
+    const endX = event.endX;
+    const endY = event.endY;
+    const endZ = event.endZ;
+    if (
+      !Number.isFinite(startX) || !Number.isFinite(startY) || !Number.isFinite(startZ)
+      || !Number.isFinite(endX) || !Number.isFinite(endY) || !Number.isFinite(endZ)
+    ) return false;
+
+    if (this.spikerShotPending.length >= CFG.enemies.max) {
+      this.spikerShotPending.shift();
+    }
+    this.spikerShotPending.push({ seq, startX, startY, startZ, endX, endY, endZ });
+    return true;
+  }
+
   /** Speed of a type right now, including the road modifier. */
   speedOf(cfg) {
     return cfg.speed * this.speedScale;
+  }
+
+  /**
+   * Live Spikers whose ranged attack can still resolve after the ordinary survivor
+   * allowance would end a wave. This is a hard field-state question, not pressure:
+   * a tracked shot remains dangerous even when the body is outside threatRange.
+   */
+  get rangedThreats() {
+    let count = 0;
+    for (const e of this.pool) {
+      if (!e.alive || e.type !== SPIKER) continue;
+      if (
+        e.state === S.TO_FIRE_RING
+        || e.state === S.CHARGING
+        || e.state === S.FIRING
+      ) count++;
+    }
+    return count;
   }
 
   // ------------------------------------------------------------------ update
@@ -694,6 +937,127 @@ export class Horde {
       let driven = false;
 
       switch (e.state) {
+        case S.TO_FIRE_RING: {
+          this.#spikerRingWorld(e, cfg, _v);
+          const d = this.#steer(e, speed, _v);
+
+          // The ring is a preferred firing position, not a promise to ignore
+          // somebody who has already breached it. Requiring the exact ring let an
+          // operative stand beside a Spiker while it ran away for 2.4 s, then wait
+          // through the whole charge — nearly four seconds before the first answer.
+          //
+          // Breach is a separate question from shot selection. A visible gunner is
+          // still the preferred TARGET, but cannot hide a closer exposed operative
+          // from this gate merely by occupying a station farther away.
+          let breached = false;
+          if (d >= cfg.reach && e.atkCd <= 0) {
+            const radius2 = cfg.fireRadius * cfg.fireRadius;
+            for (const operative of crew) {
+              if (!operative || operative.downed) continue;
+              const dx = operative.position.x - e.x;
+              const dy = operative.position.y - e.y;
+              const dz = operative.position.z - e.z;
+              if (dx * dx + dy * dy + dz * dz >= radius2) continue;
+              if (!this.#spikerCanSee(e, cfg, operative)) continue;
+              breached = true;
+              break;
+            }
+          }
+
+          if ((d < cfg.reach || breached) && e.atkCd <= 0) {
+            e.state = S.CHARGING;
+            e.chargeT = cfg.chargeTime;
+            e.shotLocked = false;
+            e.shotLeg = -1;
+            e.shotRange = 0;
+            e.vx = 0;
+            e.vz = 0;
+          }
+          break;
+        }
+
+        case S.CHARGING: {
+          // Braced means BRACED: no neighbour push and no gait while the pressure
+          // sac brightens. Aim tracks until the final lock window, then freezes.
+          e.vx = 0;
+          e.vz = 0;
+          driven = true;
+          e.chargeT = Math.max(0, e.chargeT - dt);
+
+          if (!e.shotLocked) {
+            const hasAim = this.#trackSpiker(e, cfg, crew);
+            if (hasAim && e.chargeT <= cfg.lockTime) {
+              // Freeze a PREDICTION, not the target's current world point. Walking
+              // moves an operative 2.45 m during the 0.35 s lock against a 0.8 m-wide
+              // body, and a gunner pinned in hull space is still carried about 1.6 m
+              // through world space. Without this lead, holding any movement key — or
+              // merely sitting on the moving fortress — is an automatic dodge.
+              //
+              // This is deliberately constant-velocity and authority-only, not
+              // homing. Changing direction, stopping, jumping, or reaching fortress
+              // cover after the lock still defeats the committed shot.
+              if (e.shotLeg < 0 && e.shotTarget) {
+                e.shotTarget.worldVelocity(_shotDir);
+                e.lockX += _shotDir.x * e.chargeT;
+                e.lockY += _shotDir.y * e.chargeT;
+                e.lockZ += _shotDir.z * e.chargeT;
+                const dx = e.lockX - e.x;
+                const dz = e.lockZ - e.z;
+                if (dx * dx + dz * dz > 1e-8) e.yaw = Math.atan2(-dx, -dz);
+              }
+              e.shotLocked = true;
+            }
+          }
+
+          if (e.chargeT <= 0) {
+            if (!e.shotLocked) e.shotLocked = this.#trackSpiker(e, cfg, crew);
+            if (e.shotLocked && this.#fireSpiker(e, cfg, crew)) {
+              e.state = S.FIRING;
+              e.shotT = cfg.shotFlash;
+            } else if (t.brokenLegs() >= t.legHp.length) {
+              // With no exposed operative and no working leg, the ranged job has no
+              // target. Escalate to the same boarding path as every leg attacker rather
+              // than cycling harmlessly on the ring for the rest of the run.
+              e.state = S.TO_CLIMB;
+              e.latched = false;
+              e.climbT = 0;
+              e.fuseT = 0;
+              e.routeIndex = (this.random() * t.climbRoutes.length) | 0;
+              e.chargeT = 0;
+              e.shotT = 0;
+              e.shotLocked = false;
+              e.shotTarget = null;
+              e.shotLeg = -1;
+              e.shotRange = 0;
+            } else {
+              e.state = S.TO_FIRE_RING;
+              e.atkCd = 1 / cfg.attackRate;
+            }
+          }
+          break;
+        }
+
+        case S.FIRING: {
+          // This state owns the existing stationary release beat and cooldown boundary.
+          // The exact streak is a persistent event now, so presentation no longer extends
+          // or shortens this timer and combat cadence remains unchanged.
+          e.vx = 0;
+          e.vz = 0;
+          driven = true;
+          e.shotT = Math.max(0, e.shotT - dt);
+          if (e.shotT <= 0) {
+            let next = e.fireAngle + e.fireDir * cfg.repositionArc;
+            if (next > cfg.fireArc || next < -cfg.fireArc) {
+              e.fireDir *= -1;
+              next = clamp(next, -cfg.fireArc, cfg.fireArc);
+            }
+            e.fireAngle = next;
+            e.atkCd = 1 / cfg.attackRate;
+            e.state = S.TO_FIRE_RING;
+          }
+          break;
+        }
+
         case S.BURROWED: {
           // Driven straight at the leg's attack point, below the sand. Not
           // hittable, not counted as pressure, and on a hard clock -- when the
@@ -1017,15 +1381,17 @@ export class Horde {
       // Whether an attack SHOULD splash across a bunched-up crew is a real design
       // question and belongs to the crew-scaling work, where it can be measured. It is
       // not a question this change is allowed to answer.
-      if (e.state !== S.BURROWED && cfg.damage > 0 && e.atkCd <= 0) {
+      const contactDamage = cfg.damage * cfg.contactScale;
+      if (e.state !== S.BURROWED && contactDamage > 0 && e.atkCd <= 0) {
         const reach = en.playerReach + cfg.radius - 0.5;
         const reach2 = reach * reach;
         for (const p of crew) {
+          if (!p || p.downed) continue;
           const dx = p.position.x - e.x;
           const dy = p.position.y - e.y;
           const dz = p.position.z - e.z;
           if (dx * dx + dy * dy + dz * dz >= reach2) continue;
-          p.hurt(cfg.damage);
+          p.hurt(contactDamage);
           e.atkCd = 1 / cfg.attackRate;
           break;
         }
@@ -1369,6 +1735,197 @@ export class Horde {
     return moved;
   }
 
+  #spikerRingWorld(e, cfg, out) {
+    _local.set(
+      Math.sin(e.fireAngle) * cfg.fireRadius,
+      -CFG.trampler.deckHeight + cfg.height / 2,
+      -Math.cos(e.fireAngle) * cfg.fireRadius,
+    );
+    this.trampler.localToWorld(out.copy(_local));
+    // Ground is world y=0. The hull bobs, but a firing position on the sand does not.
+    out.y = cfg.height / 2;
+    return out;
+  }
+
+  #spikerMuzzle(e, cfg, out) {
+    const forward = cfg.radius * 0.85;
+    return out.set(
+      e.x - Math.sin(e.yaw) * forward,
+      e.y + cfg.height * 0.22,
+      e.z - Math.cos(e.yaw) * forward,
+    );
+  }
+
+  #spikerSolidDistance(origin, dir, maxDist) {
+    this.spikerRay.set(origin, dir);
+    this.spikerRay.far = maxDist;
+    this.spikerHits.length = 0;
+    this.spikerRay.intersectObjects(this.spikerOccluders, false, this.spikerHits);
+    return this.spikerHits.length > 0 ? this.spikerHits[0].distance : Infinity;
+  }
+
+  #spikerCanSee(e, cfg, operative) {
+    this.#spikerMuzzle(e, cfg, _shotStart);
+    operative.eyePosition(_shotEnd);
+    _shotDir.subVectors(_shotEnd, _shotStart);
+    const dist = _shotDir.length();
+    if (dist < 1e-4 || dist > cfg.fireRange) return false;
+    _shotDir.multiplyScalar(1 / dist);
+    return this.#spikerSolidDistance(_shotStart, _shotDir, dist) >= dist - 0.08;
+  }
+
+  #spikerTarget(e, cfg, crew) {
+    let station = null;
+    let stationD2 = Infinity;
+    let nearest = null;
+    let nearestD2 = Infinity;
+    let retained = null;
+
+    for (const operative of crew) {
+      if (!operative || operative.downed || !this.#spikerCanSee(e, cfg, operative)) continue;
+      const dx = operative.position.x - e.x;
+      const dy = operative.position.y - e.y;
+      const dz = operative.position.z - e.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+
+      if (operative.station && d2 < stationD2) {
+        station = operative;
+        stationD2 = d2;
+      }
+      if (operative === e.shotTarget) retained = operative;
+      if (d2 < nearestD2) {
+        nearest = operative;
+        nearestD2 = d2;
+      }
+    }
+
+    // A station is the role, a retained visible target stops arbitrary target flicker,
+    // and strict distance comparisons leave exact ties in deterministic crew order.
+    return station ?? retained ?? nearest;
+  }
+
+  #nearestWorkingLeg(e) {
+    let best = -1;
+    let bestD2 = Infinity;
+    for (let i = 0; i < this.trampler.legHp.length; i++) {
+      if (this.trampler.legHp[i] <= 0) continue;
+      this.trampler.footWorld(i, _shotEnd);
+      const dx = _shotEnd.x - e.x;
+      const dz = _shotEnd.z - e.z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < bestD2) {
+        best = i;
+        bestD2 = d2;
+      }
+    }
+    return best;
+  }
+
+  #trackSpiker(e, cfg, crew) {
+    const operative = this.#spikerTarget(e, cfg, crew);
+    if (operative) {
+      e.shotTarget = operative;
+      e.shotLeg = -1;
+      operative.eyePosition(_shotEnd);
+    } else {
+      const leg = this.#nearestWorkingLeg(e);
+      if (leg < 0) return false;
+      e.shotLeg = leg;
+      this.trampler.footWorld(leg, _shotEnd);
+    }
+
+    e.lockX = _shotEnd.x;
+    e.lockY = _shotEnd.y;
+    e.lockZ = _shotEnd.z;
+    const dx = e.lockX - e.x;
+    const dz = e.lockZ - e.z;
+    if (dx * dx + dz * dz > 1e-8) e.yaw = Math.atan2(-dx, -dz);
+    return true;
+  }
+
+  #fireSpiker(e, cfg, crew) {
+    this.#spikerMuzzle(e, cfg, _shotStart);
+
+    if (e.shotLeg >= 0) {
+      // The tell commits to one leg. If somebody breaks that leg during the lock,
+      // abort this release; choosing another here would damage a target that never
+      // received a charge cue. The normal state transition returns to the ring and a
+      // later charge may acquire a different working leg.
+      if (this.trampler.legHp[e.shotLeg] <= 0) return false;
+      // A leg is the target geometry itself. Refresh it at release so the visible
+      // segment and the damage agree after the walking hull moved during the lock.
+      this.trampler.footWorld(e.shotLeg, _shotEnd);
+    } else {
+      _shotEnd.set(e.lockX, e.lockY, e.lockZ);
+    }
+
+    _shotDir.subVectors(_shotEnd, _shotStart);
+    const dist = _shotDir.length();
+    if (dist < 1e-4) return false;
+    _shotDir.multiplyScalar(1 / dist);
+    const maxDist = Math.min(dist, cfg.fireRange);
+    const solidDist = this.#spikerSolidDistance(_shotStart, _shotDir, maxDist);
+    let resolvedDist = Math.min(maxDist, solidDist);
+
+    if (e.shotLeg >= 0) {
+      // The target is the fixed foot point, not an arbitrary body centre. Damage only
+      // when that point is inside range and no fortress surface stops the ray first;
+      // the visible streak and the consequence therefore end at the same place.
+      const reachedLeg = dist <= cfg.fireRange && solidDist >= dist - 0.08;
+      if (reachedLeg) {
+        this.trampler.damageLeg(e.shotLeg, cfg.damage * cfg.legDamageScale);
+      }
+    } else {
+      let hit = null;
+      let hitDist = resolvedDist;
+
+      // A teammate can intercept a locked shot. The body test is the same AABB rule
+      // contact damage and movement use, and the nearest unobstructed operative wins.
+      for (const operative of crew) {
+        if (!operative || operative.downed) continue;
+        const t = rayBox(
+          _shotStart,
+          _shotDir,
+          operative.position.x,
+          operative.position.y,
+          operative.position.z,
+          operative.half.x,
+          operative.half.y,
+          operative.half.z,
+        );
+        if (t < 0 || t > maxDist || t >= hitDist) continue;
+        hit = operative;
+        hitDist = t;
+      }
+
+      if (hit) hit.hurt(cfg.damage);
+      resolvedDist = hit ? hitDist : resolvedDist;
+    }
+
+    e.shotDx = _shotDir.x;
+    e.shotDy = _shotDir.y;
+    e.shotDz = _shotDir.z;
+    e.shotRange = Number.isFinite(resolvedDist) ? resolvedDist : maxDist;
+
+    // Publish only after the final stop distance is known, so the event explains the exact
+    // consequence that just resolved. This is presentation state only: no attack timing,
+    // target selection, damage, or seeded stream reads it back.
+    const seq = ++this.spikerShotSeq;
+    this.spikerShotJournal.push({
+      seq,
+      startX: _shotStart.x,
+      startY: _shotStart.y,
+      startZ: _shotStart.z,
+      endX: _shotStart.x + _shotDir.x * e.shotRange,
+      endY: _shotStart.y + _shotDir.y * e.shotRange,
+      endZ: _shotStart.z + _shotDir.z * e.shotRange,
+    });
+    if (this.spikerShotJournal.length > CFG.enemies.max) {
+      this.spikerShotJournal.shift();
+    }
+    return true;
+  }
+
   #steer(e, speed, target) {
     const dx = target.x - e.x;
     const dz = target.z - e.z;
@@ -1404,6 +1961,7 @@ export class Horde {
       }
 
       const mesh = this.meshes[e.type];
+      const cfg = enemyCfg(e.type);
       const i = counts[e.type]++;
 
       _q.setFromAxisAngle(_yAxis, e.yaw);
@@ -1430,7 +1988,7 @@ export class Horde {
       // already does in its hot loops -- hypot pays for overflow handling that a
       // velocity in metres per second does not need.
       const anim = this.animArrays[e.type];
-      const ref = this.speedOf(enemyCfg(e.type));
+      const ref = this.speedOf(cfg);
       anim[i * 2] = e.gaitPhase;
       anim[i * 2 + 1] = e.latched
         ? 0
@@ -1448,6 +2006,17 @@ export class Horde {
         anyFlash = true;
         const beat = 0.6 + 1.9 * (0.5 + 0.5 * Math.sin(e.fuseT * 14));
         _flash.setRGB(beat, beat * 0.45, beat * 0.3);
+        mesh.setColorAt(i, _flash);
+      } else if (e.state === S.CHARGING || e.state === S.FIRING) {
+        // The whole silhouette warms as the pressure sac fills. The sac geometry makes
+        // the source readable; the instance tint keeps the tell visible at gun range.
+        anyFlash = true;
+        const progress = cfg.chargeTime > 0
+          ? 1 - clamp(e.chargeT / cfg.chargeTime, 0, 1)
+          : 1;
+        const beat = 0.75 + progress * 1.25
+          + 0.25 * (0.5 + 0.5 * Math.sin(this.gaitT * 18));
+        _flash.setRGB(beat, beat * 0.42, beat * 0.16);
         mesh.setColorAt(i, _flash);
       } else if (mesh.instanceColor) {
         // Wounded things read darker. This is the crowd half of enemy health
@@ -1740,6 +2309,12 @@ export class Horde {
     e.reactorSlot = false;
     e.latched = false;
     e.fuseT = 0;
+    e.chargeT = 0;
+    e.shotT = 0;
+    e.shotLocked = false;
+    e.shotTarget = null;
+    e.shotLeg = -1;
+    e.shotRange = 0;
     this.liveCount--;
     // Where and what died, for the particle system and the mixer. Recorded even
     // for an unpaid removal, because a sapper's charge going off is exactly the

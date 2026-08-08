@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { CFG } from "./config.js";
-import { Look, greeble } from "./look.js";
+import { Look, greeble, operativeGeometry } from "./look.js";
 import { damp, makeRandom } from "./util.js";
 
 // The thing in your hands.
@@ -23,8 +23,9 @@ import { damp, makeRandom } from "./util.js";
 const HOME = new THREE.Vector3(0.23, -0.21, -0.44);
 
 export class ViewModel {
-  constructor(camera) {
+  constructor(camera, scene = null) {
     this.camera = camera;
+    this.scene = scene;
     this.group = new THREE.Group();
     this.group.position.copy(HOME);
     // Never culled and never shadow-casting: it is two hand-spans from the lens,
@@ -39,6 +40,7 @@ export class ViewModel {
     this.lowered = 0;
 
     this.#build();
+    this.body = scene ? this.#buildDownedBody(scene) : null;
   }
 
   /**
@@ -90,6 +92,49 @@ export class ViewModel {
       return g;
     });
     for (let i = 1; i < this.models.length; i++) this.models[i].visible = false;
+  }
+
+  /** Local third-person body seen from the fixed incapacitated camera. */
+  #buildDownedBody(scene) {
+    const c = CFG.net;
+    const parts = operativeGeometry(c.avatarRadius, c.avatarHeight);
+    const body = new THREE.Group();
+    const rig = new THREE.Group();
+    body.add(rig);
+
+    const coat = Look.std("crew", {
+      color: c.bodyColor, roughness: 0.85, metalness: 0.05,
+    });
+    const gear = Look.std("crew_gear", {
+      color: c.gearColor, roughness: 0.55, metalness: 0.35,
+    });
+    const signalColour = c.seatColors[0];
+    const signal = Look.std("crew_signal", {
+      color: signalColour,
+      emissive: signalColour,
+      emissiveIntensity: c.seatEmissive,
+      roughness: 0.4,
+      metalness: 0,
+    });
+    const add = (geometry, material) => {
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      rig.add(mesh);
+      return mesh;
+    };
+
+    add(parts.canvas, coat);
+    add(parts.gear, gear);
+    add(parts.signal, signal);
+    const left = add(parts.leg, coat);
+    const right = add(parts.leg, coat);
+    left.position.set(-parts.hip.x, parts.hip.y, 0);
+    right.position.set(parts.hip.x, parts.hip.y, 0);
+    rig.rotation.z = Math.PI / 2;
+    body.visible = false;
+    scene.add(body);
+    return { group: body, rig };
   }
 
   /** Shared mesh helper: no shadows, never culled, two hand-spans from the lens. */
@@ -214,21 +259,36 @@ export class ViewModel {
    *        a pure reader too -- it never writes to the simulation.
    */
   update(dt, ctx) {
-    const { player, weapon, grapple, input } = ctx;
+    const { player, trampler, weapon, grapple, input } = ctx;
+
+    if (this.body) {
+      const downed = !!player.downed;
+      this.body.group.visible = downed;
+      if (downed) {
+        const based = player.base === trampler;
+        const parent = based ? trampler.group : this.scene;
+        if (this.body.group.parent !== parent) parent.add(this.body.group);
+        this.body.group.position.copy(player.position);
+        if (based) trampler.worldToLocal(this.body.group.position);
+        this.body.group.rotation.y = player.viewYaw - (based ? trampler.yaw : 0);
+        this.body.rig.rotation.z = Math.PI / 2;
+      }
+    }
 
     // Hidden whenever something else owns the hands. Manning a gun, being reeled
-    // by the winch, mid-climb, and actively repairing are all states where the
-    // player is not in normal weapon control. Reading admitted repair state rather
-    // than raw E keeps the weapon visible when no work can actually happen.
+    // by the winch, mid-climb, active recovery, incapacitation, and admitted repair
+    // are all states where the player is not in normal weapon control.
     const hide = !!player.station
       || grapple.active
       || player.mantle.active
+      || player.downed
+      || player.recovering
       || !!player.repairing;
     if (this.group.visible === hide) this.group.visible = !hide;
     // Existing driven states are brief and retain their original frozen pose. Repair can last
     // for seconds, so keep its hidden model ticking: recoil and sway must settle rather than
     // reappearing exactly where they were when the welder came out.
-    if (hide && !player.repairing) return;
+    if (hide && !player.repairing && !player.recovering) return;
 
     // Show only the weapon actually in hand.
     //

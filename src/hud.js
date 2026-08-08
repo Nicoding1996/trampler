@@ -778,11 +778,45 @@ export class Hud {
 
     // ---- contextual prompt
     //
-    // Priority order matters, and it is: the road you are being asked to choose,
-    // then the gun you are standing at, then the repair under your hands. Standing
-    // at a mount and standing at a repair point are never the same place, so those
-    // two cannot both be true, but a road choice can overlap either.
-    if (economy?.pickOpen) {
+    // Priority starts with incapacitation and recovery: those states own the
+    // operative's whole action set, so no shop, road, gun or repair prompt may sit
+    // above them. Everything after that retains the established urgency order.
+    const recoveryTarget = player.recoveryTarget;
+    const recoveryPlayer = recoveryTarget?.player;
+    if (player.downed) {
+      const active = player.rescuerSeat > 0;
+      const remaining = player.medevacRemaining.toFixed(1);
+      const hasCrewWindow = !!player.recoveryHasCrew;
+      this.#prompt(
+        "DOWNED",
+        active
+          ? `CREW ${player.rescuerSeat} RECOVERING`
+          : hasCrewWindow
+            ? `CREW CAN RECOVER YOU · EMERGENCY RECOVERY IN ${remaining}s`
+            : `EMERGENCY RECOVERY IN ${remaining}s`,
+        active
+          ? player.recoveryProgress / CFG.combat.recovery.recoverTime
+          : 1 - player.medevacRemaining / Math.max(player.recoveryDelay, 0.001),
+        active ? "working" : "blocked",
+      );
+    } else if (player.recovering && recoveryTarget) {
+      this.#prompt(
+        "HOLD E",
+        `RECOVER CREW ${recoveryTarget.seat}`,
+        player.recoveryTargetProgress / CFG.combat.recovery.recoverTime,
+        "working",
+      );
+    } else if (recoveryPlayer?.downed) {
+      const claimed = recoveryPlayer.rescuerSeat > 0;
+      this.#prompt(
+        claimed ? "E" : "HOLD E",
+        claimed
+          ? `CREW ${recoveryPlayer.rescuerSeat} RECOVERING`
+          : `RECOVER CREW ${recoveryTarget.seat}`,
+        recoveryPlayer.recoveryProgress / CFG.combat.recovery.recoverTime,
+        claimed ? "blocked" : "",
+      );
+    } else if (economy?.pickOpen) {
       const auto = run?.picking ? ` · AUTO IN ${Math.ceil(run.pickAutoSeconds)}s` : "";
       this.#prompt(`1-${economy.pendingPick.length}`, `TAKE SALVAGE${auto}`, 1);
     } else if (run?.choosing) {
@@ -900,7 +934,12 @@ export class Hud {
         if (director.timer > 0) {
           pace = `rest ${Math.ceil(director.timer)} s`;
         } else {
-          pace = `settling · ${Math.max(0, horde.liveCount - CFG.waves.holdUntilCleared)} left`;
+          const settling = Math.max(
+            0,
+            horde.liveCount - CFG.waves.holdUntilCleared,
+            horde.rangedThreats,
+          );
+          pace = `settling · ${settling} left`;
           paceCls = "on";
         }
         break;

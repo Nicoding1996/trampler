@@ -31,6 +31,7 @@
 // only number that describes what a player gets is the deployed one.
 
 import { readFileSync } from "node:fs";
+import { PROTOCOL_VERSION } from "../src/snapshot.js";
 
 const BASE = process.env.BASE ?? "http://127.0.0.1:8787";
 const WS_BASE = BASE.replace(/^http/, "ws");
@@ -78,7 +79,9 @@ function percentiles(values) {
  */
 function connect(code, name) {
   return new Promise((resolve, reject) => {
-    const url = `${WS_BASE}/lobby/${code}${name ? `?name=${encodeURIComponent(name)}` : ""}`;
+    const query = new URLSearchParams({ protocol: String(PROTOCOL_VERSION) });
+    if (name) query.set("name", name);
+    const url = `${WS_BASE}/lobby/${code}?${query}`;
     const socket = new WebSocket(url);
     const frames = [];
     const snaps = [];

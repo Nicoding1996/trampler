@@ -206,10 +206,11 @@ with a number that then sat in two steering files for months.
 The pool cap is `CFG.enemies.max` at 420; 400 is what test 17 fills and what every
 measurement above is taken against.
 
-Six types, one `InstancedMesh` each, plus one for the spoil heaps that mark a
-burrowing enemy. Per-type numbers come from `enemyCfg(type)` — there are **no**
-`type === CHEWER ? a : b` ternaries left anywhere, because that pattern is how a
-newly added type silently inherits the wrong numbers.
+Seven body types, one `InstancedMesh` each, plus auxiliary batches for the
+burrower's spoil heaps and the Spiker's shot streak. Per-type numbers come from
+`enemyCfg(type)` — there are **no** `type === CHEWER ? a : b` ternaries left
+anywhere, because that pattern is how a newly added type silently inherits the
+wrong numbers.
 
 Nothing allocates in the per-enemy loop. `_yAxis` was hoisted out of it after
 being spotted as 400 `Vector3`s a frame, and test 17 pins the whole simulation
@@ -217,9 +218,16 @@ step under a millisecond.
 
 ### One hitscan path, one armour path
 
-`Weapon.shootFrom(origin, dir, profile, muzzle)` is the **only** place geometry
-occlusion is applied. The rifle and both deck guns route through it, so the rule
-that keeps chewers safe beneath the hull cannot drift between weapons.
+`Weapon.shootFrom(origin, dir, profile, muzzle)` is the **only** player-weapon path
+where geometry occlusion is applied. The rifle and both deck guns route through it,
+so the rule that keeps chewers safe beneath the hull cannot drift between weapons.
+
+The Spiker's hostile ray is deliberately separate because it hits operatives or a
+fortress leg rather than the horde. It clips against the fortress's bullet occluders
+before testing its frozen constant-velocity prediction, using the same policy that
+excludes railings. Constant movement and passive hull carry are accounted for, but a
+post-lock course change still dodges. That makes the hull real cover without letting a
+railing protect a stationary gunner.
 
 `Horde.damage` is the **only** place armour is applied, for the same reason: every
 damage source in the game funnels through it, so a newly added weapon cannot
@@ -431,7 +439,7 @@ exact shape of the bug that has happened twice: a field added to one type and
 nowhere else reads as `undefined` on the others, and `d < undefined` is always
 false, which silently makes that enemy harmless. You cannot write it any more
 without the module failing to load. Test 68 checks the other direction — that all
-six types have an identical field set.
+seven types have an identical field set.
 
 ### Frame order matters
 

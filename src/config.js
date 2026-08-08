@@ -72,6 +72,24 @@ const ENEMY_BASE = {
   fuse: 0,
   fuseDamage: 0,
 
+  // Ranged behavior. A positive `fireRadius` replaces the ordinary leg approach
+  // with a hull-relative firing ring; every other field is inert at zero. The shot
+  // freezes a constant-velocity prediction for `lockTime` at the end of its charge,
+  // so changing course after the lock is the visible counter rather than an invisible
+  // accuracy roll or merely holding one direction forever.
+  fireRadius: 0,
+  fireArc: 0,
+  fireRange: 0,
+  chargeTime: 0,
+  lockTime: 0,
+  repositionArc: 0,
+  legDamageScale: 0,
+  shotFlash: 0,
+
+  // Ranged bodies still share the generic proximity pass. This multiplier lets one
+  // opt out without setting `damage` to zero, which would also disable its real attack.
+  contactScale: 1,
+
   // How far a foot coming down shoves this type, as a multiplier. Big things
   // barely notice. No damage is involved -- see the stomp block in CFG.trampler
   // for why the feet deliberately cannot hurt anything.
@@ -486,10 +504,28 @@ export const CFG = {
     regenDelay: 4.0,
     regenRate: 14,
 
-    // Brief immunity after dying. Respawn drops you on the deck, and if boarders
-    // happen to be standing there you would be killed again on the same frame,
-    // over and over. Applies to death only, not the debug respawn key.
-    spawnGrace: 1.2,
+    // Incapacitation keeps the reactor as the only run-loss condition while making
+    // operative health matter. Solo cannot supply a teammate, so emergency recovery
+    // is deliberately faster; multiplayer gives the crew a real two-second rescue
+    // window before the guaranteed fallback takes the body back to the deck.
+    recovery: {
+      range: 1.5,
+      recoverTime: 2.0,
+      soloMedevac: 4.0,
+      multiplayerMedevac: 8.0,
+      returnHealth: 0.40,
+
+      // A fixed body view rather than free spectating: close enough to retain place
+      // and show the body a teammate must reach, without granting reconnaissance.
+      cameraBack: 2.8,
+      cameraHeight: 2.0,
+      cameraPitch: -0.52,
+    },
+
+    // Brief immunity after either kind of recovery. A medevac returns on the deck,
+    // where boarders may already be standing; an in-place recovery may be in the
+    // middle of the under-hull crowd. Without grace either can loop immediately.
+    spawnGrace: 1.25,
 
     // The rifle. Named now, because there is more than one thing to hold.
     //
@@ -644,7 +680,7 @@ export const CFG = {
     // and z against `height / 2 + hitPad` in y.
     //
     // MEASURED, by sweeping a full phase cycle at full amplitude against every
-    // vertex of all six types. The finding that matters is not the one that was
+    // vertex of all seven types. The finding that matters is not the one that was
     // expected:
     //
     //   Worst extent ADDED anywhere: 0.099 m, the titan in x -- and the titan is
@@ -693,7 +729,7 @@ export const CFG = {
       // Bigger things stride slower. `rate` is divided by bulk raised to this power,
       // so a titan at bulk 2.4 runs its cycle at about 60% of a chewer's rather than
       // pedalling like one. Derived rather than a per-type knob because the
-      // relationship is the point: mass sets cadence, and six numbers that could
+      // relationship is the point: mass sets cadence, and per-type numbers that could
       // disagree about that would eventually disagree.
       bulkDrag: 0.65,
     },
@@ -872,6 +908,40 @@ export const CFG = {
       glow: 2.2,
     }),
 
+    // ------------------------------------------------------------------ spiker
+    //
+    // The ranged one, and the answer to a manned station otherwise being completely
+    // safe. It runs to a firing ring ahead or abeam of the walking hull, but braces
+    // immediately if a visible operative breaches that stand-off radius. It tracks the
+    // target, then freezes a constant-velocity prediction for the final 0.35 s. A direct
+    // spike is blocked by the fortress, so changing course after the lock or reaching the
+    // slab is the counter the geometry teaches rather than a dodge chance hidden in a
+    // number.
+    //
+    // It prefers an occupied station, because dislodging a gunner is the role. With no
+    // exposed operative it plinks the nearest working leg at a reduced rate, so hiding
+    // does not turn it harmless and it does not steal the climber's reactor job.
+    //
+    // 6.2 m/s is repositioning speed, not pressure by itself. The body spends much of
+    // its cycle planted while a 4.5 m/s fortress walks on, so it needs a real closing
+    // margin to regain an ahead-of-hull ring instead of becoming a permanent stern chase.
+    spiker: enemyType({
+      label: "SPIKER",
+      hp: 95, speed: 6.2, damage: 28, attackRate: 0.22,
+      radius: 0.65, height: 2.1, reach: 1.5,
+      fireRadius: 30,
+      fireArc: 1.2,
+      fireRange: 48,
+      chargeTime: 1.4,
+      lockTime: 0.35,
+      repositionArc: 0.42,
+      legDamageScale: 0.35,
+      shotFlash: 0.14,
+      contactScale: 0,
+      bulk: 1.0,
+      glow: 2.0,
+    }),
+
     // ------------------------------------------------------------------- titan
     //
     // The biome boss, and it inverts the pillar for one fight.
@@ -969,6 +1039,7 @@ export const CFG = {
       burrowerFromWave: 2,
       burrowerShare: 0.15,
       bulwarkFromWave: 3,
+      spikerFromWave: 3,
       sapperFromWave: 4,
       // Bulwarks and sappers grow every other wave rather than every wave, and
       // are capped. They are expensive to answer, so a linear ramp on both at
@@ -1419,6 +1490,7 @@ export const CFG = {
     bulwark: { salvage: 12, scrap: 5 },
     burrower: { salvage: 5, scrap: 2 },
     sapper: { salvage: 9, scrap: 4 },
+    spiker: { salvage: 8, scrap: 3 },
     titan: { salvage: 140, scrap: 120 },
 
     // Paid to the shared pot when a wave is resolved, not per kill: the fortress
@@ -2094,7 +2166,7 @@ export const CFG = {
     // Two tones, and the split is what stops the figure reading as a mannequin. One
     // colour over a whole body is a mannequin whatever the colour is; a helmet plainly
     // made of different stuff from a coat is a person. Chosen to sit in the same
-    // desaturated earthy family as the six enemy skins and the fortress, because the
+    // desaturated earthy family as the seven enemy skins and the fortress, because the
     // first pass painted the whole body in a SEAT colour and the result was a bright
     // violet toy standing in a dieselpunk desert.
     //
@@ -2229,7 +2301,7 @@ export const releasePresetName = () => CFG.releasePresets[CFG.releasePreset].nam
  * hunt through six modules for ternaries.
  */
 export const ENEMY_TYPE_KEYS = [
-  "chewer", "climber", "bulwark", "burrower", "sapper", "titan",
+  "chewer", "climber", "bulwark", "burrower", "sapper", "titan", "spiker",
 ];
 
 /** Config object for a numeric enemy type id. */

@@ -42,6 +42,9 @@ import { Events } from "./events.js";
 import { Items } from "./items.js";
 import { Modules } from "./modules.js";
 import { Run, RUN } from "./run.js";
+import {
+  clearRecoverySeat, configureRecovery, recoveryInputFor, stepRecovery,
+} from "./recovery.js";
 import { ENEMY_STATE } from "./enemies.js";
 import { enemyCfg } from "./config.js";
 import {
@@ -441,6 +444,9 @@ export function createSession({
       ackPose: null,
       bayOpen: false,
     }],
+    // Snapshot-fed actors a browser may recover. Authority has every Player in
+    // `operatives`, so this stays empty there and in solo sessions.
+    recoveryTargets: [],
     treasury: economy.treasury,
     networked,
     autoReset,
@@ -536,6 +542,7 @@ export function removeOperative(sim, seat) {
   const op = sim.operatives[index];
 
   op.input.release?.();
+  clearRecoverySeat(sim.operatives, seat, sim.recoveryTargets);
   op.grapple.cancel?.();
   op.player.cancelMantle?.();
   op.player.repairing = null;
@@ -568,7 +575,7 @@ function operativePose(sim, op) {
   const p = op.player;
   const based = p.base === t;
   _enc.copy(p.position);
-  let yaw = p.yaw;
+  let yaw = p.viewYaw;
   if (based) {
     t.worldToLocal(_enc);
     yaw -= t.yaw;
@@ -578,12 +585,12 @@ function operativePose(sim, op) {
     y: _enc.y,
     z: _enc.z,
     yaw,
-    pitch: p.pitch,
+    pitch: p.viewPitch,
     bits: packOperativeBits({
       based,
       station: p.station ? sim.guns.indexOf(p.station) + 1 : 0,
       repairing: !!p.repairing,
-      downed: false,
+      downed: p.downed,
       grounded: !!p.grounded,
       bayOpen: !!op.bayOpen,
     }),
@@ -621,6 +628,7 @@ export function resetSession(sim, { advanceGeneration = true } = {}) {
 
   for (const op of sim.operatives) {
     op.bayOpen = false;
+    op.player.resetRecovery();
     op.player.hp = op.player.maxHp;
     op.player.repairing = null;
     op.repair.setExternalClaims?.([]);
@@ -630,6 +638,7 @@ export function resetSession(sim, { advanceGeneration = true } = {}) {
     if (sim.networked) op.input.release?.();
   }
 
+  sim.recoveryTargets = [];
   sim.lossTimer = 0;
   if (advanceGeneration) sim.resetId = (sim.resetId ?? 0) + 1;
   for (const op of sim.operatives) captureAckPose(sim, op);
@@ -668,12 +677,24 @@ export function stepSession(sim, dt, authorityTick = null) {
     sim.horde.recordCombatFrame(authorityTick);
     return;
   }
-  for (const op of sim.operatives) {
-    if (op.input.pressed("KeyQ")) sim.director.callEarly();
-  }
+  // Decide the fallback duration before anything this tick can incapacitate an
+  // operative. Existing downed clocks are left untouched when roster size changes.
+  configureRecovery(sim.operatives);
 
   sim.trampler.update(dt);
   sim.trampler.resolveStomps(sim.horde, sim.crew);
+
+  // Hull carry and look are current before recovery measures distance. The guarded
+  // prepare call in Player.update means each command is still applied exactly once.
+  for (const op of sim.operatives) op.player.prepareStep(op.input);
+  stepRecovery(sim.operatives, dt);
+
+  // A downed operative or active rescuer owns no shared run action either.
+  for (const op of sim.operatives) {
+    const input = recoveryInputFor(op.player, op.input);
+    if (input.pressed("KeyQ")) sim.director.callEarly();
+  }
+
   sim.director.update(dt);
   sim.run.update();
 
@@ -684,12 +705,13 @@ export function stepSession(sim, dt, authorityTick = null) {
   // replay identically, and that includes the ties.
   for (let opIndex = 0; opIndex < sim.operatives.length; opIndex++) {
     const op = sim.operatives[opIndex];
-    const input = op.input;
+    const rawInput = op.input;
+    const input = recoveryInputFor(op.player, rawInput);
     // The sequence this tick's command carries, so a shot's cone spread is a function of an index
     // the client also has rather than of a stream position only this side knows. Reset per tick,
     // because `shotsThisKey` counts shots WITHIN one sequence.
     if (op.weapon) {
-      const seq = input.seq ?? 0;
+      const seq = rawInput.seq ?? 0;
       if (op.weapon.spreadKey !== seq) {
         op.weapon.spreadKey = seq;
         op.weapon.shotsThisKey = 0;
@@ -698,11 +720,7 @@ export function stepSession(sim, dt, authorityTick = null) {
     // Rewind TARGETS to the server tick this operative was rendering. `clientTick` is
     // untrusted and Horde clamps it into its bounded ring; shooter pose and geometry remain
     // current. Setting this per seat is essential because four clients can render four ticks.
-    sim.horde.combatTick = Number.isFinite(input.clientTick) ? input.clientTick : null;
-    // Position-dependent actions must see both the hull's current transform and this
-    // command's look delta. In particular, a successful grapple detaches immediately;
-    // preparing afterwards would then skip the based carry and cast from the old pose.
-    op.player.prepareStep(input);
+    sim.horde.combatTick = Number.isFinite(rawInput.clientTick) ? rawInput.clientTick : null;
     handleStationInput(sim.guns, input, op.player);
     op.grapple.handleInput(input);
     op.player.update(dt, input);
@@ -728,7 +746,7 @@ export function stepSession(sim, dt, authorityTick = null) {
       purchaseContext: purchaseInputContext(sim.resetId, sim.run),
     });
     op.grapple.update(dt);
-    input.endFrame();
+    op.input.endFrame();
   }
   sim.horde.combatTick = null;
 
@@ -890,6 +908,10 @@ export function snapshotOf(sim, tick) {
     emitterCharge: sim.emitters.slots.map((slot) => slot.charge),
 
     entities: entitiesOf(sim),
+    // Sparse release history, repeated across snapshots so one missed packet cannot erase the
+    // explanation for damage. Events are immutable after publication; copy the array so this
+    // plain snapshot remains a point-in-time value while the authority appends later shots.
+    spikerShots: [...h.spikerShotJournal],
     operatives,
   };
 }
@@ -962,6 +984,9 @@ export function operativesOf(sim) {
       grappleZ: grappleAnchor?.z ?? 0,
       grappleBits: packGrappleBits({ active: grappleActive, onHull: op.grapple?.onHull }),
       repairTarget: packRepairTarget(p.repairing),
+      medevacRemaining: p.medevacRemaining,
+      recoveryProgress: p.recoveryProgress,
+      rescuerSeat: p.rescuerSeat,
       bits: current.bits,
     });
   }
@@ -1023,7 +1048,12 @@ export function entitiesOf(sim) {
       x: _enc.x,
       y: _enc.y,
       z: _enc.z,
-      fuseT: Math.max(0, e.fuseT),
+      // The one-byte cue timer is mutually exclusive by enemy type: a sapper uses it
+      // for its fuse, while a charging Spiker uses it for the visible pressure build.
+      // Reusing the byte preserves the 14-byte entity record without hiding either tell.
+      fuseT: e.state === ENEMY_STATE.CHARGING
+        ? Math.max(0, e.chargeT)
+        : Math.max(0, e.fuseT),
       yaw: e.yaw,
     });
   }
@@ -1059,8 +1089,10 @@ export function applyEntities(sim, entities) {
     seen.add(w.id);
 
     const b = unpackEnemyBits(w.bitsA, w.bitsB);
+    const generation = w.generation ?? 0;
+    const generationChanged = e.generation !== generation;
     e.alive = true;
-    e.generation = w.generation ?? 0;
+    e.generation = generation;
     e.type = b.type;
     e.state = b.state;
     e.onHull = b.carried && b.state === ENEMY_STATE.ON_DECK;
@@ -1074,11 +1106,38 @@ export function applyEntities(sim, entities) {
     // clock does.
     e.maxHp = enemyCfg(b.type).hp;
     e.hp = b.hpFraction * e.maxHp;
+    // A pooled slot changing generation is a different body. Presentation state from the
+    // previous life must not survive merely because the new snapshot's flash bit is clear.
+    if (generationChanged) {
+      e.flash = 0;
+      e.tintBand = -1;
+    }
     // Re-armed rather than assigned, so the client's own decay runs. `flash` is a duration on
     // the client and a boolean on the wire; conflating them would make a hit flash last
     // exactly one frame at 20 Hz, which is a flicker rather than a signal.
     if (b.flash) e.flash = CFG.combat.weapon.hitFlash;
-    e.fuseT = b.fuseLit ? Math.max(0, w.fuseT ?? 0) : 0;
+
+    // The existing one-byte timer carries the only urgent cue this type owns. Sappers use it
+    // for the fuse; Spikers use it while charging. They are mutually exclusive, so both tells
+    // survive the wire with no per-entity growth.
+    const cueT = Math.max(0, w.fuseT ?? 0);
+    e.fuseT = b.fuseLit ? cueT : 0;
+    e.chargeT = b.state === ENEMY_STATE.CHARGING ? cueT : 0;
+
+    // AI and exact per-body shot transients exist only on authority. Clear them on
+    // application so a reused client slot cannot retain its previous occupant's ray; the
+    // persistent release queue is independent and is never touched by entity interpolation.
+    e.shotT = 0;
+    e.shotLocked = false;
+    e.shotTarget = null;
+    e.shotLeg = -1;
+    e.lockX = 0;
+    e.lockY = 0;
+    e.lockZ = 0;
+    e.shotDx = 0;
+    e.shotDy = 0;
+    e.shotDz = -1;
+    e.shotRange = 0;
 
     // BACK INTO WORLD SPACE, THROUGH THE HULL'S CURRENT TRANSFORM. The receiving pool stores
     // world coordinates — the same convention the simulation uses — so a carried body's
@@ -1116,6 +1175,12 @@ export function applyEntities(sim, entities) {
       e.onHull = false;
       e.reactorSlot = false;
       e.fuseT = 0;
+      e.chargeT = 0;
+      e.shotT = 0;
+      e.shotLocked = false;
+      e.shotTarget = null;
+      e.shotLeg = -1;
+      e.shotRange = 0;
       e.tintBand = -1;
       continue;
     }
@@ -1344,6 +1409,7 @@ export function applySnapshot(sim, state, localSeat = 0) {
     r.who.position.copy(t.localToWorld(r.local));
     if (correctionYaw === 0) continue;
     r.who.yaw += correctionYaw;
+    if (r.who.downed) r.who.downedYaw += correctionYaw;
     const vx = r.who.velocity.x;
     const vz = r.who.velocity.z;
     r.who.velocity.x = vx * c + vz * s;
@@ -1441,6 +1507,7 @@ export function applySnapshot(sim, state, localSeat = 0) {
   if (state.entities) applyEntities(sim, state.entities);
   if (state.operatives) {
     applyOperatives(sim, state.operatives, localSeat);
+    syncRecoveryTargets(sim, state.operatives, localSeat);
 
     // Browser prediction owns only its local operative, so its Crew cannot answer which exact
     // point a remote welder has claimed. Replace that missing roster slice from the newest
@@ -1470,6 +1537,60 @@ export function applySnapshot(sim, state, localSeat = 0) {
       }
     }
   }
+}
+
+/** Build the remote Player-shaped roster used only by browser recovery prediction. */
+function syncRecoveryTargets(sim, wire, localSeat) {
+  const represented = new Set((sim.operatives ?? []).map((op) => op.seat));
+  const previous = new Map((sim.recoveryTargets ?? []).map((entry) => [entry.seat, entry]));
+  const next = [];
+
+  for (const w of wire) {
+    if (w.seat === localSeat || represented.has(w.seat)) continue;
+    const b = unpackOperativeBits(w.bits);
+    let entry = previous.get(w.seat);
+    if (!entry) {
+      entry = {
+        seat: w.seat,
+        remote: true,
+        input: null,
+        player: {
+          position: new THREE.Vector3(),
+          velocity: new THREE.Vector3(),
+          mantle: { active: false },
+          grapple: null,
+          station: null,
+          downed: false,
+          recovering: false,
+          recoveryTarget: null,
+          recoveryTargetProgress: 0,
+          recoveryHeld: false,
+          autoMedevac: false,
+        },
+      };
+    }
+
+    const p = entry.player;
+    _enc.set(w.x, w.y, w.z);
+    if (b.based) sim.trampler.localToWorld(_enc);
+    p.position.copy(_enc);
+    p.velocity.set(0, 0, 0);
+    p.base = b.based ? sim.trampler : null;
+    p.yaw = w.yaw + (b.based ? sim.trampler.yaw : 0);
+    p.pitch = w.pitch;
+    p.downed = b.downed;
+    p.medevacRemaining = w.medevacRemaining;
+    p.recoveryProgress = w.recoveryProgress;
+    p.rescuerSeat = w.rescuerSeat;
+    p.station = b.station > 0 ? (sim.guns?.[b.station - 1] ?? null) : null;
+    if (p.downed) {
+      p.downedYaw = p.yaw;
+      p.downedPitch = w.pitch;
+    }
+    next.push(entry);
+  }
+
+  sim.recoveryTargets = next;
 }
 
 /**
@@ -1522,6 +1643,15 @@ export function applyOperatives(sim, wire, localSeat = 0) {
       p.yaw = w.yaw;
     }
     p.pitch = w.pitch;
+    p.downed = b.downed;
+    p.medevacRemaining = w.medevacRemaining;
+    p.recoveryProgress = w.recoveryProgress;
+    p.rescuerSeat = w.rescuerSeat;
+    p.autoMedevac = false;
+    if (p.downed) {
+      p.downedYaw = p.yaw;
+      p.downedPitch = w.pitch;
+    }
     p.grounded = b.grounded;
     p.repairing = unpackRepairTarget(w.repairTarget);
     // Zeroed rather than integrated. A remote operative's motion comes entirely from the next
@@ -1562,25 +1692,30 @@ export function stepSessionClient(sim, dt) {
   const { input } = sim;
   const op = sim.operatives.find((candidate) => candidate.player === sim.player)
     ?? sim.operatives[0];
+  const targets = sim.recoveryTargets ?? [];
 
+  configureRecovery(sim.operatives, targets);
   sim.trampler.update(dt);
-  // Mirror authority: actions use the current command's look and current hull-carried pose.
+  // Mirror authority: recovery uses the current command's look and hull-carried pose,
+  // then owns every downstream gameplay consumer without consuming physical input.
   sim.player.prepareStep(input);
-  handleStationInput(sim.guns, input, sim.player);
-  sim.grapple.handleInput(input);
-  sim.player.update(dt, input);
+  stepRecovery(sim.operatives, dt, { targets, authoritative: false });
+  const actionInput = recoveryInputFor(sim.player, input);
+  handleStationInput(sim.guns, actionInput, sim.player);
+  sim.grapple.handleInput(actionInput);
+  sim.player.update(dt, actionInput);
   // Prediction must admit repair before reading the carried trigger, then apply work after
   // both weapon paths in the same slots as authority and solo.
-  sim.repair.admit(dt, input);
-  sim.weapon.update(dt, input);
-  for (const g of sim.guns) g.update(dt, input, sim.player, sim.weapon);
+  sim.repair.admit(dt, actionInput);
+  sim.weapon.update(dt, actionInput);
+  for (const g of sim.guns) g.update(dt, actionInput, sim.player, sim.weapon);
   sim.repair.work(dt);
   sim.emitters.updateClient(dt, sim.player);
   sim.items.update(dt);
 
   // The edge is predicted for an immediate panel response, but purchases, votes, picks and
   // placement remain server-only and arrive in the next snapshot.
-  if (op && input.pressed(CFG.fortress.toggleKey)) op.bayOpen = !op.bayOpen;
+  if (op && actionInput.pressed(CFG.fortress.toggleKey)) op.bayOpen = !op.bayOpen;
   if (op && (sim.run.choosing || sim.run.picking)) op.bayOpen = false;
   sim.economy.lastEvent = null;
   sim.grapple.update(dt);

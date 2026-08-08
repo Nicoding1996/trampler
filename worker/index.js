@@ -32,6 +32,8 @@
 // does: two gun mounts (and manning one pins you), four legs, three reactor
 // slots, and a 26 x 16 m deck to fight under. Six players means two with no
 // station to take, which turns the oscillation into a fixed assignment.
+import { PROTOCOL_VERSION } from "../src/snapshot.js";
+
 const CREW_MAX = 4;
 // Multiplayer begins with a pair. A one-seat lobby is still useful while the host shares
 // its code, but starting it would create a solo run that nobody else can join afterwards.
@@ -94,6 +96,7 @@ const JITTER_WINDOW = TICK_HZ * 10;
 // argument as the refit terminal naming which clause refused it.
 const CLOSE_FULL = 4001;
 const CLOSE_IN_PROGRESS = 4002;
+const CLOSE_PROTOCOL = 4003;
 
 // `WebSocket.OPEN`. Spelled out because the class constant is not reliably
 // reachable off an instance in every runtime, and a wrong `undefined` here would
@@ -309,6 +312,8 @@ export default {
     const tail = parts[2] === "status" ? "status" : "join";
     const target = new URL(`https://lobby/${tail}`);
     target.searchParams.set("code", code);
+    const protocol = url.searchParams.get("protocol");
+    if (protocol !== null) target.searchParams.set("protocol", protocol);
     const name = url.searchParams.get("name");
     if (name) target.searchParams.set("name", name);
 
@@ -425,6 +430,14 @@ export class Lobby {
     // both produced the identical symptom.
     server.binaryType = "arraybuffer";
 
+    // Reject incompatible code before phase/full checks and, crucially, before allocating
+    // a seat. Waiting for the first binary frame lets a stale tab occupy the lobby and may
+    // start a run it can no longer rejoin after snapshot decoding finally detects the drift.
+    if (url.searchParams.get("protocol") !== String(PROTOCOL_VERSION)) {
+      server.close(CLOSE_PROTOCOL, "incompatible protocol - reload the page");
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
     if (this.phase !== "lobby") {
       server.close(CLOSE_IN_PROGRESS, "that run has already started");
       return new Response(null, { status: 101, webSocket: client });
@@ -453,6 +466,7 @@ export class Lobby {
 
     this.#send(server, {
       t: "hello",
+      protocol: PROTOCOL_VERSION,
       seat,
       code: this.code,
       crewMin: CREW_MIN,

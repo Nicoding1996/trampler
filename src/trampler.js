@@ -1445,7 +1445,7 @@ export class Trampler {
       // the crew.
       if (crew) {
         for (const p of crew) {
-          if (!p || p.base !== null || p.station) continue;
+          if (!p || p.downed || p.base !== null || p.station) continue;
           const dx = p.position.x - _footWorld.x;
           const dz = p.position.z - _footWorld.z;
           const dy = p.position.y - _footWorld.y;

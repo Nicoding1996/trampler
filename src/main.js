@@ -29,6 +29,7 @@ import { Fx } from "./fx.js";
 import { ViewModel } from "./viewmodel.js";
 import { Audio } from "./audio.js";
 import { Net } from "./net.js";
+import { configureRecovery, recoveryInputFor, stepRecovery } from "./recovery.js";
 import { resetSession } from "./session.js";
 
 const canvas = document.getElementById("c");
@@ -117,7 +118,7 @@ function boot() {
   const post = new Post(renderer, scene, camera);
   const shake = new Shake();
   const fx = new Fx(scene, camera);
-  const viewmodel = new ViewModel(camera);
+  const viewmodel = new ViewModel(camera, scene);
   const audio = new Audio();
   // Browser-only, like the four above it, and a RELAY rather than multiplayer: it
   // broadcasts where this operative is standing and draws where the others are.
@@ -137,6 +138,7 @@ function boot() {
     scene, camera, world, trampler, player, crew, grapple, horde, director, weapon,
     repair, guns, emitters, modules, economy, items, run, events, input,
     operatives: [localOperative],
+    recoveryTargets: [],
     treasury: economy.treasury,
     networked: false,
     autoReset: false,
@@ -362,8 +364,7 @@ function boot() {
     if (input.pressed("KeyM")) applyReleasePreset(CFG.releasePreset + 1);
     if (input.pressed("KeyR")) player.respawnOnDeck();
     if (input.pressed("KeyT")) player.dropToGround();
-    // E is held for repair, so calling a wave early moved to Q.
-    if (input.pressed("KeyQ")) director.callEarly();
+    // Q is routed inside simStep after recovery has claimed this frame's hands.
     if (input.pressed("KeyK")) resetEncounter();
 
     const d = CFG.debug;
@@ -421,11 +422,11 @@ function boot() {
    * The routing rule itself lives in economy.js so the harness can test it — the
    * harness cannot import this file, so anything decided here is uncovered.
    */
-  function handlePurchasing(dt) {
+  function handlePurchasing(dt, actionInput = input) {
     // The authority owns every purchase, vote, pick and bay toggle. The client predicts only
     // the bay's visibility, then adopts the operative bit repeated by each snapshot.
     if (net.multiplayer) {
-      if (input.pressed(CFG.fortress.toggleKey)) {
+      if (actionInput.pressed(CFG.fortress.toggleKey)) {
         localOperative.bayOpen = !localOperative.bayOpen;
       }
       if (run.choosing || run.picking) localOperative.bayOpen = false;
@@ -443,13 +444,13 @@ function boot() {
       return;
     }
 
-    if (input.pressed(CFG.fortress.toggleKey)) hud.toggleBay();
+    if (actionInput.pressed(CFG.fortress.toggleKey)) hud.toggleBay();
     // A pick or a road choice is a decision the run is blocked on, so the bay gets
     // out of the way rather than sitting underneath it.
     if (run.choosing || run.picking) hud.closeBay();
 
     const routed = routePurchaseInput({
-      economy, run, bayOpen: hud.bayOpen, input, dt,
+      economy, run, bayOpen: hud.bayOpen, input: actionInput, dt,
     });
 
     if (routed.took) {
@@ -575,10 +576,26 @@ function boot() {
     // a client moves no enemy of its own accord.
     const authoritative = net.authoritative;
 
+    // The future fallback duration is fixed before a stomp or contact hit can put
+    // somebody down. Snapshot targets complete the roster for browser prediction.
+    configureRecovery(localSim.operatives, localSim.recoveryTargets);
     trampler.update(dt);
     // Immediately after the hull moves, so a foot that came down this frame
     // resolves against where things actually are.
     if (!authoritative) trampler.resolveStomps(horde, crew);
+
+    // Recovery measures the hull-carried pose and current held E before any other
+    // gameplay system can consume it. Raw input remains untouched for networking.
+    player.prepareStep(input);
+    stepRecovery(localSim.operatives, dt, {
+      targets: localSim.recoveryTargets,
+      // A multiplayer browser never owns lifecycle outcomes, even before its first
+      // baseline or while transport is down. Snapshot availability controls what
+      // can be predicted; session role controls who may recover or medevac.
+      authoritative: !net.multiplayer,
+    });
+    const actionInput = recoveryInputFor(player, input);
+    if (!authoritative && actionInput.pressed("KeyQ")) director.callEarly();
 
     if (trampler.destroyed) {
       hud.showBanner("REACTOR LOST<small>resetting…</small>");
@@ -597,10 +614,18 @@ function boot() {
         run.update();
       }
 
-      // Banner priority, highest first: losing the reactor, finishing the run,
-      // being asked to choose a road, a tuning toast, being immobilised. Each one
-      // outranks the next because each is a state you can do less about.
-      if (run.done) {
+      // Banner priority, highest first: losing the reactor, being downed, finishing
+      // the run, a tuning toast, then immobilisation. A recovery state must not be
+      // hidden by an unrelated transient while the operative has no other actions.
+      if (player.downed) {
+        const remaining = player.medevacRemaining.toFixed(1);
+        const detail = player.rescuerSeat > 0
+          ? `CREW ${player.rescuerSeat} RECOVERING`
+          : player.recoveryHasCrew
+            ? `CREW CAN RECOVER YOU · EMERGENCY RECOVERY IN ${remaining}s`
+            : `EMERGENCY RECOVERY IN ${remaining}s`;
+        hud.showBanner(`DOWNED<small>${detail}</small>`);
+      } else if (run.done) {
         hud.showBanner(
           `BIOME CLEARED<small>${CFG.run.legs} landmarks and the siegebreaker`
           + ` · press K to run it again</small>`,
@@ -632,23 +657,23 @@ function boot() {
       }
     }
 
-    // Look and hull carry must be current before an action ray or range check reads them.
-    // Player.update calls this too as a guarded fallback for standalone simulation callers.
-    player.prepareStep(input);
-    handleStationInput(guns, input, player);
-    grapple.handleInput(input);
-    player.update(dt, input);
+    // Look and hull carry were prepared before recovery arbitration. Every gameplay
+    // consumer now sees the routed input, while physical input remains available to
+    // endFrame() and the network command capture.
+    handleStationInput(guns, actionInput, player);
+    grapple.handleInput(actionInput);
+    player.update(dt, actionInput);
     // Resolve whether work genuinely owns the carried hands before its trigger is read.
     // Progress stays after both weapon paths, preserving the established rule that clearing
     // the final nearby hostile earns full-rate repair on this same frame.
-    repair.admit(dt, input);
-    weapon.update(dt, input);
-    for (const g of guns) g.update(dt, input, player, weapon);
+    repair.admit(dt, actionInput);
+    weapon.update(dt, actionInput);
+    for (const g of guns) g.update(dt, actionInput, player, weapon);
     repair.work(dt);
     // A client updates placement readiness for its prompt, never the rack clocks, placement
     // list, targeting or damage. Those are shared state and advance once on the authority.
     if (authoritative) emitters.updateClient(dt, player);
-    else emitters.update(dt, input, player);
+    else emitters.update(dt, actionInput, player);
     // After repair and the player, so the conditional bonuses are rebuilt from the
     // position and the health this frame actually ENDED with, and before the horde
     // reads anything.
@@ -664,7 +689,7 @@ function boot() {
     // `hud.update` runs after this, so the buff strip is always current.
     items.update(dt);
     // After the director, so a wave resolved this frame pays this frame.
-    handlePurchasing(dt);
+    handlePurchasing(dt, actionInput);
     // Named on the swap, polled from a counter like every other pure reader. The
     // silhouette in your hands is the standing readout for which weapon is up; this
     // is the one moment a WORD is worth more than a shape, because "useless past
@@ -797,6 +822,11 @@ function boot() {
     // Delayed network transforms are presentation only. Gameplay above ran against the newest
     // authority restored by applyPending(); drawing now uses the smooth server-tick cursor.
     net.applyPresentation(renderDt);
+
+    // A release event outlives the simulation state that produced it. Consume it only now,
+    // once per rendered frame and after multiplayer has installed the delayed body pose; this
+    // is what keeps a shot visible when catch-up steps begin and end FIRING between renders.
+    horde.presentSpikerShots(renderDt);
 
     // Simulation remains fixed-step; only the camera is drawn between its two newest poses.
     // This also restores the unshaken base transform on every rendered frame.

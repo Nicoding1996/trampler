@@ -369,10 +369,10 @@ export class CameraPresentation {
     this.currentPosition = this.previousPosition.clone();
     this.actualPosition = new THREE.Vector3();
     this.correction = new THREE.Vector3();
-    this.previousYaw = player.yaw;
-    this.currentYaw = player.yaw;
-    this.previousPitch = player.pitch;
-    this.currentPitch = player.pitch;
+    this.previousYaw = player.viewYaw;
+    this.currentYaw = player.viewYaw;
+    this.previousPitch = player.viewPitch;
+    this.currentPitch = player.viewPitch;
 
     // A snapshot correction relocates the hull immediately, which is required for collision
     // and for keeping a rider at the same deck-local point. It must not also become a camera
@@ -395,7 +395,9 @@ export class CameraPresentation {
       && this.player.relocationCount !== this.presentationRelocationCount;
     const deathChanged = this.presentationDeaths !== undefined
       && this.player.deaths !== this.presentationDeaths;
-    if (base !== this.presentationBase || relocationChanged || deathChanged) {
+    const downedChanged = this.presentationDowned !== undefined
+      && this.player.downed !== this.presentationDowned;
+    if (base !== this.presentationBase || relocationChanged || deathChanged || downedChanged) {
       // afterStep() can observe a deck/ground transition or respawn after this frame's rebase()
       // already ran. Clear here as well as in rebase so a deck-authored residual cannot be
       // rendered once in a new coordinate frame or survive an explicit pose discontinuity.
@@ -405,6 +407,7 @@ export class CameraPresentation {
     this.presentationBase = base;
     this.presentationRelocationCount = this.player.relocationCount;
     this.presentationDeaths = this.player.deaths;
+    this.presentationDowned = this.player.downed;
     if (!base) return;
     this.baseLocalPosition.copy(this.currentPosition);
     base.worldToLocal(this.baseLocalPosition);
@@ -448,16 +451,30 @@ export class CameraPresentation {
       this.authorityYawOffset = 0;
     }
 
+    const downedChanged = this.player.downed !== this.presentationDowned;
     this.player.eyePosition(this.actualPosition);
-    this.correction.copy(this.actualPosition).sub(this.currentPosition);
-    this.previousPosition.add(this.correction);
-    this.currentPosition.copy(this.actualPosition);
+    if (downedChanged) {
+      // Entering or leaving the body camera is a state cut, not travel between two
+      // eyes. Interpolating it would sweep the camera through the operative and hull.
+      this.previousPosition.copy(this.actualPosition);
+      this.currentPosition.copy(this.actualPosition);
+      this.previousYaw = this.player.viewYaw;
+      this.currentYaw = this.player.viewYaw;
+      this.previousPitch = this.player.viewPitch;
+      this.currentPitch = this.player.viewPitch;
+      this.authorityOffset.set(0, 0, 0);
+      this.authorityYawOffset = 0;
+    } else {
+      this.correction.copy(this.actualPosition).sub(this.currentPosition);
+      this.previousPosition.add(this.correction);
+      this.currentPosition.copy(this.actualPosition);
 
-    const yawCorrection = angleDelta(this.currentYaw, this.player.yaw);
-    this.previousYaw += yawCorrection;
-    this.currentYaw = this.player.yaw;
-    this.previousPitch += this.player.pitch - this.currentPitch;
-    this.currentPitch = this.player.pitch;
+      const yawCorrection = angleDelta(this.currentYaw, this.player.viewYaw);
+      this.previousYaw += yawCorrection;
+      this.currentYaw = this.player.viewYaw;
+      this.previousPitch += this.player.viewPitch - this.currentPitch;
+      this.currentPitch = this.player.viewPitch;
+    }
     this.#captureBasedPose();
   }
 
@@ -467,7 +484,7 @@ export class CameraPresentation {
     this.previousYaw = this.currentYaw;
     this.previousPitch = this.currentPitch;
 
-    if (!this.input.locked || this.player.station) return;
+    if (!this.input.locked || this.player.station || this.player.downed) return;
     this.previousYaw -= this.input.mouse.dx * CFG.player.lookSensitivity;
     this.previousPitch = clamp(
       this.previousPitch - this.input.mouse.dy * CFG.player.lookSensitivity,
@@ -478,9 +495,15 @@ export class CameraPresentation {
 
   /** Capture the new fixed pose after the simulation has advanced. */
   afterStep() {
+    const downedChanged = this.player.downed !== this.presentationDowned;
     this.player.eyePosition(this.currentPosition);
-    this.currentYaw = this.player.yaw;
-    this.currentPitch = this.player.pitch;
+    this.currentYaw = this.player.viewYaw;
+    this.currentPitch = this.player.viewPitch;
+    if (downedChanged) {
+      this.previousPosition.copy(this.currentPosition);
+      this.previousYaw = this.currentYaw;
+      this.previousPitch = this.currentPitch;
+    }
     this.#captureBasedPose();
   }
 
@@ -492,7 +515,7 @@ export class CameraPresentation {
 
     let yaw = this.previousYaw + angleDelta(this.previousYaw, this.currentYaw) * t;
     let pitch = this.previousPitch + (this.currentPitch - this.previousPitch) * t;
-    if (this.input.locked && !this.player.station) {
+    if (this.input.locked && !this.player.station && !this.player.downed) {
       yaw -= this.input.mouse.dx * CFG.player.lookSensitivity;
       pitch -= this.input.mouse.dy * CFG.player.lookSensitivity;
     }

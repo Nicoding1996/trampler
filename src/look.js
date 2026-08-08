@@ -108,6 +108,7 @@ const ROLE_TEXTURE = {
   enemy_burrower: { set: "rock", relief: true },
   enemy_sapper: { set: "rock", relief: true },
   enemy_titan: { set: "rock", relief: true },
+  enemy_spiker: { set: "rock", relief: true },
   crew: { set: "rust", relief: true },
   crew_gear: { set: "panel", relief: true },
 };
@@ -244,7 +245,7 @@ class LookRegistry {
       const nonMetal = new Set([
         "sand", "rock", "ruin",
         "enemy_chewer", "enemy_climber", "enemy_burrower", "enemy_sapper", "enemy_titan",
-        "crew",
+        "enemy_spiker", "crew",
       ]);
       mat.metalness = nonMetal.has(mat.userData.role) ? 0.0 : 0.55;
     }
@@ -486,6 +487,28 @@ export function enemyGeometry(key, cfg) {
       break;
     }
 
+    case "spiker": {
+      // Low while running, unmistakably artillery-shaped while braced: a swollen
+      // pressure sac feeds a folded dorsal lance. The body tint carries the charge
+      // pulse, so the sac has to read by silhouette even though the type remains one
+      // instanced material and one draw call.
+      push(new THREE.BoxGeometry(r * 1.65, h * 0.4, r * 1.8), 0, -h * 0.03, 0);
+      push(new THREE.SphereGeometry(r * 0.78, 10, 8), 0, h * 0.24, r * 0.34);
+      push(new THREE.CylinderGeometry(r * 0.13, r * 0.2, r * 1.45, 7),
+        0, h * 0.34, -r * 0.52, -Math.PI / 2);
+      push(new THREE.ConeGeometry(r * 0.2, r * 0.42, 7),
+        0, h * 0.34, -r * 1.45, -Math.PI / 2);
+      for (const sx of [-1, 1]) {
+        for (const z of [-r * 0.55, r * 0.55]) {
+          const diagonal = (sx < 0) === (z < 0) ? PART.LIMB_A : PART.LIMB_B;
+          push(new THREE.CylinderGeometry(r * 0.13, r * 0.1, h * 0.46, 5),
+            sx * r * 0.72, -h * 0.24, z,
+            0, 0, sx * 0.18, [diagonal, -h * 0.01]);
+        }
+      }
+      break;
+    }
+
     case "titan": {
       // Boss silhouette: a slab of a torso on four legs, with a crown of horns.
       // Tall enough that it cannot fit under the hull, which is the fight's whole
@@ -530,9 +553,10 @@ export function enemyGeometry(key, cfg) {
 /**
  * Give a horde material a walk cycle, in the vertex shader.
  *
- * WHY IT IS DONE HERE AND NOT ON THE CPU. The horde is six InstancedMesh and one
- * geometry per type; there is no Object3D per enemy and there cannot be one, since
- * the whole crowd is six draw calls and 1,192 triangles. Animating on the CPU would
+ * WHY IT IS DONE HERE AND NOT ON THE CPU. The animated bodies are seven
+ * `InstancedMesh` objects, one geometry per type; there is no `Object3D` per enemy
+ * and there cannot be one, since the body crowd is seven draw calls and a few
+ * thousand triangles. Animating on the CPU would
  * mean touching 400 bodies a frame against a simulation budget of about a
  * millisecond, and animating with a skeleton is not on the table at all -- three.js
  * has no instanced skinning in core.

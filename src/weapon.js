@@ -337,6 +337,10 @@ export class Weapon {
       if (p.life <= 0) p.mesh.visible = false;
     }
 
+    // A downed operative has no carried weapon, and a rescuer has committed both
+    // hands to the channel. Cooldowns and visual transients still tick above.
+    if (this.player.downed || this.player.recovering) return;
+
     // Manning a station hands the trigger over to that station's weapon.
     if (this.player.station) return;
 

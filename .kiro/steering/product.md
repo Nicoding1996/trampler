@@ -28,7 +28,7 @@ options. Options do not create gameplay; pressure does.
 
 ## Enemy roles
 
-Six types. Each one attacks the pillar from a different angle, and none of them is
+Seven types. Each one attacks the pillar from a different angle, and none of them is
 a health bar with a different colour on it. If a new type cannot be described as
 "the reason to be somewhere", it should not exist.
 
@@ -50,6 +50,13 @@ a health bar with a different colour on it. If a new type cannot be described as
 - **Sappers** deal no contact damage at all. They plant a charge worth exactly one
   leg on a six-second fuse. They are the reason to go down there *right now*, and
   the only enemy that is a timer rather than a damage race.
+- **Spikers** prefer a firing ring around the moving hull, but brace immediately
+  when a visible operative breaches it. They visibly charge a dorsal lance and freeze
+  a constant-velocity prediction shortly before firing; changing course or reaching
+  fortress geometry after that lock is the counter. They prioritise an occupied
+  station, then an exposed operative, so a gunner cannot treat being pinned in the
+  open as safety. With no visible operative they pressure a working leg at reduced
+  damage rather than taking the climber's job at the reactor.
 - **The titan** is too tall to fit under the hull, so it works from outboard, in
   the open, where both guns reach it. It is the one fight that inverts the pillar
   and makes the deck the right place to be.
@@ -291,7 +298,7 @@ not a difficulty slider.
 ## Current state
 
 Everything planned below the netcode tier is built and measured: the moving deck,
-grapple boarding, six enemy types creating pressure in every direction, spatial
+grapple boarding, seven enemy types creating pressure in every direction, spatial
 damage with repair, two manned guns, deployable shock emitters, a finish line, two
 purses, an eighteen-item salvage table with rarity tiers and a re-rolled shop, a free
 pick of three at every landmark, three bounded hardpoints, a four-landmark journey

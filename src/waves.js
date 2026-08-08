@@ -1,5 +1,5 @@
 import { CFG } from "./config.js";
-import { CHEWER, CLIMBER, BULWARK, BURROWER, SAPPER, TITAN } from "./enemies.js";
+import { CHEWER, CLIMBER, BULWARK, BURROWER, SAPPER, TITAN, SPIKER } from "./enemies.js";
 import { makeRandom } from "./util.js";
 
 // Wave director, built on the pacing model Left 4 Dead uses: build up, sustain
@@ -174,7 +174,10 @@ export class Director {
    */
   get settled() {
     return this.#pressureOf(false) < CFG.waves.pressure.calmBelow
-      && this.horde.liveCount <= CFG.waves.holdUntilCleared;
+      && this.horde.liveCount <= CFG.waves.holdUntilCleared
+      // The survivor allowance is for stragglers, not a ranged body that is still
+      // tracking or resolving a shot from outside the ordinary threat radius.
+      && this.horde.rangedThreats === 0;
   }
 
   /**
@@ -366,6 +369,7 @@ export class Director {
       [BURROWER, tier >= c.burrowerFromWave ? Math.round(count * c.burrowerShare) : 0],
       [BULWARK, ramp(c.bulwarkFromWave, c.bulwarkEvery, c.bulwarkMax)],
       [SAPPER, ramp(c.sapperFromWave, c.sapperEvery, c.sapperMax)],
+      [SPIKER, tier >= c.spikerFromWave ? 1 : 0],
     ];
     const got = wanted.map(() => 0);
 

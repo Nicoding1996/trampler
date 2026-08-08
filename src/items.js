@@ -151,14 +151,12 @@ export class Items {
     this.dropT = 0;
     this.welderT = 0;
 
-    // Last frame's readings, for detecting the transitions.
+    // Last frame's readings, for detecting transitions. A medevac happens seconds
+    // after `deaths` increments, so the prior downed state — not the death counter —
+    // is what distinguishes an emergency deck return from earned boarding.
     this.wasAboard = !!this.player?.base;
+    this.wasDowned = !!this.player?.downed;
     this.seenCompletions = this.repair?.completions ?? 0;
-    // Dying respawns you on the deck, which is a ground->aboard transition as far as
-    // `player.base` can tell. Paying the boarding buff for it would be paying the
-    // player for FAILING, which is the same objection that stops an on-kill item
-    // rewarding a sapper's charge going off.
-    this.seenDeaths = this.player?.deaths ?? 0;
 
     // Diagnostics, and the HUD's "what is my build doing" readout.
     this.procs = { fragment: 0, arc: 0, executioner: 0 };
@@ -279,18 +277,13 @@ export class Items {
     // frame's, rather than by an event, because the mantle and drop paths write
     // `player.base` directly and an event threaded through attachTo would miss them.
     //
-    // A death is filtered out first. `respawnOnDeck` moves you from the ground to the
-    // deck, which is indistinguishable from boarding by looking at `player.base`, and
-    // paying the boarding buff for dying would reward the failure. The base reading is
-    // still updated, so the transition is CONSUMED rather than deferred -- otherwise
-    // the buff would simply fire on the next frame instead.
-    const deaths = p.deaths ?? 0;
-    const died = deaths !== this.seenDeaths;
-    if (died) this.seenDeaths = deaths;
-
+    // A downed transition is consumed but never paid. This covers both changes a body
+    // can make while settling and the delayed ground-to-deck jump made by medevac;
+    // checking the death counter here is too early because it changed when the body fell.
+    const downed = !!p.downed;
     const aboard = !!p.base;
     if (aboard !== this.wasAboard) {
-      if (died) {
+      if (downed || this.wasDowned) {
         // consumed, unpaid
       } else if (aboard) {
         this.boardT = CFG.items.spurs.seconds;
@@ -299,6 +292,7 @@ export class Items {
       }
       this.wasAboard = aboard;
     }
+    this.wasDowned = downed;
 
     // ---- a finished repair
     const done = this.repair?.completions ?? 0;

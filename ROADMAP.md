@@ -37,7 +37,7 @@ Everything that was on this roadmap below Tier 3 is built and measured.
 | Update 1.5 Legibility — make it all readable | done |
 | Update 1.6 HUD layout and the buy window | done |
 | Update 1.7 The refit terminal — buying becomes a place | done |
-| Update 2 The Roster — enemy variety | next, after a playtest |
+| Update 2 The Roster — enemy variety | in progress — Spiker done; elite affixes remain |
 | Tier 3 Networked players on a moving platform | untouched, and needs an engine spike |
 
 803 headless checks pass. Two consecutive full runs differ in exactly one line:
@@ -365,15 +365,19 @@ complaint about roads ("does it matter? it seems like it just went next"). Also 
 ground half of the pillar is spatially tiny — "on foot" means a 26 × 16 m box inside a 165 m
 arena.
 
-### Update 2 — The Roster (enemy variety) ← next
+### Update 2 — The Roster (enemy variety) — IN PROGRESS
 
-- **A ranged enemy.** The one genuinely missing role: all six current types deal
-  contact damage, so nothing punishes standing in the open, nothing makes cover
-  matter, and nothing can threaten a manned station at all. That last point is a
-  direct answer to the open question about whether a gun feels powerful or trapped —
-  at present nothing can reach you there.
+- **A ranged enemy — DONE.** The Spiker is a ground monster that prefers a firing
+  ring around the moving hull but braces immediately if a visible operative breaches
+  it. It visibly charges a dorsal lance, freezes a constant-velocity prediction late,
+  and releases one direct spike ray. It prioritises an occupied station, otherwise a
+  visible operative, so being pinned on a gun is no longer safe by default. Fortress
+  geometry blocks the shot; changing course after the lock still dodges it. If no
+  operative is exposed it pressures a working leg at reduced damage. It first
+  substitutes into wave 3 as a singleton, preserving both total wave size and the
+  chewer floor.
 - **Elite affixes.** The cheapest variety multiplier available: armoured, swift,
-  volatile, shielded, applied to the six existing AIs. Reads as a much larger roster
+  volatile, shielded, applied to the seven existing AIs. Reads as a much larger roster
   for a fraction of the work and plugs into the existing wave schedule.
 
 ### Update 3 — The Second Biome (content volume)
@@ -525,13 +529,14 @@ health bar with a different colour.
 | **Bulwark** | armour 20 against a 25-damage rifle. Five per shot, 300 hp, and it is slower than the hull. Must be killed at range. |
 | **Burrower** | travels underground, unshootable, and surfaces under the hull. The reason camping a gun is not a strategy. |
 | **Sapper** | zero contact damage. Plants a charge worth exactly one leg on a six-second fuse. The reason to go down there *now*. |
+| **Spiker** | braces outside the hull and fires a charged, fortress-clipped spike at exposed operatives, preferring occupied stations. The reason a manned gun is powerful rather than safe. |
 | **Titan** | 5.2 m against 4.5 m of hull clearance, so it cannot fit underneath and has to work from outboard, in the open. The one fight the deck wins. |
 
 Specials **substitute** for chewers rather than adding to the wave count, so the
 size curve the pacing was tuned against did not move. Burrowers from wave 2,
-bulwarks from wave 3, sappers from wave 4; waves one and two are the original two
-types, learned without noise.
-→ tests 68-71, 73, 81
+bulwarks and one Spiker from wave 3, sappers from wave 4; waves one and two are
+the original two types, learned without noise.
+→ tests 68-71, 73, 81, 119
 
 ## Two things measured the hard way this pass
 
