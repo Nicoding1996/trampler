@@ -15,4 +15,7 @@
 # wrangler's own writes into `.wrangler/tmp` retrigger it, and the server reloads
 # several times a second while answering nothing. That is why local multiplayer
 # development uses wrangler.dev.jsonc, which has no assets block at all.
+# The remote Cloudflare checkout includes Git's packed history. It is not part of
+# the game and a pack can exceed Workers' 25 MiB per-asset limit.
+.git
 .wrangler
