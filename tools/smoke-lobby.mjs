@@ -30,7 +30,6 @@
 // workerd and an edge PoP are different machines under different load, and the
 // only number that describes what a player gets is the deployed one.
 
-import { readFileSync } from "node:fs";
 import { PROTOCOL_VERSION } from "../src/snapshot.js";
 
 const BASE = process.env.BASE ?? "http://127.0.0.1:8787";
@@ -399,89 +398,6 @@ if (snaps.length >= 2) {
   }
 }
 
-// ---- the pose relay ------------------------------------------------------
-// The relay is what src/net.js rides on, and none of it is reachable from the
-// harness: net.js is browser-only and the DO cannot be imported at all. So the
-// round trip is asserted here or nowhere.
-{
-  console.log("");
-
-  // Seat 2 broadcasts a pose in HULL-LOCAL space; seat 1 must receive it verbatim.
-  // Local y = 0 is the deck surface, not the ground, so 0.9 is a body standing on
-  // the deck rather than one buried in it — the coordinate trap that has produced
-  // two separate test bugs in this project.
-  const sent = { t: "pose", x: 4.05, y: 0.9, z: -7.65, yaw: 1.25, b: 1 };
-  const heard = new Promise((resolve) => {
-    const onMsg = (ev) => {
-      if (ev.data instanceof ArrayBuffer) return;
-      const msg = JSON.parse(ev.data);
-      if (msg.t !== "poses") return;
-      const mine = msg.seats.find((s) => s.seat === 2);
-      if (!mine) return;
-      seat1.socket.removeEventListener("message", onMsg);
-      resolve({ msg, mine });
-    };
-    seat1.socket.addEventListener("message", onMsg);
-  });
-  crew[1].socket.send(JSON.stringify(sent));
-  const got = await Promise.race([heard, sleep(2000).then(() => null)]);
-
-  ok(got !== null, "a pose sent by seat 2 reaches seat 1");
-  if (got) {
-    ok(
-      got.mine.x === sent.x && got.mine.y === sent.y && got.mine.z === sent.z,
-      "the hull-local position survives the round trip unaltered",
-      `${got.mine.x},${got.mine.y},${got.mine.z}`,
-    );
-    ok(got.mine.b === 1, "the frame flag survives, so the client knows which space it is in");
-    // SCENARIO GUARD: seats 3 and 4 have never sent a pose, and a relay that
-    // reported them anyway would be putting bodies at the local origin — which on
-    // this hull is inside the reactor. Asserting the absence is the point.
-    ok(
-      !got.msg.seats.some((s) => s.seat === 3 || s.seat === 4),
-      "seats that have not reported are omitted, not placed at the origin",
-      `carried seats: ${got.msg.seats.map((s) => s.seat).join(",")}`,
-    );
-  }
-
-  // A NaN from one client must not reach the others. Invariant 16 is global in the
-  // harness; nothing enforced it across the wire until now. JSON cannot even carry
-  // NaN, so the realistic attack is a string or a null, which is what is sent here.
-  const poisoned = new Promise((resolve) => {
-    const onMsg = (ev) => {
-      if (ev.data instanceof ArrayBuffer) return;
-      const msg = JSON.parse(ev.data);
-      if (msg.t !== "poses") return;
-      const mine = msg.seats.find((s) => s.seat === 2);
-      if (!mine || mine.x === sent.x) return; // still the previous, good pose
-      seat1.socket.removeEventListener("message", onMsg);
-      resolve(mine);
-    };
-    seat1.socket.addEventListener("message", onMsg);
-  });
-  crew[1].socket.send(JSON.stringify({ t: "pose", x: "haha", y: null, z: 3, yaw: 0, b: 0 }));
-  const dirty = await Promise.race([poisoned, sleep(1500).then(() => null)]);
-  ok(dirty !== null, "the poisoned pose was relayed at all (test is not vacuous)");
-  if (dirty) {
-    ok(
-      Number.isFinite(dirty.x) && Number.isFinite(dirty.y) && Number.isFinite(dirty.z),
-      "non-numeric fields are coerced, so one client cannot NaN everybody else",
-      `x=${dirty.x} y=${dirty.y} z=${dirty.z}`,
-    );
-  }
-
-  // The two halves of the send-rate decision live in different files — CFG.net.sendHz
-  // in src/config.js and SNAPSHOT_EVERY in worker/index.js — with no build step to
-  // reconcile them. This is the assertion that stops them drifting.
-  const cfg = readFileSync("src/config.js", "utf8");
-  const declared = Number(cfg.match(/sendHz:\s*(\d+)/)?.[1]);
-  ok(
-    declared === crew[0].hello.snapshotHz,
-    "the client's send rate matches the rate the server advertises",
-    `CFG.net.sendHz ${declared} vs server ${crew[0].hello.snapshotHz}`,
-  );
-}
-
 // ---- joining a run in progress ------------------------------------------
 {
   const phased = new Promise((resolve) => {
@@ -504,8 +420,8 @@ if (snaps.length >= 2) {
 
   // ---- THE SHARED FORTRESS, over a real socket -----------------------------
   //
-  // Everything above this line tests the LOBBY: seats, refusals, tick fidelity, the pose
-  // relay. None of it touches the thing slice 1 added, which is that starting a run makes
+  // Everything above this line tests the LOBBY: seats, refusals and tick fidelity. None
+  // of it touches the thing slice 1 added, which is that starting a run makes
   // the Durable Object build the real simulation and broadcast it as state.
   //
   // Asserted here or nowhere. The harness proves the codec and the apply logic (sections
@@ -595,6 +511,12 @@ if (snaps.length >= 2) {
         // any one of those arrays makes the predictor silently treat it as empty.
         const bytes = seat1.snaps[0].bytes;
         const first = decode(seat1.snaps[0].buffer);
+        const operativeSeats = new Set(first.operatives.map((o) => o.seat));
+        ok(
+          first.operatives.length === CREW_MAX && operativeSeats.size === CREW_MAX,
+          "the binary authority snapshot carries every connected operative",
+          `${first.operatives.length} operatives, seats ${[...operativeSeats].join(",")}`,
+        );
         const expectFirst = snapshotBytes(first);
         ok(bytes === expectFirst, "a snapshot is exactly the size its contents imply",
           `${bytes} B for ${first.entities.length} bodies and ${first.operatives.length}`

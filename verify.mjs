@@ -36,7 +36,8 @@ import {
   unpackPhaseBits, PROTOCOL_VERSION, toleranceOf, LAYOUT, WIRE_PHASES, WIRE_RUN_PHASES,
   ENTITY_BYTES, SPIKER_SHOT_BYTES, OPERATIVE_BYTES, HELD_BIT, EDGE_BIT,
   encodeInput, decodeInput, INPUT_BYTES,
-  commitHandsInput, packRepairTarget, unpackRepairTarget, lerpSnapshot,
+  commitHandsInput, packEnemyBits, packRepairTarget, packWeaponBits,
+  unpackRepairTarget, lerpSnapshot,
 } from "./src/snapshot.js";
 import {
   createSession, stepSession, stepSessionClient, snapshotOf, applySnapshot, hullDivergence,
@@ -13474,6 +13475,40 @@ console.log("\n122. Bodies interpolate between snapshots, and a prediction is pu
 
   // ---- the midpoint is genuinely between --------------------------------------
   const mid = lerpSnapshot(first, second, 0.5);
+
+  // Net opts into the mutable hot path, so exercise that branch separately from the pure result
+  // below. Equality alone is not enough: it must also retain its storage and truncate arrays
+  // when the next frame contains fewer bodies or operatives.
+  const scratch = {};
+  const scratchMid = lerpSnapshot(first, second, 0.5, scratch);
+  ok("the production scratch interpolation matches the pure result",
+    JSON.stringify(scratchMid) === JSON.stringify(mid),
+    `${scratchMid.entities.length} bodies and ${scratchMid.operatives.length} operatives`);
+  ok("the scratch truncation scenario has something to remove (test is not vacuous)",
+    second.entities.length > 1 && second.operatives.length > 1,
+    `${second.entities.length} bodies and ${second.operatives.length} operatives before truncation`);
+  const scratchState = scratchMid;
+  const scratchEntities = scratchMid.entities;
+  const scratchOperatives = scratchMid.operatives;
+  const scratchEntity0 = scratchMid.entities[0];
+  const scratchOperative0 = scratchMid.operatives[0];
+  const shorter = {
+    ...second,
+    entities: second.entities.slice(0, 1),
+    operatives: second.operatives.slice(0, 1),
+  };
+  const reused = lerpSnapshot(first, shorter, 0.5, scratch);
+  ok("and it reuses the state, arrays and slot objects rather than allocating a second frame",
+    reused === scratchState
+      && reused.entities === scratchEntities
+      && reused.operatives === scratchOperatives
+      && reused.entities[0] === scratchEntity0
+      && reused.operatives[0] === scratchOperative0,
+    "all five identities held across calls");
+  ok("while truncating stale bodies and operatives from the reused arrays",
+    reused.entities.length === 1 && reused.operatives.length === 1,
+    `${reused.entities.length} body, ${reused.operatives.length} operative remain`);
+
   let moved = 0;
   let worstOffLine = 0;
   for (const m of mid.entities) {
@@ -13673,6 +13708,70 @@ console.log("\n123. An arbitrated shot draws a tracer and deals no damage");
   shootAt(e);
   ok("while an unarbitrated shot does publish, so the bus itself is alive",
     heard === 1, `${heard} hit event once arbitration is off`);
+
+  // The authoritative pool is newer than what the client draws. Drive the exact render-proxy
+  // path rather than calling damage or setting the body flash ourselves: the ray must return the
+  // proxy, the shot may write only that overlay, and Horde must merge it into the delayed body.
+  weapon.arbitrated = true;
+  e = target();
+  const proxyId = horde.pool.indexOf(e);
+  ok("the visible target occupies a real wire pool slot (test is not vacuous)",
+    proxyId >= 0, `pool slot ${proxyId}`);
+  const packed = packEnemyBits({
+    type: e.type,
+    state: e.state,
+    carried: false,
+    flash: false,
+    hpFraction: e.hp / e.maxHp,
+    fuseLit: false,
+  });
+  horde.setRenderCombatFrame(900, [{
+    id: proxyId,
+    generation: e.generation,
+    bitsA: packed.bitsA,
+    bitsB: packed.bitsB,
+    x: e.x,
+    y: e.y,
+    z: e.z,
+    yaw: e.yaw,
+    fuseT: 0,
+  }]);
+  horde.combatTick = 900;
+  const proxy = horde.renderTargets[proxyId];
+  const proxyHp = e.hp;
+  const proxyKills = horde.killCount;
+  const proxyScrap = sim.economy.scrap;
+  const proxySalvage = sim.economy.salvage;
+  const proxyEvents = heard;
+  const proxyHit = shootAt(e);
+
+  ok("an arbitrated render-frame ray returns the fixed proxy, not the newer pool body",
+    proxyHit?.enemy === proxy && proxy !== e,
+    `proxy id ${proxy?.id ?? "none"}, generation ${proxy?.generation ?? "none"}`);
+  ok("the immediate cue lands on the proxy alone before presentation merges it",
+    proxy.flash > 0 && e.flash === 0,
+    `proxy flash ${proxy.flash.toFixed(2)}, body flash ${e.flash.toFixed(2)}`);
+
+  horde.updateSnapshotVisuals(0);
+  ok("the real presentation update merges that cue into the delayed body",
+    e.flash > 0,
+    `body flash ${e.flash.toFixed(2)} after the merge`);
+  ok("and the proxy merge changes no health, kills, income or proc event",
+    e.hp === proxyHp
+      && horde.killCount === proxyKills
+      && sim.economy.scrap === proxyScrap
+      && sim.economy.salvage === proxySalvage
+      && heard === proxyEvents,
+    `${e.hp} hp, ${horde.killCount} kills, ${heard - proxyEvents} events`);
+
+  // Pool ids are reused. A cue from the previous occupant must never flash its replacement.
+  e.flash = 0;
+  proxy.flash = CFG.combat.weapon.hitFlash;
+  e.generation++;
+  horde.updateSnapshotVisuals(0);
+  ok("a recycled pool slot cannot inherit the previous generation's cue",
+    e.flash === 0,
+    `proxy generation ${proxy.generation}, body generation ${e.generation}`);
 }
 
 console.log("\n124. Cone spread is a function of an index both ends agree on");
@@ -13757,6 +13856,270 @@ console.log("\n124. Cone spread is a function of an index both ends agree on");
   ok("with no agreed index the seeded stream is used, so solo replays identically",
     solo1.distanceTo(solo2) < 1e-12,
     "two fresh sims agree, because both draw from the same seed in the same order");
+}
+
+// ---------------------------------------------------------------------------
+// CLIENT PLAYBACK: real Net lifecycle, recovery and observer presentation state.
+//
+// This is browser-only code, so the simulation harness normally cannot import it. A faithful
+// minimal browser shell and a synchronous WebSocket let this section drive the same public Net
+// methods and private message listener the page uses, without replacing the behavior under test.
+console.log("\n125. Network playback recovers its cushion and forgets stale observers");
+{
+  const hadDocument = Object.hasOwn(globalThis, "document");
+  const hadLocation = Object.hasOwn(globalThis, "location");
+  const hadWebSocket = Object.hasOwn(globalThis, "WebSocket");
+  const previousDocument = globalThis.document;
+  const previousLocation = globalThis.location;
+  const previousWebSocket = globalThis.WebSocket;
+
+  globalThis.document = {
+    getElementById: () => null,
+    querySelector: () => null,
+  };
+  globalThis.location = {
+    search: "",
+    origin: "http://localhost:5173",
+    port: "5173",
+    protocol: "http:",
+    host: "localhost:5173",
+  };
+
+  class FakeWebSocket {
+    static latest = null;
+
+    constructor(url) {
+      this.url = url;
+      this.readyState = 1;
+      this.binaryType = "";
+      this.listeners = new Map();
+      this.sent = [];
+      FakeWebSocket.latest = this;
+    }
+
+    addEventListener(type, listener) {
+      if (!this.listeners.has(type)) this.listeners.set(type, []);
+      this.listeners.get(type).push(listener);
+    }
+
+    emit(type, event) {
+      for (const listener of this.listeners.get(type) ?? []) listener(event);
+    }
+
+    message(data) {
+      this.emit("message", { data });
+    }
+
+    send(data) {
+      this.sent.push(data);
+    }
+
+    close(code = 1000, reason = "") {
+      this.readyState = 3;
+      this.emit("close", { code, reason });
+    }
+  }
+
+  globalThis.WebSocket = FakeWebSocket;
+
+  try {
+    const { Net } = await import("./src/net.js");
+
+    const connectNet = async (net, code) => {
+      net.setGraphicsReady();
+      await net.join(code);
+      const socket = FakeWebSocket.latest;
+      socket.message(JSON.stringify({
+        t: "hello",
+        protocol: PROTOCOL_VERSION,
+        seat: 1,
+        code,
+        phase: "lobby",
+        hostSeat: 1,
+        crewMin: 2,
+        crewMax: 4,
+        startTick: null,
+        tickHz: CFG.loop.stepHz,
+        snapshotHz: CFG.net.sendHz,
+      }));
+      return socket;
+    };
+
+    const crewMessage = (members) => JSON.stringify({
+      t: "crew",
+      crew: members,
+      phase: "lobby",
+      hostSeat: 1,
+      crewMin: 2,
+      crewMax: 4,
+      startTick: null,
+    });
+
+    // ---- observer lifecycle ---------------------------------------------------
+    const authority = createSession({ seats: 2, networked: true });
+    const client = createSession({ seats: 1, networked: true });
+    const net = new Net(client.scene, client.player, client.trampler, client);
+    const socket = await connectNet(net, "ABCDEF");
+    socket.message(crewMessage([
+      { seat: 1, name: "ONE" },
+      { seat: 2, name: "TWO" },
+    ]));
+
+    const wire = {
+      ...snapshotOf(authority, 0).operatives.find((op) => op.seat === 2),
+    };
+    wire.shotStartX = 0;
+    wire.shotStartY = 1.5;
+    wire.shotStartZ = 0;
+    wire.shotEndX = 0;
+    wire.shotEndY = 1.5;
+    wire.shotEndZ = -12;
+    net.wireOps = [wire];
+    net.wireAt = performance.now();
+    net.update(DT);
+
+    let remote = net.remotes.get(2);
+    ok("a delayed operative really creates a remote avatar (test is not vacuous)",
+      !!remote, `${net.remotes.size} remote avatar(s)`);
+
+    wire.x += 6;
+    wire.weaponBits = packWeaponBits({ slot: 0, cooldown: 0, shots: 1 });
+    net.update(DT);
+    remote = net.remotes.get(2);
+    ok("the setup contains both accumulated gait and a live shot cue",
+      !!remote && remote.speed > 0 && remote.tracer.visible,
+      remote ? `speed ${remote.speed.toFixed(1)}, tracer ${remote.tracer.visible}` : "no remote");
+
+    net.resumeFromPause();
+    remote = net.remotes.get(2);
+    ok("focus resume clears remote motion and event baselines",
+      !!remote
+        && remote.speed === 0
+        && remote.lastBased === null
+        && remote.lastWeaponShots === null
+        && !remote.tracer.visible,
+      remote ? `speed ${remote.speed}, based ${remote.lastBased}, shots ${remote.lastWeaponShots}` : "no remote");
+
+    wire.x += 6;
+    wire.weaponBits = packWeaponBits({ slot: 0, cooldown: 0, shots: 2 });
+    net.update(DT);
+    remote = net.remotes.get(2);
+    ok("the first resumed pose is a baseline, not a teleport-sized stride or replayed shot",
+      !!remote && remote.speed === 0 && !remote.tracer.visible && remote.lastWeaponShots === 2,
+      remote ? `speed ${remote.speed}, tracer ${remote.tracer.visible}, shots ${remote.lastWeaponShots}` : "no remote");
+
+    // Rebuild both observer deltas, then send a lower server tick through the real binary
+    // listener. That is the production signal for an authority restart.
+    wire.x += 1;
+    wire.weaponBits = packWeaponBits({ slot: 0, cooldown: 0, shots: 3 });
+    net.update(DT);
+    remote = net.remotes.get(2);
+    net.lastSnapshotTick = 100;
+    net.lastSnapshotResetId = authority.resetId;
+    socket.message(encode(snapshotOf(authority, 1)).buffer);
+    ok("an authority rewind clears the same observer baselines before the new run is drawn",
+      !!remote
+        && remote.speed === 0
+        && remote.lastBased === null
+        && remote.lastWeaponShots === null
+        && !remote.tracer.visible,
+      remote ? `speed ${remote.speed}, based ${remote.lastBased}, shots ${remote.lastWeaponShots}` : "no remote");
+
+    // The delayed wire record still says seat 2 exists. The newer crew bookkeeping must win,
+    // both synchronously and on the next draw, or #remote recreates the disposed avatar.
+    socket.message(crewMessage([{ seat: 1, name: "ONE" }]));
+    ok("a crew departure removes its remote synchronously",
+      !net.remotes.has(2), `${net.remotes.size} remote avatar(s)`);
+    net.update(DT);
+    ok("and stale delayed wire data cannot recreate the departed seat on the next draw",
+      !net.remotes.has(2), `${net.remotes.size} remote avatar(s)`);
+    net.leave();
+
+    // ---- playback recovery ----------------------------------------------------
+    const clockAuthority = createSession({ seats: 1, networked: true });
+    const clockClient = createSession({ seats: 1, networked: true });
+    const clockNet = new Net(
+      clockClient.scene,
+      clockClient.player,
+      clockClient.trampler,
+      clockClient,
+    );
+    const clockSocket = await connectNet(clockNet, "BCDEFG");
+    const sendSnapshot = (tick) => {
+      clockSocket.message(encode(snapshotOf(clockAuthority, tick)).buffer);
+    };
+
+    for (const tick of [0, 3, 6, 9]) sendSnapshot(tick);
+    clockNet.applyPending(0, DT);
+    const tickHz = CFG.loop.stepHz;
+    const delayTicks = (CFG.net.interpDelayMs / 1000) * tickHz;
+    ok("startup establishes the configured interpolation cushion",
+      clockNet.renderReady && Math.abs(9 - clockNet.renderTick - delayTicks) < 1e-9,
+      `${(9 - clockNet.renderTick).toFixed(2)} ticks behind`);
+
+    let drainFrames = 0;
+    while (!clockNet.interpRecovering && drainFrames < 20) {
+      clockNet.applyPending(0, DT);
+      drainFrames++;
+    }
+    ok("withholding snapshots genuinely enters recovery (test is not vacuous)",
+      clockNet.interpRecovering,
+      `${drainFrames} frames, ${(9 - clockNet.renderTick).toFixed(2)} ticks remain`);
+
+    let newestTick = 9;
+    let exitLag = null;
+    const recoveryLags = [];
+    for (let frame = 0; frame < 60; frame++) {
+      if (frame % 3 === 0) {
+        newestTick += 3;
+        sendSnapshot(newestTick);
+      }
+      const wasRecovering = clockNet.interpRecovering;
+      clockNet.applyPending(0, DT);
+      const lag = newestTick - clockNet.renderTick;
+      if (wasRecovering && !clockNet.interpRecovering && exitLag === null) exitLag = lag;
+      recoveryLags.push(lag);
+    }
+
+    ok("recovery exits only after this frame's playback leaves the full cushion intact",
+      exitLag !== null && exitLag >= delayTicks - 1e-9,
+      `exit lag ${exitLag?.toFixed(2) ?? "none"}, target ${delayTicks.toFixed(2)} ticks`);
+    const settled = recoveryLags.slice(-9);
+    const settledMin = Math.min(...settled);
+    const settledMax = Math.max(...settled);
+    ok("and converges back to the same 120 ms packet phase startup established",
+      Math.abs(settledMax - delayTicks) < 1e-9
+        && Math.abs(settledMin - (delayTicks - 2)) < 1e-9,
+      `tail ${settled.map((lag) => lag.toFixed(2)).join(", ")}`);
+
+    // One long visible frame: authority advances twelve ticks, but presentation may consume
+    // only six. The next ordinary frame then repays excess delay at exactly the bounded 1.25x.
+    newestTick += 12;
+    sendSnapshot(newestTick);
+    const beforeCap = clockNet.renderTick;
+    clockNet.applyPending(0, 0.2);
+    const cappedAdvance = clockNet.renderTick - beforeCap;
+    ok("a slow visible frame still obeys the six-tick playback cap",
+      Math.abs(cappedAdvance - 6) < 1e-9,
+      `${cappedAdvance.toFixed(2)} ticks advanced`);
+    const beforeRepay = clockNet.renderTick;
+    clockNet.applyPending(0, DT);
+    const repayAdvance = clockNet.renderTick - beforeRepay;
+    ok("excess delay is still repaid at the bounded 1.25x rate",
+      Math.abs(repayAdvance - CFG.net.interpCatchUpScale) < 1e-9,
+      `${repayAdvance.toFixed(2)} ticks advanced`);
+    clockNet.leave();
+  } catch (err) {
+    ok("the real Net lifecycle scenario executes without an exception", false,
+      err?.stack ?? String(err));
+  } finally {
+    if (hadDocument) globalThis.document = previousDocument;
+    else delete globalThis.document;
+    if (hadLocation) globalThis.location = previousLocation;
+    else delete globalThis.location;
+    if (hadWebSocket) globalThis.WebSocket = previousWebSocket;
+    else delete globalThis.WebSocket;
+  }
 }
 
 ok("no boarder ever floated off the deck footprint", !sawFloatingBoarder);

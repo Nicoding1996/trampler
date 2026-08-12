@@ -393,14 +393,17 @@ export class Horde {
     // Presentation raycasts must describe the generation that is visibly interpolated,
     // not whichever body currently occupies the authority-backed pool slot. One fixed proxy
     // per slot gives Weapon and the HUD a stable, allocation-free target with only the fields
-    // they read; clients arbitrate shots before consequence, so these are never damaged.
-    this.renderTargets = Array.from({ length: this.pool.length }, () => ({
+    // they read. Clients arbitrate shots before consequence, so hp is never damaged here;
+    // `flash` is the one presentation-only result a locally traced hit may write immediately.
+    this.renderTargets = Array.from({ length: this.pool.length }, (_, id) => ({
+      id,
       alive: false,
       generation: 0,
       type: CHEWER,
       hp: 0,
       maxHp: 1,
       yaw: 0,
+      flash: 0,
     }));
 
     // One fixed ring for the authority and one fixed render frame for a client. At 60 Hz the
@@ -837,7 +840,19 @@ export class Horde {
     for (const m of this.meshes) {
       if (m.material.userData.gait) m.material.userData.gait.uGaitTime.value = this.gaitT;
     }
-    for (const e of this.pool) {
+    for (let i = 0; i < this.pool.length; i++) {
+      const e = this.pool[i];
+      const target = this.renderTargets[i];
+      // An arbitrated client shot writes only this short presentation overlay. Merge it into
+      // the delayed body that will actually be drawn, keyed by generation so a recycled pool
+      // slot cannot flash an unrelated replacement. HP, alive state and the event bus remain
+      // untouched until authority arrives.
+      if (target.alive && target.flash > 0) {
+        if (e.alive && e.generation === target.generation) {
+          e.flash = Math.max(e.flash, target.flash);
+        }
+        target.flash = Math.max(0, target.flash - dt);
+      }
       if (e.alive && e.flash > 0) e.flash = Math.max(0, e.flash - dt);
     }
     this.#writeInstances();
@@ -2147,12 +2162,18 @@ export class Horde {
 
       const target = targets[i];
       const maxHp = enemyCfg(type).hp;
+      if (target.generation !== generation) target.flash = 0;
       target.generation = generation;
       target.type = type;
       target.hp = hpFraction * maxHp;
       target.maxHp = maxHp;
       target.yaw = w.yaw;
       target.alive = true;
+    }
+    // A locally flashed target that disappeared must not reappear with that old cue if a
+    // malformed/stale frame later mentions the same generation again.
+    for (let i = 0; i < targets.length; i++) {
+      if (!targets[i].alive) targets[i].flash = 0;
     }
     return frame;
   }
@@ -2162,6 +2183,7 @@ export class Horde {
     this.renderCombatFrame.flags.fill(0);
     for (let i = 0; i < this.renderTargets.length; i++) {
       this.renderTargets[i].alive = false;
+      this.renderTargets[i].flash = 0;
     }
     this.combatTick = null;
   }

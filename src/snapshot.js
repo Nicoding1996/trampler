@@ -925,21 +925,20 @@ export function packEnemyBits(e) {
   return { bitsA: a, bitsB: b };
 }
 
-export function unpackEnemyBits(bitsA, bitsB) {
-  return {
-    type: bitsA & 0x07,
-    state: (bitsA >> 3) & 0x07,
-    // WHICH FRAME THE POSITION IS IN, and this single bit is the whole reason a latched
-    // chewer does not skate. A body riding the deck or holding a leg is sent in hull-local
-    // space, because the receiver already knows the hull's current transform; sent in world
-    // space it would be stale by the hull's own travel — 45 cm at 120 ms, measured in
-    // section 115 — relative to the leg it is chewing, which is the readout a player uses
-    // to decide whether to drop down and fight.
-    carried: (bitsA & 64) !== 0,
-    flash: (bitsA & 128) !== 0,
-    hpFraction: (bitsB & 0x7f) / HP_STEPS,
-    fuseLit: (bitsB & 128) !== 0,
-  };
+export function unpackEnemyBits(bitsA, bitsB, out = {}) {
+  out.type = bitsA & 0x07;
+  out.state = (bitsA >> 3) & 0x07;
+  // WHICH FRAME THE POSITION IS IN, and this single bit is the whole reason a latched
+  // chewer does not skate. A body riding the deck or holding a leg is sent in hull-local
+  // space, because the receiver already knows the hull's current transform; sent in world
+  // space it would be stale by the hull's own travel — 45 cm at 120 ms, measured in
+  // section 115 — relative to the leg it is chewing, which is the readout a player uses
+  // to decide whether to drop down and fight.
+  out.carried = (bitsA & 64) !== 0;
+  out.flash = (bitsA & 128) !== 0;
+  out.hpFraction = (bitsB & 0x7f) / HP_STEPS;
+  out.fuseLit = (bitsB & 128) !== 0;
+  return out;
 }
 
 // ------------------------------------------------------------------------ operative bits
@@ -1217,11 +1216,17 @@ const mix = (a, b, t) => a + (b - a) * t;
  * which is what `attachTo()` does for the real player and what net.js already does for a
  * relayed pose, for exactly this reason.
  */
-export function lerpSnapshot(a, b, t) {
+export function lerpSnapshot(a, b, t, scratch = null) {
   if (!a || a === b) return b;
   const f = t <= 0 ? 0 : t >= 1 ? 1 : t;
 
-  const out = { ...b };
+  // The default stays a pure, independently-owned result for the harness and any caller that
+  // retains it. Net passes one private scratch bag because this runs every rendered frame over
+  // as many as 420 bodies; that opt-in path reuses the result, arrays, lookup tables and one
+  // output object per slot. Its contents are valid only until the next call with that bag.
+  const reusable = scratch !== null;
+  const out = reusable ? (scratch.state ??= {}) : { ...b };
+  if (reusable) Object.assign(out, b);
 
   // Release events are discrete newest-authority facts, never interpolated. Net consumes
   // them from the newest packet rather than this delayed render frame; retaining b's array
@@ -1231,41 +1236,113 @@ export function lerpSnapshot(a, b, t) {
   // Entities, matched by pool id AND spawn generation. A body present in `b` but not `a`,
   // or a slot whose occupant changed between them, has no history to blend from and appears
   // at its authoritative position rather than sliding in from the previous body's death.
-  const prev = new Map();
-  for (const e of a.entities ?? []) prev.set(e.id, e);
+  const previousEntities = a.entities ?? [];
+  const nextEntities = b.entities ?? [];
+  if (reusable) {
+    const prev = (scratch.prevEntities ??= []);
+    const entities = (scratch.entities ??= []);
+    const pool = (scratch.entityPool ??= []);
+    prev.length = 0;
+    for (const e of previousEntities) prev[e.id] = e;
 
-  out.entities = (b.entities ?? []).map((e) => {
-    const p = prev.get(e.id);
-    if (!p || p.generation !== e.generation) return e;
-    // Bit 64 of bitsA is `carried`. Compared before blending, because it names the frame the
-    // coordinates are in.
-    if (((p.bitsA ^ e.bitsA) & 64) !== 0) return e;
-    return {
-      ...e,
-      x: mix(p.x, e.x, f),
-      y: mix(p.y, e.y, f),
-      z: mix(p.z, e.z, f),
-      yaw: lerpAngle(p.yaw, e.yaw, f),
-    };
-  });
+    for (let i = 0; i < nextEntities.length; i++) {
+      const e = nextEntities[i];
+      const p = prev[e.id];
+      let dst = pool[i];
+      if (!dst) dst = pool[i] = {};
+      // ENTITY is a fixed nine-field wire record. Copying it explicitly is both allocation-free
+      // and measurably cheaper than Object.assign across a full 400-body frame.
+      dst.id = e.id;
+      dst.generation = e.generation;
+      dst.bitsA = e.bitsA;
+      dst.bitsB = e.bitsB;
+      dst.x = e.x;
+      dst.y = e.y;
+      dst.z = e.z;
+      dst.fuseT = e.fuseT;
+      dst.yaw = e.yaw;
 
-  const prevOps = new Map();
-  for (const o of a.operatives ?? []) prevOps.set(o.seat, o);
+      // Bit 64 of bitsA is `carried`. Compared before blending, because it names the frame the
+      // coordinates are in.
+      if (p && p.generation === e.generation && ((p.bitsA ^ e.bitsA) & 64) === 0) {
+        dst.x = mix(p.x, e.x, f);
+        dst.y = mix(p.y, e.y, f);
+        dst.z = mix(p.z, e.z, f);
+        dst.yaw = lerpAngle(p.yaw, e.yaw, f);
+      }
+      entities[i] = dst;
+    }
+    entities.length = nextEntities.length;
+    prev.length = 0;
+    out.entities = entities;
+  } else {
+    const prev = new Map();
+    for (const e of previousEntities) prev.set(e.id, e);
 
-  out.operatives = (b.operatives ?? []).map((o) => {
-    const p = prevOps.get(o.seat);
-    if (!p) return o;
-    // Bit 1 of `bits` is `based`. Same frame rule: a crewmate who stepped off the deck between
-    // the two snapshots must not be lerped through the hull on the way down.
-    if (((p.bits ^ o.bits) & 1) !== 0) return o;
-    return {
-      ...o,
-      x: mix(p.x, o.x, f),
-      y: mix(p.y, o.y, f),
-      z: mix(p.z, o.z, f),
-      yaw: lerpAngle(p.yaw, o.yaw, f),
-    };
-  });
+    out.entities = nextEntities.map((e) => {
+      const p = prev.get(e.id);
+      if (!p || p.generation !== e.generation) return e;
+      // Bit 64 of bitsA is `carried`. Compared before blending, because it names the frame the
+      // coordinates are in.
+      if (((p.bitsA ^ e.bitsA) & 64) !== 0) return e;
+      return {
+        ...e,
+        x: mix(p.x, e.x, f),
+        y: mix(p.y, e.y, f),
+        z: mix(p.z, e.z, f),
+        yaw: lerpAngle(p.yaw, e.yaw, f),
+      };
+    });
+  }
+
+  const previousOperatives = a.operatives ?? [];
+  const nextOperatives = b.operatives ?? [];
+  if (reusable) {
+    const prev = (scratch.prevOperatives ??= []);
+    const operatives = (scratch.operatives ??= []);
+    const pool = (scratch.operativePool ??= []);
+    prev.length = 0;
+    for (const o of previousOperatives) prev[o.seat] = o;
+
+    for (let i = 0; i < nextOperatives.length; i++) {
+      const o = nextOperatives[i];
+      const p = prev[o.seat];
+      let dst = pool[i];
+      if (!dst) dst = pool[i] = {};
+      Object.assign(dst, o);
+
+      // Bit 1 of `bits` is `based`. Same frame rule: a crewmate who stepped off the deck between
+      // the two snapshots must not be lerped through the hull on the way down.
+      if (p && ((p.bits ^ o.bits) & 1) === 0) {
+        dst.x = mix(p.x, o.x, f);
+        dst.y = mix(p.y, o.y, f);
+        dst.z = mix(p.z, o.z, f);
+        dst.yaw = lerpAngle(p.yaw, o.yaw, f);
+      }
+      operatives[i] = dst;
+    }
+    operatives.length = nextOperatives.length;
+    prev.length = 0;
+    out.operatives = operatives;
+  } else {
+    const prev = new Map();
+    for (const o of previousOperatives) prev.set(o.seat, o);
+
+    out.operatives = nextOperatives.map((o) => {
+      const p = prev.get(o.seat);
+      if (!p) return o;
+      // Bit 1 of `bits` is `based`. Same frame rule: a crewmate who stepped off the deck between
+      // the two snapshots must not be lerped through the hull on the way down.
+      if (((p.bits ^ o.bits) & 1) !== 0) return o;
+      return {
+        ...o,
+        x: mix(p.x, o.x, f),
+        y: mix(p.y, o.y, f),
+        z: mix(p.z, o.z, f),
+        yaw: lerpAngle(p.yaw, o.yaw, f),
+      };
+    });
+  }
 
   return out;
 }

@@ -2067,15 +2067,12 @@ export const CFG = {
   // -- tick rate, snapshot rate, crew cap, the wake interval -- live in
   // worker/index.js, because a Durable Object cannot import this file.
   //
-  // That split is a real cost and worth naming: `sendHz` here and `SNAPSHOT_EVERY`
-  // there are two halves of one decision, in two files, with nothing checking they
-  // agree. tools/smoke-lobby.mjs asserts the server's advertised rates match what
-  // this expects, so the pair cannot drift silently -- the same reason the refit
-  // terminal's distance to the reactor is asserted rather than left in a comment.
+  // The Worker advertises its actual rates in `hello`; `sendHz` survives as the client's
+  // fallback snapshot cadence for a missing/invalid advertisement. The historical name is
+  // deliberately not being folded into this transport change as a config rename.
   net: {
-    // Client pose rate. Matches the server's 20 Hz broadcast: sending faster would
-    // put two poses in one relayed frame and the second would overwrite the first
-    // before anyone saw it.
+    // Fallback only. A current server advertises 20 Hz and `Net` uses that value directly;
+    // retaining the old default keeps recovery conservative during connection setup.
     sendHz: 20,
 
     // Commands buffered per operative on the authority. Sixteen covers the Worker's bounded
@@ -2112,6 +2109,20 @@ export const CFG = {
     // Cloudflare Workers accept HTTP and WebSockets but not WebTransport datagrams,
     // so there is no unreliable option on this host and the buffer pays for it.
     interpDelayMs: 120,
+
+    // Once playback gets within one snapshot interval of live authority, it slows until the
+    // full interpolation cushion has been rebuilt. Half speed restores a lost 120 ms buffer
+    // in roughly a quarter second at 60 Hz: long enough to avoid a visible freeze, short
+    // enough that a transient browser stall cannot leave every later packet exposed as a
+    // 20 Hz hold-and-catch-up. Derived low-water detection still comes from the server's
+    // advertised snapshot rate, so this is only the recovery shape, not a second delay knob.
+    interpRecoveryScale: 0.5,
+
+    // A slow visible frame can leave MORE than the target cushion after its 100 ms playback
+    // cap. Running at 1.25x only while that excess exists repays a lost 100 ms in about 0.4 s
+    // instead of permanently ratcheting latency upward. The total advance remains bounded by
+    // maxClientCatchUpMs, and the cursor never spends the configured interpolation delay.
+    interpCatchUpScale: 1.25,
 
     // Drop an avatar that has said nothing for this long. Two seconds is well past
     // any plausible retransmit and well short of a player wondering why a ghost is

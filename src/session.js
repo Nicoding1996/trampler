@@ -56,8 +56,10 @@ import {
   PURCHASE_CONTEXT_MASK, PURCHASE_CONTEXT_SHIFT,
 } from "./snapshot.js";
 
-/** Scratch, hoisted. `snapshotOf` runs 20 times a second over up to 420 bodies. */
+/** Scratch, hoisted. Snapshot encode/apply runs over up to 420 bodies. */
 const _enc = new THREE.Vector3();
+const _enemyBits = {};
+let _entitySeen = new Uint8Array(CFG.enemies.max);
 
 /**
  * A duck-typed input that reports nothing pressed.
@@ -1078,7 +1080,9 @@ export function applyEntities(sim, entities) {
   const t = sim.trampler;
   const horde = sim.horde;
   const pool = horde.pool;
-  const seen = new Set();
+  if (_entitySeen.length < pool.length) _entitySeen = new Uint8Array(pool.length);
+  const seen = _entitySeen;
+  seen.fill(0, 0, pool.length);
 
   for (const w of entities) {
     const e = pool[w.id];
@@ -1086,9 +1090,9 @@ export function applyEntities(sim, entities) {
     // Skipped rather than thrown: one stale client should not lose the whole horde, and the
     // protocol version check has already had its chance to catch a real mismatch.
     if (!e) continue;
-    seen.add(w.id);
+    seen[w.id] = 1;
 
-    const b = unpackEnemyBits(w.bitsA, w.bitsB);
+    const b = unpackEnemyBits(w.bitsA, w.bitsB, _enemyBits);
     const generation = w.generation ?? 0;
     const generationChanged = e.generation !== generation;
     e.alive = true;
@@ -1169,7 +1173,7 @@ export function applyEntities(sim, entities) {
   for (let i = 0; i < pool.length; i++) {
     const e = pool[i];
     if (!e.alive) continue;
-    if (!seen.has(i)) {
+    if (seen[i] === 0) {
       e.alive = false;
       e.latched = false;
       e.onHull = false;

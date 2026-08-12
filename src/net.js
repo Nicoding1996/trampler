@@ -85,9 +85,6 @@ const REMOTE_SHOT_MAT = new THREE.MeshBasicMaterial({
 const _pose = { x: 0, y: 0, z: 0, yaw: 0, based: false };
 const _seen = new Set();
 
-/** cm precision. Not a real quantisation, just an honest refusal to send 17 digits. */
-const cm = (n) => Math.round(n * 100) / 100;
-
 /** Shortest-arc angle lerp, so facing does not spin the long way round at ±pi. */
 function lerpAngle(a, b, t) {
   let d = (b - a) % (Math.PI * 2);
@@ -160,7 +157,12 @@ export class Net {
     // its world state is drawn.
     this.lastReconciledTick = -1;
     this.interpAlpha = 0;
+    // Reused by lerpSnapshot's browser hot path. The pure/default path still returns owned
+    // objects for the harness; this bag owns one mutable presentation frame for this client.
+    this.interpScratch = {};
     this.starvedFrames = 0;
+    this.interpRecovering = false;
+    this.interpRecoveries = 0;
 
     // PREDICTION HISTORY for the local operative, keyed on the input sequence it belongs to.
     // Held in HULL-LOCAL space when aboard, for the same reason everything else is: the
@@ -228,10 +230,8 @@ export class Net {
     this.error = "";
     this.startRefusal = "";
 
-    /** seat -> { buffer: [], avatar, lastAt } */
+    /** seat -> observer-only avatar and effect state */
     this.remotes = new Map();
-
-    this.sendAcc = 0;
 
     // Where the lobby is. Explicit override first, then the local-development guess,
     // then same-origin -- which is the deployed case and the one that needs nothing.
@@ -424,6 +424,8 @@ export class Net {
     this.yawCorrection = 0;
     this.pitchCorrection = 0;
     this.renderEntities = null;
+    this.interpRecovering = false;
+    this.#resetRemotePresentation();
     this.sim?.horde?.clearRenderCombatFrame?.();
     if (this.buffer.length === 0) {
       this.renderTick = null;
@@ -488,6 +490,8 @@ export class Net {
     this.lastReconciledTick = -1;
     this.interpAlpha = 0;
     this.starvedFrames = 0;
+    this.interpRecovering = false;
+    this.interpRecoveries = 0;
     this.ackSeq = 0;
     this.lastReconciledSeq = 0;
     this.authorityResetId = null;
@@ -501,7 +505,6 @@ export class Net {
     this.smoothings = 0;
     this.wireOps = [];
     this.wireAt = 0;
-    this.sendAcc = 0;
     this.simReady = false;
     this.sim?.horde?.clearRenderCombatFrame?.();
     this.sim?.repair?.setExternalClaims?.([]);
@@ -671,10 +674,6 @@ export class Net {
         }
         break;
 
-      case "poses":
-        this.#onPoses(msg.seats);
-        break;
-
       case "input":
         // A current client never sends before its first baseline. If an old/racing client does,
         // the Worker names the refusal instead of counting and discarding intent invisibly.
@@ -735,7 +734,9 @@ export class Net {
       this.buffer.length = 0;
       this.renderTick = null;
       this.renderReady = false;
+      this.interpRecovering = false;
       this.renderEntities = null;
+      this.#resetRemotePresentation();
       this.sim?.horde?.clearRenderCombatFrame?.();
       this.history.length = 0;
       this.correction.set(0, 0, 0);
@@ -814,24 +815,78 @@ export class Net {
       const tickHz = Number.isFinite(this.serverTickHz)
         ? this.serverTickHz
         : CFG.loop.stepHz;
+      const snapshotHz = Number.isFinite(this.serverSnapshotHz) && this.serverSnapshotHz > 0
+        ? this.serverSnapshotHz
+        : CFG.net.sendHz;
       const delayTicks = (CFG.net.interpDelayMs / 1000) * tickHz;
+      const snapshotTicks = tickHz / snapshotHz;
       const bufferedTicks = newest.tick - oldest.tick;
 
       if (this.renderTick === null) this.renderTick = oldest.tick;
 
       // Do not consume the first packet immediately and then trail live by only one snapshot
       // interval forever. Hold until the buffer spans the configured delay, then play the
-      // server timeline at exactly its fixed rate. Once started, a packet burst increases the
-      // available ceiling but never the cursor's speed.
+      // server timeline at exactly its fixed rate.
+      //
+      // Once running, getting within ONE snapshot interval of live authority means the jitter
+      // cushion has been spent. That used to be permanent: playback ran at the same rate as
+      // authority, so it had no way to fall 120 ms behind again and every later packet wobble
+      // became a visible hold-and-catch-up. Recovery deliberately runs slower until the full
+      // cushion is back. It changes presentation time only; newest authority still drives all
+      // gameplay queries above the delayed pose.
       if (!this.renderReady) {
         if (bufferedTicks >= delayTicks) {
           this.renderTick = Math.max(oldest.tick, newest.tick - delayTicks);
           this.renderReady = true;
+          this.interpRecovering = false;
         }
       } else {
-        const nextTick = this.renderTick + Math.max(0, playbackDt) * tickHz;
-        if (nextTick > newest.tick) this.starvedFrames++;
+        const availableTicks = newest.tick - this.renderTick;
+        if (!this.interpRecovering && availableTicks < snapshotTicks) {
+          this.interpRecovering = true;
+          this.interpRecoveries++;
+        }
+        // Recovery completion is decided after this frame's playback advance below. Testing
+        // the pre-advance lag spent one full tick of the cushion on the exit frame and left
+        // every later packet exposed to a shallower 20 Hz sawtooth.
+
+        // A visible-frame stall must not consume more interpolation history than the client
+        // simulation is willing to absorb. Focus/visibility gaps are discarded separately;
+        // this is the same six-step cap used by main.js for an ordinary slow frame.
+        const maxPlaybackTicks = (CFG.net.maxClientCatchUpMs / 1000) * tickHz;
+        const baseTicks = Math.min(
+          Math.max(0, playbackDt) * tickHz,
+          maxPlaybackTicks,
+        );
+        let playbackTicks = baseTicks
+          * (this.interpRecovering ? CFG.net.interpRecoveryScale : 1);
+
+        // The cap has a second side. If a 200 ms browser frame advances authority by twelve
+        // ticks but playback by only six, ordinary 1x playback can never repay the extra six:
+        // latency ratchets upward until history truncation eventually forces a jump. Spend
+        // only cushion ABOVE delayTicks, at a bounded rate and still inside the same absolute
+        // per-frame cap. Normal packet sawtooth reaches delayTicks after its base advance and
+        // therefore adds exactly zero here.
+        if (!this.interpRecovering && baseTicks > 0) {
+          const excessAfterBase = availableTicks - playbackTicks - delayTicks;
+          const scaledExtra = baseTicks * (CFG.net.interpCatchUpScale - 1);
+          const capExtra = maxPlaybackTicks - playbackTicks;
+          playbackTicks += Math.max(0, Math.min(excessAfterBase, scaledExtra, capExtra));
+        }
+
+        const nextTick = this.renderTick + playbackTicks;
+        if (nextTick > newest.tick) {
+          this.starvedFrames++;
+          if (!this.interpRecovering) {
+            this.interpRecovering = true;
+            this.interpRecoveries++;
+          }
+        }
         this.renderTick = Math.min(newest.tick, nextTick);
+
+        if (this.interpRecovering && newest.tick - this.renderTick >= delayTicks) {
+          this.interpRecovering = false;
+        }
       }
 
       // A prolonged burst may overrun even the bounded eight-packet history. The oldest
@@ -870,7 +925,7 @@ export class Net {
         // Delayed bodies are stored for the post-step presentation phase, never written into
         // the gameplay pool here. Weapon rays, repair threat checks, shop safety and emitter
         // targeting therefore see newest authority rather than a 120 ms-old visual pose.
-        const blended = lerpSnapshot(pair.a, pair.b, pair.t);
+        const blended = lerpSnapshot(pair.a, pair.b, pair.t, this.interpScratch);
         this.renderEntities = blended.entities ?? null;
         // The local presentation ray and the authority now ask about one named server tick.
         // Load the already-blended positions rather than approximating them from the newest
@@ -1374,61 +1429,10 @@ export class Net {
     return this.multiplayer && (!this.connected || !this.authoritative);
   }
 
-  #onPoses(seats) {
-    const now = performance.now();
-    for (const p of seats) {
-      if (p.seat === this.seat) continue;
-      const r = this.#remote(p.seat);
-      // Stamped with the LOCAL arrival time, not a server timestamp. Interpolating
-      // against our own clock needs no clock sync at all, and a server clock would
-      // be the wrong tool twice over -- Workers freeze Date.now() between I/O, and
-      // any offset estimate would itself need smoothing.
-      r.buffer.push({ at: now, x: p.x, y: p.y, z: p.z, yaw: p.yaw, based: !!p.b });
-      r.lastAt = now;
-      // Two intervals of delay needs three samples to bracket it; eight is slack for
-      // a burst without letting a paused tab accumulate a minute of history.
-      while (r.buffer.length > 8) r.buffer.shift();
-    }
-  }
-
   // ---- frame ---------------------------------------------------------------
 
   update(dt) {
-    if (this.connected) {
-      this.sendAcc += dt;
-      const interval = 1 / CFG.net.sendHz;
-      if (this.sendAcc >= interval) {
-        // Modulo rather than zeroing, so a long frame does not silently halve the
-        // send rate. Same reason the server accumulates instead of trusting its
-        // timer.
-        this.sendAcc %= interval;
-        this.#sendPose();
-      }
-    }
     this.#drawRemotes(dt);
-  }
-
-  #sendPose() {
-    const based = this.player.base === this.trampler;
-
-    _v.copy(this.player.position);
-    let yaw = this.player.yaw;
-    if (based) {
-      this.trampler.worldToLocal(_v);
-      // Yaw goes into the hull's frame too, and this is not symmetry for its own
-      // sake. The receiver parents the avatar to trampler.group, which already
-      // carries the hull's rotation, so sending a world yaw would apply the hull's
-      // turn twice. It is also what the game itself does -- #carry spins the view
-      // by yawDelta, so standing still on a turning deck turns you in world space.
-      yaw -= this.trampler.yaw;
-    }
-
-    this.socket.send(JSON.stringify({
-      t: "pose",
-      x: cm(_v.x), y: cm(_v.y), z: cm(_v.z),
-      yaw: cm(yaw),
-      b: based ? 1 : 0,
-    }));
   }
 
   /**
@@ -1471,6 +1475,10 @@ export class Net {
     for (const w of this.wireOps) {
       // Never draw yourself. The local operative is a camera, not a body in front of it.
       if (w.seat === this.seat) continue;
+      // Text bookkeeping is newer than the delayed presentation cursor. A crew departure
+      // therefore outranks any buffered snapshot that still contains the old seat; otherwise
+      // the stale wire record recreates the avatar immediately after the crew handler drops it.
+      if (this.crew.length > 0 && !this.crew.some((member) => member.seat === w.seat)) continue;
       _seen.add(w.seat);
 
       const r = this.#remote(w.seat);
@@ -1485,7 +1493,6 @@ export class Net {
       const operative = unpackOperativeBits(w.bits);
       _pose.based = operative.based;
 
-      r.lastAt = performance.now();
       if (operative.downed) {
         r.speed = 0;
         r.legL.rotation.x = 0;
@@ -1720,9 +1727,7 @@ export class Net {
     let r = this.remotes.get(seat);
     if (r) return r;
     r = {
-      buffer: [],
       ...this.#makeAvatar(seat),
-      lastAt: performance.now(),
       // Walk-cycle state. `lastBased` starts null rather than false so the first
       // drawn frame counts as a frame CHANGE and contributes no step -- otherwise
       // the distance from the origin to wherever the crewmate actually is arrives as
@@ -1871,6 +1876,31 @@ export class Net {
     avatar.visible = false;
     this.scene.add(avatar);
     return { avatar, rig, legL, legR, marker, effects, rope, hook, tracer, muzzle };
+  }
+
+  /** Forget observer deltas whenever presentation jumps to a different point in time. */
+  #resetRemotePresentation() {
+    for (const r of this.remotes.values()) {
+      // The next pose establishes a baseline. Treating it as travel turns a focus resume or
+      // authority rewind into one maximum-amplitude stride across the teleport.
+      r.gait = 0;
+      r.speed = 0;
+      r.lastX = 0;
+      r.lastZ = 0;
+      r.lastBased = null;
+      r.legL.rotation.x = 0;
+      r.legR.rotation.x = 0;
+      r.rig.rotation.set(0, 0, 0);
+
+      // Shot sequences are events, not state to replay. Baseline the next observed sequence
+      // and hide any cue left visible by the old presentation timeline.
+      r.lastWeaponShots = null;
+      r.shotLife = 0;
+      r.tracer.visible = false;
+      r.muzzle.visible = false;
+      r.rope.visible = false;
+      r.hook.visible = false;
+    }
   }
 
   #dropRemote(seat) {

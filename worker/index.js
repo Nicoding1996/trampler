@@ -125,16 +125,6 @@ function mintCode() {
   return out;
 }
 
-/**
- * A finite number, or zero.
- *
- * Not defensive habit -- invariant 16 forbids NaN in any position, and a single NaN
- * arriving from one client would be broadcast to every other client and collapse the
- * bounding sphere of anything derived from it. A relay that trusts its input is a
- * relay that lets one bad actor blank everybody's screen.
- */
-const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-
 /** Is a browser origin allowed to mutate or join this lobby endpoint? */
 function originAllowed(request) {
   const raw = request.headers.get("origin");
@@ -452,10 +442,7 @@ export class Lobby {
     // Map insertion order is connection order, so the first member is the initial host and
     // the first survivor is the deterministic promotion target later.
     if (this.hostSeat === 0) this.hostSeat = seat;
-    // `pose` stays null until this client sends one, and the broadcast skips nulls, so
-    // a seat that has connected but not yet reported does not appear at the origin --
-    // which on this deck is inside the reactor.
-    this.crew.set(server, { seat, name, pose: null });
+    this.crew.set(server, { seat, name });
 
     server.addEventListener("message", (ev) => this.#onMessage(server, ev));
     // Both, because a dropped connection fires `close` on a clean hangup and
@@ -621,22 +608,6 @@ export class Lobby {
         // disconnect must cancel a backlog immediately, not wait behind the stale movement or
         // fire intent they exist to revoke.
         this.#releaseInput(me.seat);
-        break;
-
-      case "pose":
-        // LATEST WINS, and nothing is queued. A pose that arrived and was superseded
-        // before the next broadcast is worthless -- the receiver interpolates past it
-        // -- so keeping a backlog would only add latency to what does get sent.
-        //
-        // Not validated, and that is the honest limit of a relay: a client asserting
-        // it is standing inside the reactor is believed. Validation is the
-        // authoritative step, and it cannot be bolted on here -- it needs the server
-        // to be running the simulation, which is a later slice.
-        me.pose = {
-          x: num(msg.x), y: num(msg.y), z: num(msg.z),
-          yaw: num(msg.yaw),
-          b: msg.b ? 1 : 0,
-        };
         break;
 
       case "start": {
@@ -917,17 +888,6 @@ export class Lobby {
     // buffer for. One per wake is smoother and strictly cheaper.
     if (!due) return;
     this.snapshots++;
-
-    // One packet carrying every seat, rather than each client hearing from each other
-    // client. At four players that is 4 messages a tick instead of 12, and it means a
-    // client's interpolation buffer advances in lockstep for every teammate -- poses
-    // that arrived together are drawn together, so nobody is a frame fresher than
-    // anybody else for no reason.
-    const seats = [];
-    for (const c of this.crew.values()) {
-      if (c.pose) seats.push({ seat: c.seat, ...c.pose });
-    }
-    if (seats.length > 0) this.#broadcast({ t: "poses", seats });
 
     // THE STATE SNAPSHOT. Binary, from src/snapshot.js, and this is the message that makes
     // every client's fortress the same fortress.

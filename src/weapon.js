@@ -502,11 +502,16 @@ export class Weapon {
       // executioner — for hits the server never registered. Invariant 2b-i's whole argument is
       // about procs happening where they should not.
       //
-      // `hitFlash` and `hits` are deliberately still set. They are the only "that connected"
-      // signal in the game (invariant 8a), and withholding them until a round trip completes
-      // would make every shot feel 120 ms late. The honest cost is that a client can briefly see
-      // a hitmarker for a shot the server disagreed about — which is the standard trade, and far
-      // cheaper than the alternative.
+      // `hitFlash`, `hits` and the target's short white flash are deliberately still set.
+      // They are the immediate "that connected" signal (invariant 8a), and withholding them
+      // until a round trip completes would make every shot feel 120 ms late. On an
+      // authoritative client the ray returns a fixed render proxy, so this writes a visual
+      // overlay only; Horde merges it into the delayed body by (id, generation) and never
+      // changes hp, alive state or the event bus. The honest cost is that a client can briefly
+      // see a hit for a shot the server disagreed about — the standard prediction trade, and
+      // far cheaper than locally inventing consequence.
+      if (this.arbitrated) hit.enemy.flash = w.hitFlash;
+
       if (!this.arbitrated) {
         if (this.horde.damage(hit.enemy, dealt, by, this.armourPierce + flank)) {
           this.kills++;

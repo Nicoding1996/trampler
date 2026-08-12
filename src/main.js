@@ -780,7 +780,7 @@ function boot() {
     // Deliberately NOT inside the accumulator loop. One correction describes one moment; a
     // frame that owes three steps should apply it once and then predict forward three times,
     // which is exactly what a client does between packets anyway.
-    net.applyPending(renderDt, frameMs / 1000);
+    net.applyPending(renderDt);
     cameraPresentation.rebase(renderDt);
 
     if (!controlsSuspended) accumulator += absorbMs;
